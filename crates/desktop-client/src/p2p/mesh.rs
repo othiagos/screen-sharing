@@ -530,7 +530,12 @@ impl MeshPeerManager {
         registry = register_default_interceptors(registry, &mut media_engine)?;
 
         let mut setting_engine = SettingEngine::default();
-        setting_engine.set_network_types(vec![NetworkType::Udp4]);
+        setting_engine.set_network_types(vec![
+            NetworkType::Udp4,
+            NetworkType::Udp6,
+            NetworkType::Tcp4,
+            NetworkType::Tcp6,
+        ]);
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
