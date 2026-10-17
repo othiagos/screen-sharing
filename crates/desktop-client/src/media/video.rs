@@ -493,12 +493,12 @@ mod win32_capture {
                 BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
             },
         },
-        Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS},
+        Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY},
         UI::WindowsAndMessaging::{
             EnumWindows, GetClientRect, GetShellWindow, GetWindow, GetWindowLongW, GetWindowRect,
             GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-            IsWindowVisible, GWL_EXSTYLE, GW_OWNER, PW_CLIENTONLY, WS_EX_APPWINDOW,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
         },
     };
 
@@ -771,11 +771,15 @@ mod win32_capture {
             // Convert BGRA -> RGBA and check if the surface is completely blank (which can happen
             // for exclusive-fullscreen DirectX swapchains when PrintWindow is unsupported).
             let mut non_zero_samples = 0usize;
-            let sample_step = (rgba.len() / 4 / 64).max(1);
-            for (idx, px) in rgba.chunks_exact_mut(4).enumerate() {
-                px.swap(0, 2);
-                px[3] = 255;
-                if idx % sample_step == 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            let pixel_count = rgba.len() / 4;
+            let sample_step = (pixel_count / 64).max(1);
+            for idx in 0..pixel_count {
+                let base = idx * 4;
+                rgba.swap(base, base + 2);
+                rgba[base + 3] = 255;
+                if idx % sample_step == 0
+                    && (rgba[base] != 0 || rgba[base + 1] != 0 || rgba[base + 2] != 0)
+                {
                     non_zero_samples += 1;
                 }
             }
