@@ -49,3 +49,24 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev.package.fast_image_resize]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3
+
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.yuv]
+opt-level = 3
+
+[profile.dev.package.xcap]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+

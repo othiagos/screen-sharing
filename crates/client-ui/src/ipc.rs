@@ -1,11 +1,17 @@
-use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array, Uint8ClampedArray};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use js_sys::{Array, ArrayBuffer, Float32Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared_protocol::{
     CaptureTarget, IceServerConfig, PeerId, RoomId, StreamConfig, FRAME_HEADER_LEN,
 };
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
+use web_sys::{
+    CanvasRenderingContext2d, HtmlCanvasElement, ImageData, WebGlBuffer, WebGlProgram,
+    WebGlRenderingContext as GL, WebGlShader, WebGlTexture, WebGlUniformLocation,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoomStatusSnapshot {
@@ -232,6 +238,278 @@ pub async fn invoke_set_window_fullscreen(fullscreen: bool) -> Result<(), String
     Ok(())
 }
 
+/// Hardware-accelerated WebGL video renderer that uploads planar I420 (`Y`, `U`, `V` luminance
+/// textures) or `RGBA` textures directly from JS `Uint8Array` views and converts BT.601 YUV420p
+/// to RGB in a GPU fragment shader.
+struct WebGlVideoRenderer {
+    canvas: HtmlCanvasElement,
+    gl: GL,
+    program: WebGlProgram,
+    vbo: WebGlBuffer,
+    tex_y: WebGlTexture,
+    tex_u: WebGlTexture,
+    tex_v: WebGlTexture,
+    u_mode: WebGlUniformLocation,
+    a_pos: u32,
+    a_tex: u32,
+}
+
+thread_local! {
+    static WEBGL_RENDERERS: RefCell<HashMap<String, WebGlVideoRenderer>> = RefCell::new(HashMap::new());
+}
+
+fn compile_shader(gl: &GL, shader_type: u32, source: &str) -> Result<WebGlShader, String> {
+    let shader = gl
+        .create_shader(shader_type)
+        .ok_or_else(|| "Failed to create WebGL shader".to_string())?;
+    gl.shader_source(&shader, source);
+    gl.compile_shader(&shader);
+    if gl
+        .get_shader_parameter(&shader, GL::COMPILE_STATUS)
+        .as_bool()
+        .unwrap_or(false)
+    {
+        Ok(shader)
+    } else {
+        let log = gl.get_shader_info_log(&shader).unwrap_or_default();
+        gl.delete_shader(Some(&shader));
+        Err(format!("WebGL shader compile error: {log}"))
+    }
+}
+
+fn create_planar_texture(gl: &GL) -> Result<WebGlTexture, String> {
+    let tex = gl
+        .create_texture()
+        .ok_or_else(|| "Failed to create WebGL texture".to_string())?;
+    gl.bind_texture(GL::TEXTURE_2D, Some(&tex));
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
+    gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::LINEAR as i32);
+    Ok(tex)
+}
+
+impl WebGlVideoRenderer {
+    fn new(canvas: &HtmlCanvasElement) -> Result<Self, String> {
+        let ctx_obj = canvas
+            .get_context("webgl")
+            .or_else(|_| canvas.get_context("experimental-webgl"))
+            .map_err(format_js_error)?
+            .ok_or_else(|| "WebGL context unavailable".to_string())?;
+        let gl: GL = ctx_obj
+            .dyn_into::<GL>()
+            .map_err(|_| "Invalid WebGL rendering context".to_string())?;
+
+        let vs_src = r#"
+            attribute vec2 a_pos;
+            attribute vec2 a_tex;
+            varying vec2 v_tex;
+            void main() {
+                gl_Position = vec4(a_pos, 0.0, 1.0);
+                v_tex = a_tex;
+            }
+        "#;
+        let fs_src = r#"
+            precision mediump float;
+            varying vec2 v_tex;
+            uniform sampler2D u_tex_y;
+            uniform sampler2D u_tex_u;
+            uniform sampler2D u_tex_v;
+            uniform int u_mode;
+            void main() {
+                if (u_mode == 1) {
+                    gl_FragColor = texture2D(u_tex_y, v_tex);
+                } else {
+                    float y = texture2D(u_tex_y, v_tex).r;
+                    float u = texture2D(u_tex_u, v_tex).r - 0.5;
+                    float v = texture2D(u_tex_v, v_tex).r - 0.5;
+                    float y_adj = 1.16438356 * (y - 0.0625);
+                    float r = y_adj + 1.59602678 * v;
+                    float g = y_adj - 0.39176229 * u - 0.81296764 * v;
+                    float b = y_adj + 2.01723214 * u;
+                    gl_FragColor = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+                }
+            }
+        "#;
+
+        let vs = compile_shader(&gl, GL::VERTEX_SHADER, vs_src)?;
+        let fs = compile_shader(&gl, GL::FRAGMENT_SHADER, fs_src)?;
+        let program = gl
+            .create_program()
+            .ok_or_else(|| "Failed to create WebGL program".to_string())?;
+        gl.attach_shader(&program, &vs);
+        gl.attach_shader(&program, &fs);
+        gl.link_program(&program);
+        gl.delete_shader(Some(&vs));
+        gl.delete_shader(Some(&fs));
+
+        if !gl
+            .get_program_parameter(&program, GL::LINK_STATUS)
+            .as_bool()
+            .unwrap_or(false)
+        {
+            let log = gl.get_program_info_log(&program).unwrap_or_default();
+            return Err(format!("WebGL program link error: {log}"));
+        }
+
+        gl.use_program(Some(&program));
+
+        // Interleaved [x, y, u, v] full-screen triangle strip with top-left UV origin
+        let vertices: [f32; 16] = [
+            -1.0, -1.0, 0.0, 1.0, // bottom-left
+            1.0, -1.0, 1.0, 1.0, // bottom-right
+            -1.0, 1.0, 0.0, 0.0, // top-left
+            1.0, 1.0, 1.0, 0.0, // top-right
+        ];
+        let vbo = gl
+            .create_buffer()
+            .ok_or_else(|| "Failed to create WebGL VBO".to_string())?;
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vbo));
+        let vert_array = Float32Array::from(&vertices[..]);
+        gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, vert_array.as_ref(), GL::STATIC_DRAW);
+
+        let a_pos = gl.get_attrib_location(&program, "a_pos") as u32;
+        let a_tex = gl.get_attrib_location(&program, "a_tex") as u32;
+        gl.enable_vertex_attrib_array(a_pos);
+        gl.enable_vertex_attrib_array(a_tex);
+        gl.vertex_attrib_pointer_with_i32(a_pos, 2, GL::FLOAT, false, 16, 0);
+        gl.vertex_attrib_pointer_with_i32(a_tex, 2, GL::FLOAT, false, 16, 8);
+
+        let tex_y = create_planar_texture(&gl)?;
+        let tex_u = create_planar_texture(&gl)?;
+        let tex_v = create_planar_texture(&gl)?;
+
+        if let Some(loc_y) = gl.get_uniform_location(&program, "u_tex_y") {
+            gl.uniform1i(Some(&loc_y), 0);
+        }
+        if let Some(loc_u) = gl.get_uniform_location(&program, "u_tex_u") {
+            gl.uniform1i(Some(&loc_u), 1);
+        }
+        if let Some(loc_v) = gl.get_uniform_location(&program, "u_tex_v") {
+            gl.uniform1i(Some(&loc_v), 2);
+        }
+        let u_mode = gl
+            .get_uniform_location(&program, "u_mode")
+            .ok_or_else(|| "Missing u_mode uniform".to_string())?;
+
+        gl.pixel_storei(GL::UNPACK_ALIGNMENT, 1);
+
+        Ok(Self {
+            canvas: canvas.clone(),
+            gl,
+            program,
+            vbo,
+            tex_y,
+            tex_u,
+            tex_v,
+            u_mode,
+            a_pos,
+            a_tex,
+        })
+    }
+
+    fn draw_frame(
+        &self,
+        u8_array: &Uint8Array,
+        width: u32,
+        height: u32,
+        is_i420: bool,
+    ) -> Result<(), String> {
+        let gl = &self.gl;
+        gl.viewport(0, 0, width as i32, height as i32);
+        gl.use_program(Some(&self.program));
+        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&self.vbo));
+        gl.vertex_attrib_pointer_with_i32(self.a_pos, 2, GL::FLOAT, false, 16, 0);
+        gl.vertex_attrib_pointer_with_i32(self.a_tex, 2, GL::FLOAT, false, 16, 8);
+        gl.pixel_storei(GL::UNPACK_ALIGNMENT, 1);
+
+        if is_i420 {
+            let y_len = width * height;
+            let uv_len = y_len / 4;
+            let y_start = FRAME_HEADER_LEN as u32;
+            let u_start = y_start + y_len;
+            let v_start = u_start + uv_len;
+
+            let y_view = u8_array.subarray(y_start, u_start);
+            let u_view = u8_array.subarray(u_start, v_start);
+            let v_view = u8_array.subarray(v_start, v_start + uv_len);
+
+            gl.uniform1i(Some(&self.u_mode), 0);
+
+            gl.active_texture(GL::TEXTURE0);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_y));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                GL::TEXTURE_2D,
+                0,
+                GL::LUMINANCE as i32,
+                width as i32,
+                height as i32,
+                0,
+                GL::LUMINANCE,
+                GL::UNSIGNED_BYTE,
+                Some(y_view.as_ref()),
+            )
+            .map_err(format_js_error)?;
+
+            let half_w = (width / 2) as i32;
+            let half_h = (height / 2) as i32;
+
+            gl.active_texture(GL::TEXTURE1);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_u));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                GL::TEXTURE_2D,
+                0,
+                GL::LUMINANCE as i32,
+                half_w,
+                half_h,
+                0,
+                GL::LUMINANCE,
+                GL::UNSIGNED_BYTE,
+                Some(u_view.as_ref()),
+            )
+            .map_err(format_js_error)?;
+
+            gl.active_texture(GL::TEXTURE2);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_v));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                GL::TEXTURE_2D,
+                0,
+                GL::LUMINANCE as i32,
+                half_w,
+                half_h,
+                0,
+                GL::LUMINANCE,
+                GL::UNSIGNED_BYTE,
+                Some(v_view.as_ref()),
+            )
+            .map_err(format_js_error)?;
+        } else {
+            let rgba_len = width * height * 4;
+            let start = FRAME_HEADER_LEN as u32;
+            let rgba_view = u8_array.subarray(start, start + rgba_len);
+
+            gl.uniform1i(Some(&self.u_mode), 1);
+            gl.active_texture(GL::TEXTURE0);
+            gl.bind_texture(GL::TEXTURE_2D, Some(&self.tex_y));
+            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                GL::TEXTURE_2D,
+                0,
+                GL::RGBA as i32,
+                width as i32,
+                height as i32,
+                0,
+                GL::RGBA,
+                GL::UNSIGNED_BYTE,
+                Some(rgba_view.as_ref()),
+            )
+            .map_err(format_js_error)?;
+        }
+
+        gl.draw_arrays(GL::TRIANGLE_STRIP, 0, 4);
+        Ok(())
+    }
+}
+
 fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool, String> {
     let u8_array = if raw.is_instance_of::<ArrayBuffer>() {
         Uint8Array::new(&raw)
@@ -253,12 +531,16 @@ fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool,
 
     let width = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let height = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let expected_rgba_len = (width as usize)
+    let px = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| "Frame dimensions overflow".to_string())?;
+    let expected_i420_len = px + (px / 2);
+    let expected_rgba_len = px.saturating_mul(4);
 
-    if width == 0 || height == 0 || packet_len != FRAME_HEADER_LEN + expected_rgba_len {
+    let is_i420 = packet_len == FRAME_HEADER_LEN + expected_i420_len && expected_i420_len > 0;
+    let is_rgba = packet_len == FRAME_HEADER_LEN + expected_rgba_len && expected_rgba_len > 0;
+
+    if width == 0 || height == 0 || (!is_i420 && !is_rgba) {
         return Ok(false);
     }
 
@@ -278,6 +560,27 @@ fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool,
         canvas.set_height(height);
     }
 
+    // 1. Hardware-Accelerated GPU WebGL Renderer (supports both planar I420 and RGBA)
+    let webgl_res = WEBGL_RENDERERS.with(|map_cell| -> Result<(), String> {
+        let mut map = map_cell.borrow_mut();
+        let needs_reinit = match map.get(canvas_id) {
+            Some(existing) => existing.canvas != canvas,
+            None => true,
+        };
+        if needs_reinit {
+            let renderer = WebGlVideoRenderer::new(&canvas)?;
+            map.insert(canvas_id.to_string(), renderer);
+        }
+        map.get(canvas_id)
+            .unwrap()
+            .draw_frame(&u8_array, width, height, is_i420)
+    });
+
+    if webgl_res.is_ok() {
+        return Ok(true);
+    }
+
+    // 2. Fallback to 2D Canvas if WebGL context creation is unavailable
     let ctx_obj = canvas
         .get_context("2d")
         .map_err(format_js_error)?
@@ -286,11 +589,44 @@ fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool,
         .dyn_into::<CanvasRenderingContext2d>()
         .map_err(|_| "Invalid 2D rendering context".to_string())?;
 
-    let clamped = Uint8ClampedArray::new_with_byte_offset_and_length(
-        &u8_array.buffer(),
-        u8_array.byte_offset() + FRAME_HEADER_LEN as u32,
-        expected_rgba_len as u32,
-    );
+    let clamped = if is_rgba {
+        Uint8ClampedArray::new_with_byte_offset_and_length(
+            &u8_array.buffer(),
+            u8_array.byte_offset() + FRAME_HEADER_LEN as u32,
+            expected_rgba_len as u32,
+        )
+    } else {
+        let mut i420 = vec![0u8; expected_i420_len];
+        u8_array
+            .subarray(
+                FRAME_HEADER_LEN as u32,
+                (FRAME_HEADER_LEN + expected_i420_len) as u32,
+            )
+            .copy_to(&mut i420);
+        let w = width as usize;
+        let h = height as usize;
+        let y_plane = &i420[..px];
+        let u_plane = &i420[px..px + px / 4];
+        let v_plane = &i420[px + px / 4..];
+        let mut rgba = vec![255u8; expected_rgba_len];
+        let half_w = w / 2;
+        for y in 0..h {
+            for x in 0..w {
+                let y_val = i32::from(y_plane[y * w + x]);
+                let uv_idx = (y / 2) * half_w + (x / 2);
+                let u_val = i32::from(u_plane[uv_idx]) - 128;
+                let v_val = i32::from(v_plane[uv_idx]) - 128;
+                let dst = (y * w + x) * 4;
+                rgba[dst] = (y_val + ((359 * v_val + 128) >> 8)).clamp(0, 255) as u8;
+                rgba[dst + 1] =
+                    (y_val - ((88 * u_val + 183 * v_val + 128) >> 8)).clamp(0, 255) as u8;
+                rgba[dst + 2] = (y_val + ((454 * u_val + 128) >> 8)).clamp(0, 255) as u8;
+            }
+        }
+        let arr = Uint8ClampedArray::new_with_length(expected_rgba_len as u32);
+        arr.copy_from(&rgba);
+        arr
+    };
 
     let image_data_ctor = Reflect::get(&window, &JsValue::from_str("ImageData"))
         .map_err(format_js_error)?
@@ -311,10 +647,8 @@ fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool,
     Ok(true)
 }
 
-/// Fetches a raw binary frame buffer (`ArrayBuffer` / `Uint8Array`) for `peer_id` from Tauri IPC,
-/// parses only the 24-byte header (`[u32 width, u32 height, [u8; 16] peer_uuid]`), constructs a
-/// zero-copy `Uint8ClampedArray` view over the JS `ArrayBuffer`, and renders it directly onto
-/// the target `<canvas>` 2D context without copying pixel bytes through WASM linear memory.
+/// Fetches a raw binary frame buffer (`ArrayBuffer` / `Uint8Array`) for `peer_id` from Tauri IPC
+/// and renders it onto the target `<canvas>` using GPU-accelerated WebGL shaders (with 2D fallback).
 pub async fn fetch_and_render_peer_canvas(
     peer_id: PeerId,
     canvas_id: &str,

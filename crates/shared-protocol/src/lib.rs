@@ -205,7 +205,13 @@ impl StreamConfig {
     }
 }
 
-/// Encodes a binary video frame with a 24-byte header:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePixelFormat {
+    Rgba,
+    I420,
+}
+
+/// Encodes a binary RGBA video frame with a 24-byte header:
 /// `[u32 width (LE), u32 height (LE), [u8; 16] peer_uuid, ...rgba_bytes]`
 pub fn encode_frame_packet(
     peer_id: PeerId,
@@ -231,6 +237,33 @@ pub fn encode_frame_packet(
     buf.extend_from_slice(&height.to_le_bytes());
     buf.extend_from_slice(peer_id.as_bytes());
     buf.extend_from_slice(rgba);
+    Ok(buf)
+}
+
+/// Encodes a binary planar I420 (`YUV420p`, 1.5 bytes/pixel) video frame with a 24-byte header:
+/// `[u32 width (LE), u32 height (LE), [u8; 16] peer_uuid, ...y_plane, ...u_plane, ...v_plane]`
+pub fn encode_yuv420p_frame_packet(
+    peer_id: PeerId,
+    width: u32,
+    height: u32,
+    i420: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    let y_len = (width as usize).checked_mul(height as usize).unwrap_or(0);
+    let expected = y_len + (y_len / 2);
+    if i420.len() != expected {
+        return Err(ProtocolError::FramePayloadSizeMismatch {
+            width,
+            height,
+            expected,
+            actual: i420.len(),
+        });
+    }
+
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + i420.len());
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(peer_id.as_bytes());
+    buf.extend_from_slice(i420);
     Ok(buf)
 }
 
@@ -264,6 +297,42 @@ pub fn decode_frame_packet(packet: &[u8]) -> Result<(PeerId, u32, u32, &[u8]), P
     }
 
     Ok((peer_id, width, height, rgba))
+}
+
+/// Decodes either an RGBA (`w * h * 4`) or planar I420 (`w * h * 3 / 2`) binary video frame packet.
+pub fn decode_any_frame_packet(
+    packet: &[u8],
+) -> Result<(PeerId, u32, u32, FramePixelFormat, &[u8]), ProtocolError> {
+    if packet.len() < FRAME_HEADER_LEN {
+        return Err(ProtocolError::FrameBufferTooShort {
+            expected: FRAME_HEADER_LEN,
+            actual: packet.len(),
+        });
+    }
+
+    let width = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    let height = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&packet[8..24]);
+    let peer_id = Uuid::from_bytes(uuid_bytes);
+
+    let payload = &packet[FRAME_HEADER_LEN..];
+    let px = (width as usize).checked_mul(height as usize).unwrap_or(0);
+    let expected_rgba = px.saturating_mul(4);
+    let expected_i420 = px + (px / 2);
+
+    if payload.len() == expected_i420 && expected_i420 > 0 {
+        Ok((peer_id, width, height, FramePixelFormat::I420, payload))
+    } else if payload.len() == expected_rgba && expected_rgba > 0 {
+        Ok((peer_id, width, height, FramePixelFormat::Rgba, payload))
+    } else {
+        Err(ProtocolError::FramePayloadSizeMismatch {
+            width,
+            height,
+            expected: expected_i420,
+            actual: payload.len(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +489,19 @@ mod tests {
         assert_eq!(dec_w, width);
         assert_eq!(dec_h, height);
         assert_eq!(dec_rgba, rgba.as_slice());
+
+        // I420 (YUV420p) packet roundtrip
+        let i420 = vec![64u8; ((width * height * 3) / 2) as usize];
+        let yuv_packet =
+            encode_yuv420p_frame_packet(peer_id, width, height, &i420).expect("encode i420 packet");
+        assert_eq!(yuv_packet.len(), FRAME_HEADER_LEN + i420.len());
+
+        let (dec_yuv_peer, dec_yuv_w, dec_yuv_h, fmt, dec_i420) =
+            decode_any_frame_packet(&yuv_packet).expect("decode i420 packet");
+        assert_eq!(dec_yuv_peer, peer_id);
+        assert_eq!((dec_yuv_w, dec_yuv_h), (width, height));
+        assert_eq!(fmt, FramePixelFormat::I420);
+        assert_eq!(dec_i420, i420.as_slice());
 
         // Short packet error
         assert!(matches!(

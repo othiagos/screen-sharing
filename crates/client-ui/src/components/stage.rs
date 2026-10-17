@@ -73,12 +73,12 @@ pub fn StageView(
         on_cleanup(move || status_handle.clear());
     }
 
-    // 2. On-Demand 60 FPS Video Frame Renderer (every 14ms) — completely idle (0 IPC calls)
-    // unless the user is watching at least one peer OR previewing their own active screen share.
-    let frame_in_flight = Rc::new(Cell::new(false));
-    if let Ok(frame_handle) = set_interval_with_handle(
+    // 2a. On-Demand 60 FPS Remote Stream Renderer (8ms oversampled poll) — completely idle (0 IPC calls)
+    // unless the user is actively watching at least one remote peer.
+    let peer_frame_in_flight = Rc::new(Cell::new(false));
+    if let Ok(peer_frame_handle) = set_interval_with_handle(
         move || {
-            if frame_in_flight.get() {
+            if peer_frame_in_flight.get() {
                 return;
             }
             let watched = room_status.with_untracked(|s| {
@@ -88,18 +88,13 @@ pub fn StageView(
                     Vec::new()
                 }
             });
-            let render_local =
-                is_sharing.get_untracked() && show_local_preview.get_untracked();
-            if watched.is_empty() && !render_local {
+            if watched.is_empty() {
                 return;
             }
 
-            frame_in_flight.set(true);
-            let in_flight = Rc::clone(&frame_in_flight);
+            peer_frame_in_flight.set(true);
+            let in_flight = Rc::clone(&peer_frame_in_flight);
             spawn_local(async move {
-                if render_local {
-                    let _ = fetch_and_render_local_preview_canvas("local-preview-canvas").await;
-                }
                 for peer_id in watched {
                     let canvas_id = format!("peer-canvas-{peer_id}");
                     let _ = fetch_and_render_peer_canvas(peer_id, &canvas_id).await;
@@ -107,9 +102,35 @@ pub fn StageView(
                 in_flight.set(false);
             });
         },
-        Duration::from_millis(14),
+        Duration::from_millis(8),
     ) {
-        on_cleanup(move || frame_handle.clear());
+        on_cleanup(move || peer_frame_handle.clear());
+    }
+
+    // 2b. Independent Local Preview Renderer (33ms / ~30 FPS) — runs on its own in-flight guard
+    // so local preview IPC never delays or competes with remote 60 FPS stream playback.
+    let local_frame_in_flight = Rc::new(Cell::new(false));
+    if let Ok(local_frame_handle) = set_interval_with_handle(
+        move || {
+            if local_frame_in_flight.get() {
+                return;
+            }
+            let render_local =
+                is_sharing.get_untracked() && show_local_preview.get_untracked();
+            if !render_local {
+                return;
+            }
+
+            local_frame_in_flight.set(true);
+            let in_flight = Rc::clone(&local_frame_in_flight);
+            spawn_local(async move {
+                let _ = fetch_and_render_local_preview_canvas("local-preview-canvas").await;
+                in_flight.set(false);
+            });
+        },
+        Duration::from_millis(33),
+    ) {
+        on_cleanup(move || local_frame_handle.clear());
     }
 
     let on_toggle_fullscreen = move |peer_id: PeerId| {

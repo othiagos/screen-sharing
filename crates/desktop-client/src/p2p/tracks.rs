@@ -6,7 +6,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use shared_protocol::{encode_frame_packet, PeerId};
+use shared_protocol::{
+    decode_any_frame_packet, encode_frame_packet, encode_yuv420p_frame_packet, FramePixelFormat,
+    PeerId,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -23,7 +26,9 @@ use webrtc::{
 
 use crate::media::{
     traits::{MediaError, RawAudioFrame, RawVideoFrame},
-    video::{H264VideoDecoder, H264VideoEncoder},
+    video::{
+        rgba_to_yuv420p_into, yuv420p_planar_to_rgba, H264VideoDecoder, H264VideoEncoder,
+    },
     CpalAudioPlayer, OpusAudioDecoder, OpusAudioEncoder,
 };
 
@@ -50,9 +55,7 @@ struct CachedFramePacket {
 #[derive(Clone)]
 struct LocalPreviewFrame {
     seq: u64,
-    width: u32,
-    height: u32,
-    rgba: Arc<Vec<u8>>,
+    packet: Arc<Vec<u8>>,
 }
 
 /// Thread-safe store of remote decoded video frames, active stream status, and per-peer media counters.
@@ -154,13 +157,19 @@ impl RemoteMediaStore {
     }
 
     pub fn record_video_frame(&self, frame: DecodedVideoFrame) {
-        self.mark_peer_streaming(frame.peer_id);
-        let counters = self.counters_for(frame.peer_id);
+        let mut i420 = Vec::new();
+        if rgba_to_yuv420p_into(&frame.rgba, frame.width, frame.height, &mut i420).is_ok() {
+            self.record_video_frame_yuv(frame.peer_id, frame.width, frame.height, &i420);
+        }
+    }
+
+    /// Records a decoded planar I420 (`YUV420p`) video frame directly without CPU YUV->RGBA conversion.
+    pub fn record_video_frame_yuv(&self, peer_id: PeerId, width: u32, height: u32, i420: &[u8]) {
+        self.mark_peer_streaming(peer_id);
+        let counters = self.counters_for(peer_id);
         let seq = counters.decoded_video_frames.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let Ok(packet_vec) =
-            encode_frame_packet(frame.peer_id, frame.width, frame.height, &frame.rgba)
-        else {
+        let Ok(packet_vec) = encode_yuv420p_frame_packet(peer_id, width, height, i420) else {
             return;
         };
 
@@ -170,7 +179,7 @@ impl RemoteMediaStore {
         }
 
         self.latest_frames.write().insert(
-            frame.peer_id,
+            peer_id,
             CachedFramePacket {
                 seq,
                 packet: Arc::new(packet_vec),
@@ -179,12 +188,21 @@ impl RemoteMediaStore {
     }
 
     pub fn record_local_preview_frame(&self, width: u32, height: u32, rgba: Vec<u8>) {
+        let mut i420 = Vec::new();
+        if rgba_to_yuv420p_into(&rgba, width, height, &mut i420).is_ok() {
+            self.record_local_preview_yuv(width, height, &i420);
+        }
+    }
+
+    /// Records a local preview frame using an already-computed planar I420 (`YUV420p`) buffer.
+    pub fn record_local_preview_yuv(&self, width: u32, height: u32, i420: &[u8]) {
+        let Ok(packet_vec) = encode_yuv420p_frame_packet(PeerId::nil(), width, height, i420) else {
+            return;
+        };
         let seq = self.local_preview_seq.fetch_add(1, Ordering::Relaxed) + 1;
         *self.local_preview_frame.write() = Some(LocalPreviewFrame {
             seq,
-            width,
-            height,
-            rgba: Arc::new(rgba),
+            packet: Arc::new(packet_vec),
         });
     }
 
@@ -201,7 +219,7 @@ impl RemoteMediaStore {
         }
         self.last_delivered_local_seq
             .store(cached.seq, Ordering::Relaxed);
-        encode_frame_packet(PeerId::nil(), cached.width, cached.height, &cached.rgba).ok()
+        Some(cached.packet.as_ref().clone())
     }
 
     pub fn record_audio_packet(&self, peer_id: PeerId) {
@@ -212,13 +230,21 @@ impl RemoteMediaStore {
     }
 
     pub fn latest_frame_packet(&self, peer_id: PeerId) -> Option<Vec<u8>> {
-        let guard = self.latest_frames.read();
-        let cached = guard.get(&peer_id)?;
-        Some(cached.packet.as_ref().clone())
+        let packet_arc = {
+            let guard = self.latest_frames.read();
+            guard.get(&peer_id)?.packet.clone()
+        };
+        match decode_any_frame_packet(&packet_arc) {
+            Ok((pid, w, h, FramePixelFormat::I420, i420)) => {
+                let rgba = yuv420p_planar_to_rgba(i420, w, h).ok()?;
+                encode_frame_packet(pid, w, h, &rgba).ok()
+            }
+            _ => Some(packet_arc.as_ref().clone()),
+        }
     }
 
-    /// Returns the pre-encoded binary frame packet only if a newer frame (`seq > last_delivered_seq`)
-    /// has been decoded since the last IPC poll for `peer_id`.
+    /// Returns the pre-encoded binary frame packet (`I420` or `RGBA`) only if a newer frame
+    /// (`seq > last_delivered_seq`) has been decoded since the last IPC poll for `peer_id`.
     pub fn take_new_frame_packet(&self, peer_id: PeerId) -> Option<Vec<u8>> {
         let guard = self.latest_frames.read();
         let cached = guard.get(&peer_id)?;
@@ -290,9 +316,16 @@ pub fn spawn_outgoing_video_pipeline(
     media_store: RemoteMediaStore,
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
-    let mut encoder = H264VideoEncoder::new(fps, 5_000_000)?;
+    let target_bitrate = if fps >= 60 {
+        8_000_000
+    } else if fps >= 30 {
+        5_000_000
+    } else {
+        3_000_000
+    };
+    let mut encoder = H264VideoEncoder::new(fps, target_bitrate)?;
     let frame_duration = Duration::from_micros(1_000_000 / (fps.clamp(1, 60) as u64));
-    let (nal_tx, mut nal_rx) = mpsc::channel::<Bytes>(4);
+    let (nal_tx, mut nal_rx) = mpsc::channel::<Bytes>(8);
 
     let force_kf = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let force_kf_flag = Arc::clone(&force_kf);
@@ -312,6 +345,7 @@ pub fn spawn_outgoing_video_pipeline(
     std::thread::Builder::new()
         .name("h264-video-encoder".to_string())
         .spawn(move || {
+            let mut preview_counter = 0u64;
             while !cancel_enc.is_cancelled() {
                 let Some(mut frame) = video_rx.blocking_recv() else {
                     break;
@@ -334,7 +368,17 @@ pub fn spawn_outgoing_video_pipeline(
                         warn!("H.264 frame encode error: {err}");
                     }
                 }
-                media_store.record_local_preview_frame(frame.width, frame.height, frame.rgba);
+                // Reuse the already-converted I420 planar buffer from the encoder for the local
+                // preview (at up to 30 FPS when capturing at 60 FPS so PiP preview IPC never
+                // competes with remote 60 FPS streams).
+                if fps <= 30 || preview_counter.is_multiple_of(2) {
+                    media_store.record_local_preview_yuv(
+                        frame.width,
+                        frame.height,
+                        encoder.last_yuv420p(),
+                    );
+                }
+                preview_counter = preview_counter.wrapping_add(1);
             }
         })
         .map_err(|e| MediaError::Codec(format!("Failed to spawn H.264 encoder thread: {e}")))?;
@@ -407,13 +451,14 @@ pub fn spawn_incoming_track_handler(
     track: Arc<TrackRemote>,
     media_store: RemoteMediaStore,
     audio_player: Option<CpalAudioPlayer>,
+    keyframe_req_notify: Option<Arc<Notify>>,
     cancel: CancellationToken,
 ) {
     media_store.mark_peer_streaming(peer_id);
     let mime = track.codec().capability.mime_type.to_lowercase();
     if mime.contains("h264") {
         tokio::spawn(async move {
-            run_incoming_h264_loop(peer_id, track, media_store, cancel).await;
+            run_incoming_h264_loop(peer_id, track, media_store, keyframe_req_notify, cancel).await;
         });
     } else if mime.contains("opus") {
         tokio::spawn(async move {
@@ -428,11 +473,16 @@ async fn run_incoming_h264_loop(
     peer_id: PeerId,
     track: Arc<TrackRemote>,
     media_store: RemoteMediaStore,
+    keyframe_req_notify: Option<Arc<Notify>>,
     cancel: CancellationToken,
 ) {
-    let (au_tx, mut au_rx) = mpsc::channel::<Vec<u8>>(16);
+    // Use a deep queue (128 access units) so encoded P-frames are never dropped between
+    // RTP depacketization and OpenH264 decoding (dropping a single P-frame breaks H.264
+    // inter-frame prediction until the next IDR keyframe).
+    let (au_tx, mut au_rx) = mpsc::channel::<Vec<u8>>(128);
     let store_dec = media_store.clone();
     let cancel_dec = cancel.clone();
+    let kf_notify_dec = keyframe_req_notify.clone();
 
     let _ = std::thread::Builder::new()
         .name(format!("h264-decoder-{peer_id}"))
@@ -449,25 +499,39 @@ async fn run_incoming_h264_loop(
                 let dec = match &mut decoder {
                     Some(d) => d,
                     None => match H264VideoDecoder::new() {
-                        Ok(d) => decoder.insert(d),
+                        Ok(d) => {
+                            if let Some(notify) = &kf_notify_dec {
+                                notify.notify_one();
+                            }
+                            decoder.insert(d)
+                        }
                         Err(err) => {
                             warn!(%peer_id, "Failed to initialize H264VideoDecoder: {err}");
                             return;
                         }
                     },
                 };
-                match dec.decode_annex_b(&access_unit) {
-                    Ok(Some((width, height, rgba))) => {
-                        store_dec.record_video_frame(DecodedVideoFrame {
-                            peer_id,
-                            width,
-                            height,
-                            rgba,
-                        });
+                match dec.decode_annex_b_yuv(&access_unit) {
+                    Ok((Some((width, height, i420)), had_error)) => {
+                        store_dec.record_video_frame_yuv(peer_id, width, height, &i420);
+                        if had_error {
+                            if let Some(notify) = &kf_notify_dec {
+                                notify.notify_one();
+                            }
+                        }
                     }
-                    Ok(None) => {}
+                    Ok((None, had_error)) => {
+                        if had_error {
+                            if let Some(notify) = &kf_notify_dec {
+                                notify.notify_one();
+                            }
+                        }
+                    }
                     Err(err) => {
                         debug!(%peer_id, "H264 decode error: {err}");
+                        if let Some(notify) = &kf_notify_dec {
+                            notify.notify_one();
+                        }
                     }
                 }
             }
@@ -475,6 +539,7 @@ async fn run_incoming_h264_loop(
 
     let mut depacketizer = H264Packet::default();
     let mut access_unit_buf = Vec::with_capacity(64 * 1024);
+    let mut last_seq: Option<u16> = None;
 
     loop {
         tokio::select! {
@@ -498,8 +563,22 @@ async fn run_incoming_h264_loop(
                 // until the local user explicitly chooses to watch this peer's stream.
                 if !media_store.is_peer_watched(peer_id) {
                     access_unit_buf.clear();
+                    last_seq = None;
                     continue;
                 }
+
+                // Detect RTP sequence number gaps (packet loss) and immediately request an IDR keyframe.
+                let seq = rtp_packet.header.sequence_number;
+                if let Some(prev) = last_seq {
+                    if seq != prev.wrapping_add(1) {
+                        access_unit_buf.clear();
+                        depacketizer = H264Packet::default();
+                        if let Some(notify) = &keyframe_req_notify {
+                            notify.notify_one();
+                        }
+                    }
+                }
+                last_seq = Some(seq);
 
                 match depacketizer.depacketize(&rtp_packet.payload) {
                     Ok(nal_bytes) if !nal_bytes.is_empty() => {
@@ -509,13 +588,22 @@ async fn run_incoming_h264_loop(
                                 &mut access_unit_buf,
                                 Vec::with_capacity(64 * 1024),
                             );
-                            let _ = au_tx.try_send(au);
+                            if au_tx.try_send(au).is_err() {
+                                // Decoder queue overflowed; request a fresh IDR keyframe to resync.
+                                if let Some(notify) = &keyframe_req_notify {
+                                    notify.notify_one();
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}
                     Err(err) => {
                         debug!(%peer_id, "H264 RTP depacketize error: {err}");
                         access_unit_buf.clear();
+                        depacketizer = H264Packet::default();
+                        if let Some(notify) = &keyframe_req_notify {
+                            notify.notify_one();
+                        }
                     }
                 }
             }

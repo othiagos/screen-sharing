@@ -774,12 +774,53 @@ impl MeshPeerManager {
                 let maybe_sess = weak_sess_track.upgrade();
 
                 Box::pin(async move {
+                    let is_video = track
+                        .codec()
+                        .capability
+                        .mime_type
+                        .to_lowercase()
+                        .contains("h264");
                     info!(
                         %remote_peer_id,
                         codec = %track.codec().capability.mime_type,
                         "Incoming remote media track established"
                     );
-                    spawn_incoming_track_handler(remote_peer_id, track, store, player, cancel);
+
+                    let kf_req_notify = if is_video {
+                        let notify = Arc::new(Notify::new());
+                        if let Some(sess_kf) = maybe_sess.clone() {
+                            let notify_listener = Arc::clone(&notify);
+                            let cancel_kf = cancel.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    tokio::select! {
+                                        _ = cancel_kf.cancelled() => break,
+                                        _ = notify_listener.notified() => {
+                                            let _ = sess_kf
+                                                .send_control_message(&PeerControlMessage::RequestKeyframe)
+                                                .await;
+                                            tokio::select! {
+                                                _ = cancel_kf.cancelled() => break,
+                                                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Some(notify)
+                    } else {
+                        None
+                    };
+
+                    spawn_incoming_track_handler(
+                        remote_peer_id,
+                        track,
+                        store,
+                        player,
+                        kf_req_notify,
+                        cancel,
+                    );
 
                     if let Some(sess) = maybe_sess {
                         let _ = sess
