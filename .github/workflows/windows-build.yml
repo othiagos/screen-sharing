@@ -1,0 +1,96 @@
+name: CI & Release Build (Linux & Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-linux:
+    name: Linux (Test & Build x64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config libclang-dev nasm \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libxcb1-dev libxrandr-dev libdbus-1-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM Frontend (client-ui)
+        run: cargo build -p client-ui --target wasm32-unknown-unknown --release
+
+      - name: Run Clippy Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Unit and E2E Tests (Linux)
+        run: cargo test --workspace
+
+      - name: Build Linux Release Executables
+        run: cargo build --release -p desktop-client -p signaling-server
+
+      - name: Upload Linux Executables Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen-sharing-linux-x64
+          path: |
+            target/release/desktop-client
+            target/release/signaling-server
+
+  build-windows:
+    name: Windows (Test & Build x64)
+    runs-on: windows-latest
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Install NASM (for OpenH264 SIMD acceleration)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM Frontend (client-ui)
+        run: cargo build -p client-ui --target wasm32-unknown-unknown --release
+
+      - name: Run Clippy Lints (Windows)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Unit and E2E Tests (Windows)
+        run: cargo test --workspace
+
+      - name: Build Windows Release Executables
+        run: cargo build --release -p desktop-client -p signaling-server
+
+      - name: Upload Windows Executables Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screen-sharing-windows-x64
+          path: |
+            target/release/desktop-client.exe
+            target/release/signaling-server.exe

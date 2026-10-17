@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared-protocol",
+    "crates/signaling-server",
+    "crates/client-ui",
+    "crates/desktop-client",
+]
+default-members = [
+    "crates/shared-protocol",
+    "crates/signaling-server",
+    "crates/desktop-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+shared-protocol = { path = "crates/shared-protocol" }
+signaling-server = { path = "crates/signaling-server" }
+
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+dashmap = "6.1"
+futures-util = "0.3"
+parking_lot = "0.12"
+ringbuf = "0.4"
+
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde", "js"] }
+
+webrtc = "0.11"
+bytes = "1.7"
+
+xcap = "0.0.14"
+fast_image_resize = "4.2"
+yuv = "0.1.6"
+openh264 = "0.6"
+
+cpal = "0.15"
+audiopus = "0.3.0-rc.0"
+
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

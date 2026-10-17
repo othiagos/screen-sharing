@@ -1,0 +1,65 @@
+[package]
+name = "desktop-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "desktop_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "desktop-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+audiopus.workspace = true
+bytes.workspace = true
+cpal.workspace = true
+dashmap.workspace = true
+fast_image_resize.workspace = true
+futures-util.workspace = true
+openh264.workspace = true
+parking_lot.workspace = true
+ringbuf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shared-protocol.workspace = true
+tauri = { version = "2.0", default-features = false, features = ["wry"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+webrtc.workspace = true
+xcap.workspace = true
+yuv.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+windows-core = "0.58"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.8"
+
+[dev-dependencies]
+signaling-server.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+wasm-bindgen-cli-support = "=0.2.129"
+

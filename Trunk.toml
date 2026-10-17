@@ -1,0 +1,11 @@
+[build]
+target = "crates/client-ui/index.html"
+dist = "crates/client-ui/dist"
+
+[watch]
+watch = ["crates/client-ui", "crates/shared-protocol"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 1420
+open = false

@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: p2p-signaling-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 9001

@@ -1,0 +1,30 @@
+[package]
+name = "signaling-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "signaling_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "signaling-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shared-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
