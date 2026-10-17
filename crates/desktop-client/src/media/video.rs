@@ -117,19 +117,28 @@ pub fn rgba_to_yuv420p_into(
     let half_h = h / 2;
     let row_stride = w * 4;
 
+    // 1. High-throughput row-by-row luminance (Y) conversion.
+    // Operating strictly on contiguous row slices allows LLVM to vectorize with AVX2/SSE2/NEON.
+    for (rgba_row, y_row) in rgba.chunks_exact(row_stride).zip(y_plane.chunks_exact_mut(w)) {
+        for (px, y_out) in rgba_row.chunks_exact(4).zip(y_row.iter_mut()) {
+            let r = i32::from(px[0]);
+            let g = i32::from(px[1]);
+            let b = i32::from(px[2]);
+            *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+        }
+    }
+
+    // 2. Chrominance (U, V) conversion with 2x2 box averaging.
     for by in 0..half_h {
         let py = by * 2;
         let rgba_row0 = &rgba[py * row_stride..(py + 1) * row_stride];
         let rgba_row1 = &rgba[(py + 1) * row_stride..(py + 2) * row_stride];
-        let (y_row0, y_row1) = y_plane[py * w..(py + 2) * w].split_at_mut(w);
         let u_row = &mut u_plane[by * half_w..(by + 1) * half_w];
         let v_row = &mut v_plane[by * half_w..(by + 1) * half_w];
 
-        for (((((c0, c1), y0), y1), u_out), v_out) in rgba_row0
+        for (((c0, c1), u_out), v_out) in rgba_row0
             .chunks_exact(8)
             .zip(rgba_row1.chunks_exact(8))
-            .zip(y_row0.chunks_exact_mut(2))
-            .zip(y_row1.chunks_exact_mut(2))
             .zip(u_row.iter_mut())
             .zip(v_row.iter_mut())
         {
@@ -137,11 +146,6 @@ pub fn rgba_to_yuv420p_into(
             let (r01, g01, b01) = (i32::from(c0[4]), i32::from(c0[5]), i32::from(c0[6]));
             let (r10, g10, b10) = (i32::from(c1[0]), i32::from(c1[1]), i32::from(c1[2]));
             let (r11, g11, b11) = (i32::from(c1[4]), i32::from(c1[5]), i32::from(c1[6]));
-
-            y0[0] = (((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16) as u8;
-            y0[1] = (((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16) as u8;
-            y1[0] = (((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16) as u8;
-            y1[1] = (((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16) as u8;
 
             let r_avg = (r00 + r01 + r10 + r11 + 2) >> 2;
             let g_avg = (g00 + g01 + g10 + g11 + 2) >> 2;
@@ -276,10 +280,10 @@ impl H264VideoEncoder {
         let config = EncoderConfig::new()
             .set_bitrate_bps(bitrate_bps.max(1_000_000))
             .max_frame_rate(clamped_fps as f32)
-            .enable_skip_frame(false)
+            .enable_skip_frame(true)
             .rate_control_mode(RateControlMode::Bitrate)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(UsageType::CameraVideoRealTime)
             .set_multiple_thread_idc(threads);
 
         Encoder::with_api_config(OpenH264API::from_source(), config)
@@ -628,6 +632,7 @@ mod win32_capture {
         staging_tex: Option<ID3D11Texture2D>,
         staging_dims: (u32, u32),
         last_bgra: Vec<u8>,
+        last_scaled: Option<(u32, u32, Vec<u8>)>,
         width: u32,
         height: u32,
         monitor_id_hint: u32,
@@ -722,6 +727,7 @@ mod win32_capture {
                     staging_tex: None,
                     staging_dims: (0, 0),
                     last_bgra: Vec::new(),
+                    last_scaled: None,
                     width,
                     height,
                     monitor_id_hint,
@@ -842,8 +848,22 @@ mod win32_capture {
 
                         let _ = self.dupl.ReleaseFrame();
                         copy_res?;
+
+                        let (dst_w, dst_h, mut scaled) = scale_rgba_frame_with_resizer(
+                            resizer,
+                            &self.last_bgra,
+                            self.width,
+                            self.height,
+                            resolution,
+                        )?;
+                        bgra_to_rgba_in_place(&mut scaled);
+                        self.last_scaled = Some((dst_w, dst_h, scaled.clone()));
+                        return Ok((dst_w, dst_h, scaled));
                     }
                     Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                        if let Some(cached) = &self.last_scaled {
+                            return Ok(cached.clone());
+                        }
                         if self.last_bgra.is_empty() {
                             return Err(MediaError::VideoCapture(
                                 "DXGI initial frame timed out".to_string(),
@@ -871,6 +891,7 @@ mod win32_capture {
                     resolution,
                 )?;
                 bgra_to_rgba_in_place(&mut scaled);
+                self.last_scaled = Some((dst_w, dst_h, scaled.clone()));
                 Ok((dst_w, dst_h, scaled))
             }
         }
@@ -1527,7 +1548,7 @@ impl VideoCapturer for NativeVideoCapturer {
 
                 let mut resizer = Resizer::new();
                 let start = Instant::now();
-                let mut next_tick = Instant::now();
+                let mut next_tick = Instant::now() + frame_interval;
 
                 while !cancel.is_cancelled() {
                     let now = Instant::now();
@@ -1537,7 +1558,11 @@ impl VideoCapturer for NativeVideoCapturer {
                             break;
                         }
                     }
-                    next_tick = Instant::now() + frame_interval;
+                    next_tick += frame_interval;
+                    let now_after = Instant::now();
+                    if now_after > next_tick + frame_interval {
+                        next_tick = now_after + frame_interval;
+                    }
 
                     // If the downstream encoder is currently busy with the previous frame,
                     // skip capturing this tick rather than building up a latency queue.
@@ -1690,6 +1715,32 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(100),
             "FPS limiter ran too fast: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_h264_60fps_encode_budget() {
+        let width = 1280u32;
+        let height = 720u32;
+        let rgba = MockVideoCapturer::generate_smpte_bars(width, height, 0);
+        let mut encoder = H264VideoEncoder::new(60, 8_000_000).expect("init 60fps encoder");
+
+        // Warm up with first frame (IDR)
+        let _ = encoder.encode_rgba(&rgba, width, height).expect("warmup");
+
+        let start = Instant::now();
+        let frame_count = 10;
+        for i in 1..=frame_count {
+            let frame = MockVideoCapturer::generate_smpte_bars(width, height, i);
+            let bitstream = encoder.encode_rgba(&frame, width, height).expect("encode frame");
+            assert!(!bitstream.is_empty());
+        }
+        let total_time = start.elapsed();
+        let avg_time_per_frame = total_time / (frame_count as u32);
+        println!("Average 720p encode time per frame: {avg_time_per_frame:?}");
+        assert!(
+            avg_time_per_frame < Duration::from_millis(16),
+            "Encode time exceeded 16ms frame budget: {avg_time_per_frame:?}"
         );
     }
 }
