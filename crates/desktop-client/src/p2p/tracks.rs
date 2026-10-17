@@ -41,11 +41,29 @@ pub struct DecodedVideoFrame {
     pub rgba: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct CachedFramePacket {
+    seq: u64,
+    packet: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct LocalPreviewFrame {
+    seq: u64,
+    width: u32,
+    height: u32,
+    rgba: Arc<Vec<u8>>,
+}
+
 /// Thread-safe store of remote decoded video frames, active stream status, and per-peer media counters.
 #[derive(Clone, Default)]
 pub struct RemoteMediaStore {
     counters: Arc<DashMap<PeerId, Arc<PeerMediaCounters>>>,
-    latest_frames: Arc<RwLock<HashMap<PeerId, DecodedVideoFrame>>>,
+    latest_frames: Arc<RwLock<HashMap<PeerId, CachedFramePacket>>>,
+    last_delivered_seq: Arc<DashMap<PeerId, u64>>,
+    local_preview_frame: Arc<RwLock<Option<LocalPreviewFrame>>>,
+    local_preview_seq: Arc<AtomicU64>,
+    last_delivered_local_seq: Arc<AtomicU64>,
     frame_subscribers: Arc<RwLock<Vec<mpsc::Sender<Vec<u8>>>>>,
     streaming_peers: Arc<RwLock<HashSet<PeerId>>>,
     watched_peers: Arc<RwLock<Option<HashSet<PeerId>>>>,
@@ -72,6 +90,7 @@ impl RemoteMediaStore {
                 set.remove(&peer_id);
             }
         }
+        self.last_delivered_seq.remove(&peer_id);
         if !watched {
             self.latest_frames.write().remove(&peer_id);
         }
@@ -100,6 +119,7 @@ impl RemoteMediaStore {
     pub fn mark_peer_stopped(&self, peer_id: PeerId) {
         self.streaming_peers.write().remove(&peer_id);
         self.latest_frames.write().remove(&peer_id);
+        self.last_delivered_seq.remove(&peer_id);
         if let Some(set) = self.watched_peers.write().as_mut() {
             set.remove(&peer_id);
         }
@@ -136,20 +156,52 @@ impl RemoteMediaStore {
     pub fn record_video_frame(&self, frame: DecodedVideoFrame) {
         self.mark_peer_streaming(frame.peer_id);
         let counters = self.counters_for(frame.peer_id);
-        counters.decoded_video_frames.fetch_add(1, Ordering::Relaxed);
+        let seq = counters.decoded_video_frames.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let Ok(packet_vec) =
+            encode_frame_packet(frame.peer_id, frame.width, frame.height, &frame.rgba)
+        else {
+            return;
+        };
 
         let subs = self.frame_subscribers.read().clone();
-        if !subs.is_empty() {
-            if let Ok(packet) =
-                encode_frame_packet(frame.peer_id, frame.width, frame.height, &frame.rgba)
-            {
-                for sub in subs {
-                    let _ = sub.try_send(packet.clone());
-                }
-            }
+        for sub in subs {
+            let _ = sub.try_send(packet_vec.clone());
         }
 
-        self.latest_frames.write().insert(frame.peer_id, frame);
+        self.latest_frames.write().insert(
+            frame.peer_id,
+            CachedFramePacket {
+                seq,
+                packet: Arc::new(packet_vec),
+            },
+        );
+    }
+
+    pub fn record_local_preview_frame(&self, width: u32, height: u32, rgba: Vec<u8>) {
+        let seq = self.local_preview_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        *self.local_preview_frame.write() = Some(LocalPreviewFrame {
+            seq,
+            width,
+            height,
+            rgba: Arc::new(rgba),
+        });
+    }
+
+    pub fn clear_local_preview_frame(&self) {
+        *self.local_preview_frame.write() = None;
+        self.last_delivered_local_seq.store(0, Ordering::Relaxed);
+    }
+
+    pub fn take_new_local_preview_packet(&self) -> Option<Vec<u8>> {
+        let cached = self.local_preview_frame.read().clone()?;
+        let last_seq = self.last_delivered_local_seq.load(Ordering::Relaxed);
+        if cached.seq <= last_seq {
+            return None;
+        }
+        self.last_delivered_local_seq
+            .store(cached.seq, Ordering::Relaxed);
+        encode_frame_packet(PeerId::nil(), cached.width, cached.height, &cached.rgba).ok()
     }
 
     pub fn record_audio_packet(&self, peer_id: PeerId) {
@@ -161,16 +213,30 @@ impl RemoteMediaStore {
 
     pub fn latest_frame_packet(&self, peer_id: PeerId) -> Option<Vec<u8>> {
         let guard = self.latest_frames.read();
-        let frame = guard.get(&peer_id)?;
-        encode_frame_packet(frame.peer_id, frame.width, frame.height, &frame.rgba).ok()
+        let cached = guard.get(&peer_id)?;
+        Some(cached.packet.as_ref().clone())
+    }
+
+    /// Returns the pre-encoded binary frame packet only if a newer frame (`seq > last_delivered_seq`)
+    /// has been decoded since the last IPC poll for `peer_id`.
+    pub fn take_new_frame_packet(&self, peer_id: PeerId) -> Option<Vec<u8>> {
+        let guard = self.latest_frames.read();
+        let cached = guard.get(&peer_id)?;
+        let last_seq = self
+            .last_delivered_seq
+            .get(&peer_id)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if cached.seq <= last_seq {
+            return None;
+        }
+        self.last_delivered_seq.insert(peer_id, cached.seq);
+        Some(cached.packet.as_ref().clone())
     }
 
     pub fn all_latest_frame_packets(&self) -> Vec<Vec<u8>> {
         let guard = self.latest_frames.read();
-        guard
-            .values()
-            .filter_map(|f| encode_frame_packet(f.peer_id, f.width, f.height, &f.rgba).ok())
-            .collect()
+        guard.values().map(|c| c.packet.as_ref().clone()).collect()
     }
 
     pub fn subscribe_binary_frames(&self) -> mpsc::Receiver<Vec<u8>> {
@@ -214,42 +280,78 @@ pub fn create_opus_audio_track() -> Arc<TrackLocalStaticSample> {
     ))
 }
 
-/// Spawns a task that encodes raw RGBA video frames into H.264 Annex-B NAL units and writes
-/// RTP samples to `video_track`.
+/// Spawns a dedicated encoder thread that encodes raw RGBA video frames into H.264 Annex-B NAL units
+/// and an async writer task that transmits RTP samples on `video_track`.
 pub fn spawn_outgoing_video_pipeline(
     mut video_rx: mpsc::Receiver<RawVideoFrame>,
     video_track: Arc<TrackLocalStaticSample>,
     fps: u8,
     keyframe_notify: Arc<Notify>,
+    media_store: RemoteMediaStore,
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
-    let mut encoder = H264VideoEncoder::new(fps, 2_500_000)?;
+    let mut encoder = H264VideoEncoder::new(fps, 5_000_000)?;
     let frame_duration = Duration::from_micros(1_000_000 / (fps.clamp(1, 60) as u64));
+    let (nal_tx, mut nal_rx) = mpsc::channel::<Bytes>(4);
+
+    let force_kf = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let force_kf_flag = Arc::clone(&force_kf);
+    let cancel_kf = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_kf.cancelled() => break,
+                _ = keyframe_notify.notified() => {
+                    force_kf_flag.store(true, Ordering::Release);
+                }
+            }
+        }
+    });
+
+    let cancel_enc = cancel.clone();
+    std::thread::Builder::new()
+        .name("h264-video-encoder".to_string())
+        .spawn(move || {
+            while !cancel_enc.is_cancelled() {
+                let Some(mut frame) = video_rx.blocking_recv() else {
+                    break;
+                };
+                // Drain any queued older frames so we always encode the freshest frame
+                while let Ok(newer) = video_rx.try_recv() {
+                    frame = newer;
+                }
+                if force_kf.swap(false, Ordering::AcqRel) {
+                    encoder.request_keyframe();
+                }
+                match encoder.encode_rgba(&frame.rgba, frame.width, frame.height) {
+                    Ok(annex_b) if !annex_b.is_empty() => {
+                        if nal_tx.blocking_send(Bytes::from(annex_b)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!("H.264 frame encode error: {err}");
+                    }
+                }
+                media_store.record_local_preview_frame(frame.width, frame.height, frame.rgba);
+            }
+        })
+        .map_err(|e| MediaError::Codec(format!("Failed to spawn H.264 encoder thread: {e}")))?;
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = keyframe_notify.notified() => {
-                    encoder.request_keyframe();
-                }
-                maybe_frame = video_rx.recv() => {
-                    let Some(frame) = maybe_frame else { break };
-                    match encoder.encode_rgba(&frame.rgba, frame.width, frame.height) {
-                        Ok(annex_b) if !annex_b.is_empty() => {
-                            let sample = Sample {
-                                data: Bytes::from(annex_b),
-                                duration: frame_duration,
-                                ..Default::default()
-                            };
-                            if let Err(err) = video_track.write_sample(&sample).await {
-                                debug!("Failed writing H.264 sample to track: {err}");
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            warn!("H.264 frame encode error: {err}");
-                        }
+                maybe_nal = nal_rx.recv() => {
+                    let Some(annex_b) = maybe_nal else { break };
+                    let sample = Sample {
+                        data: annex_b,
+                        duration: frame_duration,
+                        ..Default::default()
+                    };
+                    if let Err(err) = video_track.write_sample(&sample).await {
+                        debug!("Failed writing H.264 sample to track: {err}");
                     }
                 }
             }
@@ -328,7 +430,49 @@ async fn run_incoming_h264_loop(
     media_store: RemoteMediaStore,
     cancel: CancellationToken,
 ) {
-    let mut decoder: Option<H264VideoDecoder> = None;
+    let (au_tx, mut au_rx) = mpsc::channel::<Vec<u8>>(16);
+    let store_dec = media_store.clone();
+    let cancel_dec = cancel.clone();
+
+    let _ = std::thread::Builder::new()
+        .name(format!("h264-decoder-{peer_id}"))
+        .spawn(move || {
+            let mut decoder: Option<H264VideoDecoder> = None;
+            while !cancel_dec.is_cancelled() {
+                let Some(access_unit) = au_rx.blocking_recv() else {
+                    break;
+                };
+                if !store_dec.is_peer_watched(peer_id) {
+                    decoder = None;
+                    continue;
+                }
+                let dec = match &mut decoder {
+                    Some(d) => d,
+                    None => match H264VideoDecoder::new() {
+                        Ok(d) => decoder.insert(d),
+                        Err(err) => {
+                            warn!(%peer_id, "Failed to initialize H264VideoDecoder: {err}");
+                            return;
+                        }
+                    },
+                };
+                match dec.decode_annex_b(&access_unit) {
+                    Ok(Some((width, height, rgba))) => {
+                        store_dec.record_video_frame(DecodedVideoFrame {
+                            peer_id,
+                            width,
+                            height,
+                            rgba,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        debug!(%peer_id, "H264 decode error: {err}");
+                    }
+                }
+            }
+        });
+
     let mut depacketizer = H264Packet::default();
     let mut access_unit_buf = Vec::with_capacity(64 * 1024);
 
@@ -353,42 +497,19 @@ async fn run_incoming_h264_loop(
                 // On-demand stream watching: drain RTP packets without CPU-heavy H.264 decoding
                 // until the local user explicitly chooses to watch this peer's stream.
                 if !media_store.is_peer_watched(peer_id) {
-                    decoder = None;
                     access_unit_buf.clear();
                     continue;
                 }
 
-                let dec = match &mut decoder {
-                    Some(d) => d,
-                    None => match H264VideoDecoder::new() {
-                        Ok(d) => decoder.insert(d),
-                        Err(err) => {
-                            warn!(%peer_id, "Failed to initialize H264VideoDecoder: {err}");
-                            return;
-                        }
-                    },
-                };
-
                 match depacketizer.depacketize(&rtp_packet.payload) {
                     Ok(nal_bytes) if !nal_bytes.is_empty() => {
                         access_unit_buf.extend_from_slice(&nal_bytes);
-                        // Decode immediately when marker bit is set or buffer contains complete NALs
-                        if rtp_packet.header.marker || access_unit_buf.len() > 4 {
-                            match dec.decode_annex_b(&access_unit_buf) {
-                                Ok(Some((width, height, rgba))) => {
-                                    media_store.record_video_frame(DecodedVideoFrame {
-                                        peer_id,
-                                        width,
-                                        height,
-                                        rgba,
-                                    });
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    debug!(%peer_id, "H264 decode error: {err}");
-                                }
-                            }
-                            access_unit_buf.clear();
+                        if rtp_packet.header.marker || access_unit_buf.len() > 256 * 1024 {
+                            let au = std::mem::replace(
+                                &mut access_unit_buf,
+                                Vec::with_capacity(64 * 1024),
+                            );
+                            let _ = au_tx.try_send(au);
                         }
                     }
                     Ok(_) => {}

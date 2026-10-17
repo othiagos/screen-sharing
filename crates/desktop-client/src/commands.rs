@@ -12,7 +12,7 @@ use crate::{
     media::{
         default_os_audio_capturer,
         traits::VideoCapturer,
-        video::{list_capture_targets, NativeVideoCapturer},
+        video::{capture_preview_packet, list_capture_targets, NativeVideoCapturer},
     },
     p2p::mesh::MeshPeerManager,
 };
@@ -180,6 +180,15 @@ pub async fn list_capture_sources() -> Result<Vec<CaptureTarget>, String> {
 }
 
 #[tauri::command]
+pub async fn capture_target_preview(target: CaptureTarget) -> Result<IpcResponse, String> {
+    let packet = tokio::task::spawn_blocking(move || capture_preview_packet(&target))
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    Ok(IpcResponse::new(packet))
+}
+
+#[tauri::command]
 pub async fn start_screen_share(
     state: State<'_, Arc<ClientAppState>>,
     config: StreamConfig,
@@ -218,7 +227,8 @@ pub async fn stop_screen_share(state: State<'_, Arc<ClientAppState>>) -> Result<
 
 /// Returns the latest decoded RGBA video frame for `peer_id` as a raw binary `ArrayBuffer`
 /// prefixed with the 24-byte header `[u32 width, u32 height, [u8; 16] peer_uuid]`.
-/// Uses `tauri::ipc::Response::new(Vec<u8>)` to bypass JSON serialization completely.
+/// Uses `tauri::ipc::Response::new(Vec<u8>)` to bypass JSON serialization completely,
+/// and returns an empty buffer when no new frame has been decoded since the previous poll.
 #[tauri::command]
 pub async fn fetch_peer_frame(
     state: State<'_, Arc<ClientAppState>>,
@@ -235,9 +245,37 @@ pub async fn fetch_peer_frame(
 
     let packet = mgr
         .media_store()
-        .latest_frame_packet(peer_id)
+        .take_new_frame_packet(peer_id)
         .unwrap_or_default();
     Ok(IpcResponse::new(packet))
+}
+
+#[tauri::command]
+pub async fn fetch_local_preview_frame(
+    state: State<'_, Arc<ClientAppState>>,
+) -> Result<IpcResponse, String> {
+    let mgr = {
+        let guard = state.mesh.lock().await;
+        guard.as_ref().cloned()
+    };
+
+    let Some(mgr) = mgr else {
+        return Ok(IpcResponse::new(Vec::new()));
+    };
+
+    let packet = mgr
+        .media_store()
+        .take_new_local_preview_packet()
+        .unwrap_or_default();
+    Ok(IpcResponse::new(packet))
+}
+
+#[tauri::command]
+pub async fn set_window_fullscreen(
+    window: tauri::Window,
+    fullscreen: bool,
+) -> Result<(), String> {
+    window.set_fullscreen(fullscreen).map_err(|e| e.to_string())
 }
 
 pub fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
@@ -251,9 +289,12 @@ pub fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
             get_room_status,
             set_peer_watched,
             list_capture_sources,
+            capture_target_preview,
             start_screen_share,
             stop_screen_share,
             fetch_peer_frame,
+            fetch_local_preview_frame,
+            set_window_fullscreen,
         ])
 }
 

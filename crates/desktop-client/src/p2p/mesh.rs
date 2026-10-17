@@ -329,6 +329,7 @@ impl MeshPeerManager {
             Arc::clone(&video_track),
             fps,
             Arc::clone(&keyframe_notify),
+            self.inner.media_store.clone(),
             share_cancel.clone(),
         )?;
 
@@ -382,6 +383,7 @@ impl MeshPeerManager {
 
     /// Stops any active local screen/audio capture and removes outgoing tracks from mesh peers.
     pub async fn stop_sharing(&self) -> Result<(), MeshError> {
+        self.inner.media_store.clear_local_preview_frame();
         let prev = {
             let mut guard = self.inner.local_share.lock().await;
             guard.take()
