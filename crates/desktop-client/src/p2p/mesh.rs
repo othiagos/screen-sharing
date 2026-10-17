@@ -617,16 +617,37 @@ impl MeshPeerManager {
 
         session.control_dc.on_open(Box::new(move || {
             debug!(%remote_peer_id, "mesh-control RTCDataChannel opened");
-            dc_open.store(true, Ordering::Release);
-            dc_open_notify.notify_waiters();
-
-            // If the local peer is ALREADY sharing when a new peer joins the room and its
-            // mesh-control DataChannel opens, attach tracks and send a RenegotiateOffer now
-            // (since an SDP Answer to the newcomer's initial offer cannot add new m=video/m=audio lines).
             let mgr = mgr_open.clone();
             let maybe_sess = weak_sess_open.upgrade();
+            let dc_open = Arc::clone(&dc_open);
+            let dc_open_notify = Arc::clone(&dc_open_notify);
+
             tokio::spawn(async move {
                 let Some(sess) = maybe_sess else { return };
+
+                // Wait briefly for the RTCPeerConnection to reach Connected and for the remote
+                // peer's `start_sctp()` to finish calling `open_stream(0)` on pre-negotiated
+                // stream 0 before transmitting any SCTP DATA chunks (avoids webrtc-sctp
+                // `ErrStreamAlreadyExist` when one side finishes COOKIE-ACK slightly earlier).
+                let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while !sess.is_connected() && tokio::time::Instant::now() < wait_deadline {
+                    tokio::select! {
+                        _ = sess.cancel.cancelled() => return,
+                        _ = sess.state_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                }
+                tokio::select! {
+                    _ = sess.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                }
+
+                dc_open.store(true, Ordering::Release);
+                dc_open_notify.notify_waiters();
+
+                // If the local peer is ALREADY sharing when a new peer joins the room and its
+                // mesh-control DataChannel opens, attach tracks and send a RenegotiateOffer now
+                // (since an SDP Answer to the newcomer's initial offer cannot add new m=video/m=audio lines).
                 let active_share = {
                     let guard = mgr.inner.local_share.lock().await;
                     guard.as_ref().map(|s| {
@@ -646,6 +667,22 @@ impl MeshPeerManager {
                             %remote_peer_id,
                             "Failed renegotiating active stream to newly joined peer: {err}"
                         );
+                        return;
+                    }
+
+                    // Fallback retry in case the remote peer's DataChannel handler was still
+                    // initializing under heavy CI load when the first RenegotiateOffer arrived.
+                    tokio::select! {
+                        _ = sess.cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                    if sess.pc.signaling_state() == RTCSignalingState::HaveLocalOffer {
+                        if let Some(local_desc) = sess.pc.local_description().await {
+                            let _ = mgr.inner.signaling.send(ClientSignal::SdpOffer {
+                                target: remote_peer_id,
+                                sdp: local_desc.sdp,
+                            });
+                        }
                     }
                 }
             });
