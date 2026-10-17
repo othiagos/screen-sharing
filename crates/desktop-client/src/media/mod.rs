@@ -135,53 +135,89 @@ impl CpalAudioPlayer {
         let _ = std::thread::Builder::new()
             .name("cpal-audio-output".to_string())
             .spawn(move || {
-                let host = cpal::default_host();
-                let Some(device) = host.default_output_device() else {
-                    debug!("No default audio output device available (headless environment)");
-                    while !thread_cancel.is_cancelled() {
-                        let _ = cons.clear();
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    return;
-                };
-
-                let config = cpal::StreamConfig {
-                    channels: RawAudioFrame::CHANNELS,
-                    sample_rate: cpal::SampleRate(RawAudioFrame::SAMPLE_RATE),
-                    buffer_size: cpal::BufferSize::Default,
-                };
-
-                let stream_res = device.build_output_stream(
-                    &config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let popped = cons.pop_slice(data);
-                        for sample in &mut data[popped..] {
-                            *sample = 0.0;
-                        }
-                    },
-                    move |err| {
-                        warn!("cpal output stream error: {err}");
-                    },
-                    None,
-                );
-
-                match stream_res {
-                    Ok(stream) => {
-                        if let Err(err) = stream.play() {
-                            warn!("cpal stream.play() failed: {err}");
-                            return;
-                        }
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let host = cpal::default_host();
+                    let Some(device) = host.default_output_device() else {
+                        debug!("No default audio output device available (headless environment)");
                         while !thread_cancel.is_cancelled() {
+                            let _ = cons.clear();
                             std::thread::sleep(Duration::from_millis(50));
                         }
-                    }
-                    Err(err) => {
-                        debug!("Could not initialize 48kHz stereo cpal stream (headless/busy): {err}");
-                        while !thread_cancel.is_cancelled() {
-                            std::thread::sleep(Duration::from_millis(50));
+                        return;
+                    };
+
+                    let preferred_config = cpal::StreamConfig {
+                        channels: RawAudioFrame::CHANNELS,
+                        sample_rate: cpal::SampleRate(RawAudioFrame::SAMPLE_RATE),
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+
+                    let (config, out_channels) = match device.default_output_config() {
+                        Ok(default_cfg)
+                            if default_cfg.channels() != RawAudioFrame::CHANNELS
+                                || default_cfg.sample_rate().0 != RawAudioFrame::SAMPLE_RATE =>
+                        {
+                            let ch = default_cfg.channels().max(1);
+                            (
+                                cpal::StreamConfig {
+                                    channels: ch,
+                                    sample_rate: default_cfg.sample_rate(),
+                                    buffer_size: cpal::BufferSize::Default,
+                                },
+                                ch as usize,
+                            )
+                        }
+                        _ => (preferred_config, RawAudioFrame::CHANNELS as usize),
+                    };
+
+                    let stream_res = device.build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            if out_channels == 2 {
+                                let popped = cons.pop_slice(data);
+                                for sample in &mut data[popped..] {
+                                    *sample = 0.0;
+                                }
+                            } else {
+                                for frame_out in data.chunks_mut(out_channels) {
+                                    let l = cons.try_pop().unwrap_or(0.0);
+                                    let r = cons.try_pop().unwrap_or(l);
+                                    if out_channels == 1 {
+                                        frame_out[0] = (l + r) * 0.5;
+                                    } else {
+                                        frame_out[0] = l;
+                                        frame_out[1] = r;
+                                        for extra in &mut frame_out[2..] {
+                                            *extra = 0.0;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        move |err| {
+                            warn!("cpal output stream error: {err}");
+                        },
+                        None,
+                    );
+
+                    match stream_res {
+                        Ok(stream) => {
+                            if let Err(err) = stream.play() {
+                                warn!("cpal stream.play() failed: {err}");
+                                return;
+                            }
+                            while !thread_cancel.is_cancelled() {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                        Err(err) => {
+                            debug!("Could not initialize cpal output stream (headless/busy): {err}");
+                            while !thread_cancel.is_cancelled() {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
                         }
                     }
-                }
+                }));
             });
     }
 

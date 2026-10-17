@@ -94,8 +94,13 @@ impl AudioCapturer for WindowsAudioCapturer {
         std::thread::Builder::new()
             .name("wasapi-audio-capture".to_string())
             .spawn(move || {
-                if let Err(err) = run_wasapi_capture_loop(mode, tx, cancel) {
-                    warn!("WASAPI audio capture loop exited: {err}");
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_wasapi_capture_loop(mode, tx, cancel)
+                }));
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => warn!("WASAPI audio capture loop exited: {err}"),
+                    Err(_) => warn!("WASAPI audio capture thread caught panic"),
                 }
             })
             .map_err(|e| {
@@ -125,6 +130,12 @@ fn explicit_48khz_stereo_float_format() -> WAVEFORMATEX {
 }
 
 fn activate_process_loopback_client(pid: u32) -> Result<IAudioClient, MediaError> {
+    if pid == 0 {
+        return Err(MediaError::AudioCapture(
+            "Target window PID is 0; process loopback requires a valid process ID".to_string(),
+        ));
+    }
+
     let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: windows::Win32::Media::Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -135,9 +146,14 @@ fn activate_process_loopback_client(pid: u32) -> Result<IAudioClient, MediaError
         },
     };
 
-    let mut prop_variant = PROPVARIANT::default();
+    // IMPORTANT: `PROPVARIANT`'s `Drop` implementation calls `PropVariantClear`, which calls
+    // `CoTaskMemFree` on `blob.pBlobData` when `vt == VT_BLOB`. Because `activation_params`
+    // lives on the stack, allowing `PROPVARIANT::drop` to run corrupts the Windows heap
+    // (`STATUS_HEAP_CORRUPTION` 0xC0000374) and crashes the process!
+    // Wrapping in `ManuallyDrop` ensures `PropVariantClear` is never called on stack memory.
+    let mut prop_variant = std::mem::ManuallyDrop::new(PROPVARIANT::default());
     unsafe {
-        let raw_vt = (&mut prop_variant as *mut PROPVARIANT).cast::<u16>();
+        let raw_vt = (&mut *prop_variant as *mut PROPVARIANT).cast::<u16>();
         *raw_vt = VT_BLOB.0;
         let blob_size_ptr = (raw_vt as *mut u8).add(8).cast::<u32>();
         *blob_size_ptr = size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32;
@@ -153,7 +169,7 @@ fn activate_process_loopback_client(pid: u32) -> Result<IAudioClient, MediaError
         ActivateAudioInterfaceAsync(
             PCWSTR(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK.as_ptr()),
             &IAudioClient::IID as *const GUID,
-            Some(&prop_variant),
+            Some(&*prop_variant),
             &handler,
         )
     }
@@ -191,7 +207,16 @@ fn run_wasapi_capture_loop(
         let audio_client = match mode {
             AudioCaptureMode::ApplicationOnly { pid } => {
                 debug!(pid, "Activating Windows WASAPI Process Loopback");
-                activate_process_loopback_client(pid)?
+                match activate_process_loopback_client(pid) {
+                    Ok(client) => client,
+                    Err(err) => {
+                        warn!(
+                            pid,
+                            "Process Loopback activation failed ({err}); falling back to System Global Loopback"
+                        );
+                        activate_system_loopback_client()?
+                    }
+                }
             }
             AudioCaptureMode::SystemGlobal => {
                 debug!("Activating Windows WASAPI System Global Loopback");
