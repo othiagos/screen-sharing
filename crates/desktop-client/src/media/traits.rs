@@ -17,12 +17,13 @@ pub enum MediaError {
     AudioPlayback(String),
 }
 
-/// Raw RGBA video frame produced by a `VideoCapturer`.
+/// Raw video frame produced by a `VideoCapturer` (RGBA or BGRA pixel order).
 #[derive(Debug, Clone)]
 pub struct RawVideoFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    pub is_bgra: bool,
     pub timestamp_us: u64,
 }
 

@@ -801,7 +801,7 @@ impl MeshPeerManager {
                                                 .await;
                                             tokio::select! {
                                                 _ = cancel_kf.cancelled() => break,
-                                                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                                                _ = tokio::time::sleep(Duration::from_millis(800)) => {}
                                             }
                                         }
                                     }

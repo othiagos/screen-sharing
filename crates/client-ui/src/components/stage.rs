@@ -21,7 +21,7 @@ pub fn StageView(
 ) -> impl IntoView {
     let (show_picker, set_show_picker) = create_signal(false);
     let (is_sharing, set_is_sharing) = create_signal(room_status.with_untracked(|s| s.is_sharing));
-    let (show_local_preview, set_show_local_preview) = create_signal(true);
+    let (show_local_preview, set_show_local_preview) = create_signal(false);
     let (fullscreen_peer, set_fullscreen_peer) = create_signal::<Option<PeerId>>(None);
 
     let keydown_handle = window_event_listener(ev::keydown, move |ev| {
@@ -107,8 +107,8 @@ pub fn StageView(
         on_cleanup(move || peer_frame_handle.clear());
     }
 
-    // 2b. Independent Local Preview Renderer (33ms / ~30 FPS) — runs on its own in-flight guard
-    // so local preview IPC never delays or competes with remote 60 FPS stream playback.
+    // 2b. Independent Local Preview Renderer (150ms / ~7 FPS) — runs on its own in-flight guard
+    // so local preview IPC never wastes broadcaster CPU or competes with remote 60 FPS stream playback.
     let local_frame_in_flight = Rc::new(Cell::new(false));
     if let Ok(local_frame_handle) = set_interval_with_handle(
         move || {
@@ -128,7 +128,7 @@ pub fn StageView(
                 in_flight.set(false);
             });
         },
-        Duration::from_millis(33),
+        Duration::from_millis(150),
     ) {
         on_cleanup(move || local_frame_handle.clear());
     }

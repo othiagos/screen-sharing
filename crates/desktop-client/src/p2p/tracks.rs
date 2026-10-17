@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -67,6 +67,7 @@ pub struct RemoteMediaStore {
     local_preview_frame: Arc<RwLock<Option<LocalPreviewFrame>>>,
     local_preview_seq: Arc<AtomicU64>,
     last_delivered_local_seq: Arc<AtomicU64>,
+    last_preview_poll_ms: Arc<AtomicU64>,
     frame_subscribers: Arc<RwLock<Vec<mpsc::Sender<Vec<u8>>>>>,
     streaming_peers: Arc<RwLock<HashSet<PeerId>>>,
     watched_peers: Arc<RwLock<Option<HashSet<PeerId>>>>,
@@ -209,9 +210,28 @@ impl RemoteMediaStore {
     pub fn clear_local_preview_frame(&self) {
         *self.local_preview_frame.write() = None;
         self.last_delivered_local_seq.store(0, Ordering::Relaxed);
+        self.last_preview_poll_ms.store(0, Ordering::Relaxed);
+    }
+
+    pub fn is_local_preview_active(&self) -> bool {
+        let last = self.last_preview_poll_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(last) < 2000
     }
 
     pub fn take_new_local_preview_packet(&self) -> Option<Vec<u8>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_preview_poll_ms.store(now_ms, Ordering::Relaxed);
+
         let cached = self.local_preview_frame.read().clone()?;
         let last_seq = self.last_delivered_local_seq.load(Ordering::Relaxed);
         if cached.seq <= last_seq {
@@ -317,11 +337,11 @@ pub fn spawn_outgoing_video_pipeline(
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
     let target_bitrate = if fps >= 60 {
-        8_000_000
+        4_000_000
     } else if fps >= 30 {
-        5_000_000
+        2_500_000
     } else {
-        3_000_000
+        1_500_000
     };
     let mut encoder = H264VideoEncoder::new(fps, target_bitrate)?;
     let frame_duration = Duration::from_micros(1_000_000 / (fps.clamp(1, 60) as u64));
@@ -346,6 +366,9 @@ pub fn spawn_outgoing_video_pipeline(
         .name("h264-video-encoder".to_string())
         .spawn(move || {
             let mut preview_counter = 0u64;
+            let mut last_forced_idr = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap_or_else(Instant::now);
             while !cancel_enc.is_cancelled() {
                 let Some(mut frame) = video_rx.blocking_recv() else {
                     break;
@@ -354,10 +377,18 @@ pub fn spawn_outgoing_video_pipeline(
                 while let Ok(newer) = video_rx.try_recv() {
                     frame = newer;
                 }
-                if force_kf.swap(false, Ordering::AcqRel) {
+                if force_kf.swap(false, Ordering::AcqRel)
+                    && last_forced_idr.elapsed() >= Duration::from_millis(800)
+                {
                     encoder.request_keyframe();
+                    last_forced_idr = Instant::now();
                 }
-                match encoder.encode_rgba(&frame.rgba, frame.width, frame.height) {
+                let encode_res = if frame.is_bgra {
+                    encoder.encode_bgra(&frame.rgba, frame.width, frame.height)
+                } else {
+                    encoder.encode_rgba(&frame.rgba, frame.width, frame.height)
+                };
+                match encode_res {
                     Ok(annex_b) if !annex_b.is_empty() => {
                         if nal_tx.blocking_send(Bytes::from(annex_b)).is_err() {
                             break;
@@ -368,10 +399,9 @@ pub fn spawn_outgoing_video_pipeline(
                         warn!("H.264 frame encode error: {err}");
                     }
                 }
-                // Reuse the already-converted I420 planar buffer from the encoder for the local
-                // preview (at up to 30 FPS when capturing at 60 FPS so PiP preview IPC never
-                // competes with remote 60 FPS streams).
-                if fps <= 30 || preview_counter.is_multiple_of(2) {
+                // Only record local preview if the UI is actively watching/polling the preview canvas,
+                // and throttle to ~10 FPS (every 6th frame at 60 FPS) to eliminate CPU waste.
+                if preview_counter.is_multiple_of(6) && media_store.is_local_preview_active() {
                     media_store.record_local_preview_yuv(
                         frame.width,
                         frame.height,
@@ -567,18 +597,29 @@ async fn run_incoming_h264_loop(
                     continue;
                 }
 
-                // Detect RTP sequence number gaps (packet loss) and immediately request an IDR keyframe.
+                // Detect forward RTP sequence number gaps (packet loss on WAN) to request a keyframe resync,
+                // but DO NOT clear `access_unit_buf` or reset `depacketizer` simply due to reordered/jittered packets.
                 let seq = rtp_packet.header.sequence_number;
-                if let Some(prev) = last_seq {
-                    if seq != prev.wrapping_add(1) {
-                        access_unit_buf.clear();
-                        depacketizer = H264Packet::default();
-                        if let Some(notify) = &keyframe_req_notify {
-                            notify.notify_one();
+                match last_seq {
+                    Some(highest) => {
+                        let diff = seq.wrapping_sub(highest);
+                        if diff > 0 && diff < 32768 {
+                            // Forward sequence progression
+                            if diff > 1 {
+                                // Forward gap (packets dropped in transit)
+                                if let Some(notify) = &keyframe_req_notify {
+                                    notify.notify_one();
+                                }
+                            }
+                            last_seq = Some(seq);
                         }
+                        // If diff == 0 || diff >= 32768, it's a reordered or duplicate packet,
+                        // so we retain `highest` in `last_seq` and let depacketizer process it.
+                    }
+                    None => {
+                        last_seq = Some(seq);
                     }
                 }
-                last_seq = Some(seq);
 
                 match depacketizer.depacketize(&rtp_packet.payload) {
                     Ok(nal_bytes) if !nal_bytes.is_empty() => {

@@ -95,6 +95,7 @@ impl VideoCapturer for MockVideoCapturer {
                             width,
                             height,
                             rgba,
+                            is_bgra: false,
                             timestamp_us: start.elapsed().as_micros() as u64,
                         };
                         if tx.send(frame).await.is_err() {
