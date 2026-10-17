@@ -1,9 +1,9 @@
-use js_sys::{ArrayBuffer, Object, Reflect, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Object, Reflect, Uint8Array, Uint8ClampedArray};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shared_protocol::{
-    decode_frame_packet, CaptureTarget, IceServerConfig, PeerId, RoomId, StreamConfig,
+    CaptureTarget, IceServerConfig, PeerId, RoomId, StreamConfig, FRAME_HEADER_LEN,
 };
-use wasm_bindgen::{prelude::*, Clamped, JsCast};
+use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
@@ -54,6 +54,18 @@ struct FetchFrameArgs {
     peer_id: PeerId,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturePreviewArgs {
+    target: CaptureTarget,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetFullscreenArgs {
+    fullscreen: bool,
+}
+
 async fn tauri_invoke_raw(cmd: &str, args: JsValue) -> Result<JsValue, String> {
     let window = web_sys::window().ok_or_else(|| "No browser window available".to_string())?;
 
@@ -100,18 +112,45 @@ async fn tauri_invoke<A: Serialize, R: DeserializeOwned>(
     serde_wasm_bindgen::from_value(raw).map_err(|e| e.to_string())
 }
 
+fn upgrade_ws_to_wss_on_redirect(url: &str, err: &str) -> Option<String> {
+    if (err.contains("301") || err.contains("302") || err.contains("307") || err.contains("308"))
+        && url.starts_with("ws://")
+    {
+        Some(url.replacen("ws://", "wss://", 1))
+    } else {
+        None
+    }
+}
+
 pub async fn invoke_create_room(
     signaling_url: String,
     custom_ice_servers: Vec<IceServerConfig>,
 ) -> Result<RoomStatusSnapshot, String> {
-    tauri_invoke(
+    match tauri_invoke(
         "create_room_session",
         &CreateRoomArgs {
-            signaling_url,
-            custom_ice_servers,
+            signaling_url: signaling_url.clone(),
+            custom_ice_servers: custom_ice_servers.clone(),
         },
     )
     .await
+    {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            if let Some(wss_url) = upgrade_ws_to_wss_on_redirect(&signaling_url, &err) {
+                tauri_invoke(
+                    "create_room_session",
+                    &CreateRoomArgs {
+                        signaling_url: wss_url,
+                        custom_ice_servers,
+                    },
+                )
+                .await
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 pub async fn invoke_join_room(
@@ -119,15 +158,33 @@ pub async fn invoke_join_room(
     room_id: RoomId,
     custom_ice_servers: Vec<IceServerConfig>,
 ) -> Result<RoomStatusSnapshot, String> {
-    tauri_invoke(
+    match tauri_invoke(
         "join_room_session",
         &JoinRoomArgs {
-            signaling_url,
-            room_id,
-            custom_ice_servers,
+            signaling_url: signaling_url.clone(),
+            room_id: room_id.clone(),
+            custom_ice_servers: custom_ice_servers.clone(),
         },
     )
     .await
+    {
+        Ok(res) => Ok(res),
+        Err(err) => {
+            if let Some(wss_url) = upgrade_ws_to_wss_on_redirect(&signaling_url, &err) {
+                tauri_invoke(
+                    "join_room_session",
+                    &JoinRoomArgs {
+                        signaling_url: wss_url,
+                        room_id,
+                        custom_ice_servers,
+                    },
+                )
+                .await
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 pub async fn invoke_leave_room() -> Result<(), String> {
@@ -168,17 +225,14 @@ pub async fn invoke_set_peer_watched(peer_id: PeerId, watched: bool) -> Result<(
     Ok(())
 }
 
-/// Fetches a raw binary frame buffer (`ArrayBuffer` / `Uint8Array`) for `peer_id` from Tauri IPC,
-/// parses the 24-byte header (`[u32 width, u32 height, [u8; 16] peer_uuid]`), constructs a
-/// `web_sys::ImageData`, and renders it directly onto the target `<canvas>` 2D context.
-pub async fn fetch_and_render_peer_canvas(
-    peer_id: PeerId,
-    canvas_id: &str,
-) -> Result<bool, String> {
-    let js_args =
-        serde_wasm_bindgen::to_value(&FetchFrameArgs { peer_id }).map_err(|e| e.to_string())?;
-    let raw = tauri_invoke_raw("fetch_peer_frame", js_args).await?;
+pub async fn invoke_set_window_fullscreen(fullscreen: bool) -> Result<(), String> {
+    let js_args = serde_wasm_bindgen::to_value(&SetFullscreenArgs { fullscreen })
+        .map_err(|e| e.to_string())?;
+    let _ = tauri_invoke_raw("set_window_fullscreen", js_args).await?;
+    Ok(())
+}
 
+fn render_binary_packet_to_canvas(raw: JsValue, canvas_id: &str) -> Result<bool, String> {
     let u8_array = if raw.is_instance_of::<ArrayBuffer>() {
         Uint8Array::new(&raw)
     } else if raw.is_instance_of::<Uint8Array>() {
@@ -188,15 +242,25 @@ pub async fn fetch_and_render_peer_canvas(
     };
 
     let packet_len = u8_array.length() as usize;
-    if packet_len == 0 {
+    if packet_len < FRAME_HEADER_LEN {
         return Ok(false);
     }
 
-    let mut packet = vec![0u8; packet_len];
-    u8_array.copy_to(&mut packet);
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    u8_array
+        .subarray(0, FRAME_HEADER_LEN as u32)
+        .copy_to(&mut header);
 
-    let (_decoded_peer, width, height, rgba) =
-        decode_frame_packet(&packet).map_err(|e| e.to_string())?;
+    let width = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let height = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let expected_rgba_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "Frame dimensions overflow".to_string())?;
+
+    if width == 0 || height == 0 || packet_len != FRAME_HEADER_LEN + expected_rgba_len {
+        return Ok(false);
+    }
 
     let window = web_sys::window().ok_or_else(|| "No window".to_string())?;
     let document = window.document().ok_or_else(|| "No document".to_string())?;
@@ -222,12 +286,61 @@ pub async fn fetch_and_render_peer_canvas(
         .dyn_into::<CanvasRenderingContext2d>()
         .map_err(|_| "Invalid 2D rendering context".to_string())?;
 
-    let image_data =
-        ImageData::new_with_u8_clamped_array_and_sh(Clamped(rgba), width, height)
-            .map_err(format_js_error)?;
+    let clamped = Uint8ClampedArray::new_with_byte_offset_and_length(
+        &u8_array.buffer(),
+        u8_array.byte_offset() + FRAME_HEADER_LEN as u32,
+        expected_rgba_len as u32,
+    );
+
+    let image_data_ctor = Reflect::get(&window, &JsValue::from_str("ImageData"))
+        .map_err(format_js_error)?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| "ImageData constructor unavailable".to_string())?;
+    let ctor_args = Array::of3(
+        &clamped.into(),
+        &JsValue::from_f64(width as f64),
+        &JsValue::from_f64(height as f64),
+    );
+    let image_data: ImageData = Reflect::construct(&image_data_ctor, &ctor_args)
+        .map_err(format_js_error)?
+        .unchecked_into::<ImageData>();
 
     ctx.put_image_data(&image_data, 0.0, 0.0)
         .map_err(format_js_error)?;
 
     Ok(true)
+}
+
+/// Fetches a raw binary frame buffer (`ArrayBuffer` / `Uint8Array`) for `peer_id` from Tauri IPC,
+/// parses only the 24-byte header (`[u32 width, u32 height, [u8; 16] peer_uuid]`), constructs a
+/// zero-copy `Uint8ClampedArray` view over the JS `ArrayBuffer`, and renders it directly onto
+/// the target `<canvas>` 2D context without copying pixel bytes through WASM linear memory.
+pub async fn fetch_and_render_peer_canvas(
+    peer_id: PeerId,
+    canvas_id: &str,
+) -> Result<bool, String> {
+    let js_args =
+        serde_wasm_bindgen::to_value(&FetchFrameArgs { peer_id }).map_err(|e| e.to_string())?;
+    let raw = tauri_invoke_raw("fetch_peer_frame", js_args).await?;
+    render_binary_packet_to_canvas(raw, canvas_id)
+}
+
+/// Captures a live preview frame for the selected `CaptureTarget` in the picker modal and renders
+/// it onto the preview `<canvas>`.
+pub async fn fetch_and_render_target_preview(
+    target: CaptureTarget,
+    canvas_id: &str,
+) -> Result<bool, String> {
+    let js_args = serde_wasm_bindgen::to_value(&CapturePreviewArgs { target })
+        .map_err(|e| e.to_string())?;
+    let raw = tauri_invoke_raw("capture_target_preview", js_args).await?;
+    render_binary_packet_to_canvas(raw, canvas_id)
+}
+
+/// Fetches the latest locally captured & scaled video frame while the local user is sharing their
+/// screen and renders it onto the local preview `<canvas>`.
+pub async fn fetch_and_render_local_preview_canvas(canvas_id: &str) -> Result<bool, String> {
+    let empty = Object::new();
+    let raw = tauri_invoke_raw("fetch_local_preview_frame", empty.into()).await?;
+    render_binary_packet_to_canvas(raw, canvas_id)
 }

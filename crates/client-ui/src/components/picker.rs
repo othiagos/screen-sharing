@@ -1,8 +1,12 @@
-use leptos::*;
+use std::{cell::Cell, rc::Rc, time::Duration};
+
+use leptos::{leptos_dom::helpers::set_interval_with_handle, *};
 use shared_protocol::{AudioCaptureMode, CaptureTarget, StreamConfig, TargetResolution};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::ipc::{invoke_list_capture_sources, invoke_start_screen_share};
+use crate::ipc::{
+    fetch_and_render_target_preview, invoke_list_capture_sources, invoke_start_screen_share,
+};
 
 #[component]
 pub fn CapturePickerModal(
@@ -16,6 +20,10 @@ pub fn CapturePickerModal(
     let (resolution_choice, set_resolution_choice) = create_signal("720p".to_string());
     let (fps_choice, set_fps_choice) = create_signal("30".to_string());
     let (audio_choice, set_audio_choice) = create_signal("system".to_string());
+
+    let preview_in_flight = Rc::new(Cell::new(false));
+    let preview_in_flight_effect = Rc::clone(&preview_in_flight);
+    let preview_in_flight_timer = Rc::clone(&preview_in_flight);
 
     let refresh_sources = move || {
         spawn_local(async move {
@@ -34,6 +42,48 @@ pub fn CapturePickerModal(
             refresh_sources();
         }
     });
+
+    // Immediately render preview when selection or source list changes while modal is open
+    create_effect(move |_| {
+        if !show.get() {
+            return;
+        }
+        let idx = selected_idx.get();
+        let maybe_target = sources.with(|list| list.get(idx).cloned());
+        if let Some(target) = maybe_target {
+            if !preview_in_flight_effect.get() {
+                preview_in_flight_effect.set(true);
+                let in_flight = Rc::clone(&preview_in_flight_effect);
+                spawn_local(async move {
+                    let _ = fetch_and_render_target_preview(target, "picker-preview-canvas").await;
+                    in_flight.set(false);
+                });
+            }
+        }
+    });
+
+    // Live preview refresh while picker modal is open
+    if let Ok(preview_handle) = set_interval_with_handle(
+        move || {
+            if !show.get_untracked() || preview_in_flight_timer.get() {
+                return;
+            }
+            let idx = selected_idx.get_untracked();
+            let maybe_target = sources.with_untracked(|list| list.get(idx).cloned());
+            let Some(target) = maybe_target else {
+                return;
+            };
+            preview_in_flight_timer.set(true);
+            let in_flight = Rc::clone(&preview_in_flight_timer);
+            spawn_local(async move {
+                let _ = fetch_and_render_target_preview(target, "picker-preview-canvas").await;
+                in_flight.set(false);
+            });
+        },
+        Duration::from_millis(350),
+    ) {
+        on_cleanup(move || preview_handle.clear());
+    }
 
     let on_start_share = move |_| {
         let current_sources = sources.get();
@@ -141,6 +191,31 @@ pub fn CapturePickerModal(
                                 .collect_view()
                         }}
                     </div>
+                </div>
+
+                <div style="margin-top: 1rem;">
+                    <div class="row" style="justify-content: space-between; margin-top: 0; margin-bottom: 0.4rem;">
+                        <label style="font-size: 0.85rem; color: var(--text-muted); font-weight: 600;">
+                            "Preview of Selected Screen / Window:"
+                        </label>
+                        <span style="font-size: 0.8rem; color: var(--text-muted);">
+                            {move || {
+                                let idx = selected_idx.get();
+                                sources.with(|list| {
+                                    list.get(idx).map(|src| match src {
+                                        CaptureTarget::Monitor { id, name } => format!("Monitor #{id}: {name}"),
+                                        CaptureTarget::Window { title, pid, .. } => format!("{title} (PID {pid})"),
+                                    }).unwrap_or_else(|| "No source selected".to_string())
+                                })
+                            }}
+                        </span>
+                    </div>
+                    <canvas
+                        id="picker-preview-canvas"
+                        width="640"
+                        height="360"
+                        style="width: 100%; max-height: 240px; object-fit: contain; background: #000; border-radius: 0.5rem; border: 1px solid #334155; display: block;"
+                    ></canvas>
                 </div>
 
                 <div class="row" style="margin-top: 1.1rem; gap: 1.5rem; align-items: flex-start;">
