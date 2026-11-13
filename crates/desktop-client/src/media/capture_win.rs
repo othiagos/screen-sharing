@@ -1,0 +1,869 @@
+#![cfg(target_os = "windows")]
+
+use std::ffi::c_void;
+use std::mem::size_of;
+use std::ptr::null_mut;
+
+use fast_image_resize::Resizer;
+use shared_protocol::{CaptureTarget, TargetResolution};
+use tracing::{debug, warn};
+use windows::core::{Interface, IInspectable};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+};
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    SRCCOPY,
+};
+use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClientRect, GetShellWindow, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+};
+
+use crate::media::traits::MediaError;
+use crate::media::video::scale_bgra_frame_with_resizer;
+
+/// Outcome of polling a Windows GPU/GDI capture source.
+pub enum CapturePoll {
+    /// New scaled BGRA frame produced.
+    Frame(u32, u32, Vec<u8>),
+    /// Source screen/window had no compositor damage since the previous frame.
+    Unchanged,
+}
+
+fn has_non_zero_sample(buf: &[u8]) -> bool {
+    let step = (buf.len() / 512).max(16);
+    for chunk in buf.chunks(step) {
+        if chunk.len() >= 3 && (chunk[0] != 0 || chunk[1] != 0 || chunk[2] != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// GPU DXGI Desktop Duplication monitor capturer (zero duplicate encode spam on idle ticks).
+pub struct DxgiMonitorDuplicator {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    dupl: IDXGIOutputDuplication,
+    staging_tex: Option<ID3D11Texture2D>,
+    staging_dims: (u32, u32),
+    last_bgra: Vec<u8>,
+    width: u32,
+    height: u32,
+    monitor_id_hint: u32,
+    monitor_name_hint: String,
+}
+
+impl DxgiMonitorDuplicator {
+    pub fn new(monitor_id_hint: u32, monitor_name_hint: &str) -> Result<Self, MediaError> {
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()
+                .map_err(|e| MediaError::VideoCapture(format!("CreateDXGIFactory1: {e}")))?;
+
+            let mut fallback_pair = None;
+            let mut matched_pair = None;
+            let mut adapter_idx = 0u32;
+
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
+                let mut output_idx = 0u32;
+                while let Ok(output) = adapter.EnumOutputs(output_idx) {
+                    if let Ok(desc) = output.GetDesc() {
+                        if desc.AttachedToDesktop.as_bool() {
+                            let hmon_id = desc.Monitor.0 as usize as u32;
+                            let dev_name_len = desc
+                                .DeviceName
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.DeviceName.len());
+                            let dev_name =
+                                String::from_utf16_lossy(&desc.DeviceName[..dev_name_len]);
+
+                            if fallback_pair.is_none() {
+                                fallback_pair = Some((adapter.clone(), output.clone()));
+                            }
+                            if hmon_id == monitor_id_hint
+                                || (!monitor_name_hint.is_empty()
+                                    && dev_name.contains(monitor_name_hint))
+                            {
+                                matched_pair = Some((adapter.clone(), output));
+                                break;
+                            }
+                        }
+                    }
+                    output_idx += 1;
+                }
+                if matched_pair.is_some() {
+                    break;
+                }
+                adapter_idx += 1;
+            }
+
+            let (adapter, output) = matched_pair.or(fallback_pair).ok_or_else(|| {
+                MediaError::VideoCapture("No attached DXGI desktop outputs found".to_string())
+            })?;
+
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            D3D11CreateDevice(
+                &adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .map_err(|e| MediaError::VideoCapture(format!("D3D11CreateDevice failed: {e}")))?;
+
+            let device = device.ok_or_else(|| {
+                MediaError::VideoCapture("D3D11CreateDevice returned null device".to_string())
+            })?;
+            let context = context.ok_or_else(|| {
+                MediaError::VideoCapture("D3D11CreateDevice returned null context".to_string())
+            })?;
+
+            let output1: IDXGIOutput1 = output
+                .cast()
+                .map_err(|e| MediaError::VideoCapture(format!("IDXGIOutput1 cast: {e}")))?;
+            let dupl = output1
+                .DuplicateOutput(&device)
+                .map_err(|e| MediaError::VideoCapture(format!("DuplicateOutput: {e}")))?;
+
+            let dupl_desc = dupl.GetDesc();
+            let width = dupl_desc.ModeDesc.Width;
+            let height = dupl_desc.ModeDesc.Height;
+
+            Ok(Self {
+                device,
+                context,
+                dupl,
+                staging_tex: None,
+                staging_dims: (0, 0),
+                last_bgra: Vec::new(),
+                width,
+                height,
+                monitor_id_hint,
+                monitor_name_hint: monitor_name_hint.to_string(),
+            })
+        }
+    }
+
+    fn recreate(&mut self) -> Result<(), MediaError> {
+        *self = Self::new(self.monitor_id_hint, &self.monitor_name_hint)?;
+        Ok(())
+    }
+
+    pub fn poll_scaled_frame(
+        &mut self,
+        resizer: &mut Resizer,
+        resolution: TargetResolution,
+        clamp_1080p: bool,
+    ) -> Result<CapturePoll, MediaError> {
+        unsafe {
+            let timeout_ms = if self.last_bgra.is_empty() { 32 } else { 0 };
+            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+
+            match self
+                .dupl
+                .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
+            {
+                Ok(()) => {
+                    let copy_res = (|| -> Result<(), MediaError> {
+                        let res = resource.take().ok_or_else(|| {
+                            MediaError::VideoCapture(
+                                "DXGI AcquireNextFrame returned null resource".to_string(),
+                            )
+                        })?;
+                        let src_tex: ID3D11Texture2D = res.cast().map_err(|e| {
+                            MediaError::VideoCapture(format!("ID3D11Texture2D cast: {e}"))
+                        })?;
+                        copy_texture_to_bgra_vec(
+                            &self.device,
+                            &self.context,
+                            &mut self.staging_tex,
+                            &mut self.staging_dims,
+                            &src_tex,
+                            &mut self.last_bgra,
+                            &mut self.width,
+                            &mut self.height,
+                        )
+                    })();
+
+                    let _ = self.dupl.ReleaseFrame();
+                    copy_res?;
+
+                    let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+                        resizer,
+                        &self.last_bgra,
+                        self.width,
+                        self.height,
+                        resolution,
+                        clamp_1080p,
+                    )?;
+                    Ok(CapturePoll::Frame(dst_w, dst_h, scaled))
+                }
+                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    if self.last_bgra.is_empty() {
+                        Err(MediaError::VideoCapture(
+                            "DXGI initial frame timed out".to_string(),
+                        ))
+                    } else {
+                        Ok(CapturePoll::Unchanged)
+                    }
+                }
+                Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
+                    self.recreate()?;
+                    Ok(CapturePoll::Unchanged)
+                }
+                Err(err) => Err(MediaError::VideoCapture(format!(
+                    "DXGI AcquireNextFrame error: {err}"
+                ))),
+            }
+        }
+    }
+}
+
+/// GPU window capturer backed by `Windows.Graphics.Capture` (WGC) for tear-free game capture
+/// without Alt-Tab desktop leaks, with automatic GDI DIB fallback on older Windows 10 builds.
+pub struct Win32WindowCapturer {
+    id: u32,
+    title: String,
+    wgc: Option<WgcSession>,
+    wgc_attempted: bool,
+    gdi_fallback: GdiDibSurface,
+}
+
+struct WgcSession {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    winrt_device: IDirect3DDevice,
+    frame_pool: Direct3D11CaptureFramePool,
+    _session: GraphicsCaptureSession,
+    staging_tex: Option<ID3D11Texture2D>,
+    staging_dims: (u32, u32),
+    last_bgra: Vec<u8>,
+    width: u32,
+    height: u32,
+    pool_size: SizeInt32,
+}
+
+impl WgcSession {
+    fn new(hwnd: HWND) -> Result<Self, MediaError> {
+        unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
+
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            D3D11CreateDevice(
+                None,
+                windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+            .map_err(|e| MediaError::VideoCapture(format!("WGC D3D11CreateDevice failed: {e}")))?;
+
+            let device = device.ok_or_else(|| {
+                MediaError::VideoCapture("WGC D3D11 device was null".to_string())
+            })?;
+            let context = context.ok_or_else(|| {
+                MediaError::VideoCapture("WGC D3D11 context was null".to_string())
+            })?;
+
+            let dxgi_device: IDXGIDevice = device
+                .cast()
+                .map_err(|e| MediaError::VideoCapture(format!("WGC IDXGIDevice cast: {e}")))?;
+            let inspectable: IInspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
+                .map_err(|e| {
+                    MediaError::VideoCapture(format!(
+                        "CreateDirect3D11DeviceFromDXGIDevice failed: {e}"
+                    ))
+                })?;
+            let winrt_device: IDirect3DDevice = inspectable
+                .cast()
+                .map_err(|e| MediaError::VideoCapture(format!("IDirect3DDevice cast: {e}")))?;
+
+            let interop: IGraphicsCaptureItemInterop =
+                windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                    .map_err(|e| {
+                        MediaError::VideoCapture(format!("WGC GraphicsCaptureItem factory: {e}"))
+                    })?;
+            let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd).map_err(|e| {
+                MediaError::VideoCapture(format!("WGC CreateForWindow failed: {e}"))
+            })?;
+            let item_size = item
+                .Size()
+                .map_err(|e| MediaError::VideoCapture(format!("WGC GraphicsCaptureItem::Size: {e}")))?;
+            let pool_size = SizeInt32 {
+                Width: item_size.Width.max(2),
+                Height: item_size.Height.max(2),
+            };
+
+            let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+                &winrt_device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                2,
+                pool_size,
+            )
+            .map_err(|e| {
+                MediaError::VideoCapture(format!("WGC CreateFreeThreaded failed: {e}"))
+            })?;
+
+            let session = frame_pool.CreateCaptureSession(&item).map_err(|e| {
+                MediaError::VideoCapture(format!("WGC CreateCaptureSession failed: {e}"))
+            })?;
+            // Suppress yellow capture border on Win11 and keep game cursor visible if supported.
+            let _ = session.SetIsBorderRequired(false);
+            let _ = session.SetIsCursorCaptureEnabled(true);
+            session.StartCapture().map_err(|e| {
+                MediaError::VideoCapture(format!("WGC StartCapture failed: {e}"))
+            })?;
+
+            Ok(Self {
+                device,
+                context,
+                winrt_device,
+                frame_pool,
+                _session: session,
+                staging_tex: None,
+                staging_dims: (0, 0),
+                last_bgra: Vec::new(),
+                width: 0,
+                height: 0,
+                pool_size,
+            })
+        }
+    }
+
+    fn poll_bgra(&mut self) -> Result<Option<(u32, u32, &[u8])>, MediaError> {
+        let mut latest_frame = None;
+        while let Ok(frame) = self.frame_pool.TryGetNextFrame() {
+            latest_frame = Some(frame);
+        }
+
+        let Some(frame) = latest_frame else {
+            return Ok(None);
+        };
+
+        let content_size = frame
+            .ContentSize()
+            .unwrap_or(self.pool_size);
+        if content_size.Width > 1
+            && content_size.Height > 1
+            && (content_size.Width != self.pool_size.Width
+                || content_size.Height != self.pool_size.Height)
+        {
+            self.pool_size = content_size;
+            let _ = self.frame_pool.Recreate(
+                &self.winrt_device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                2,
+                content_size,
+            );
+        }
+
+        let surface = frame
+            .Surface()
+            .map_err(|e| MediaError::VideoCapture(format!("WGC frame.Surface(): {e}")))?;
+        let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(|e| {
+            MediaError::VideoCapture(format!("WGC IDirect3DDxgiInterfaceAccess: {e}"))
+        })?;
+        let src_tex: ID3D11Texture2D = unsafe {
+            access
+                .GetInterface()
+                .map_err(|e| MediaError::VideoCapture(format!("WGC GetInterface<ID3D11Texture2D>: {e}")))?
+        };
+
+        unsafe {
+            copy_texture_to_bgra_vec(
+                &self.device,
+                &self.context,
+                &mut self.staging_tex,
+                &mut self.staging_dims,
+                &src_tex,
+                &mut self.last_bgra,
+                &mut self.width,
+                &mut self.height,
+            )?;
+        }
+
+        Ok(Some((self.width, self.height, &self.last_bgra)))
+    }
+}
+
+impl Drop for WgcSession {
+    fn drop(&mut self) {
+        let _ = self._session.Close();
+        let _ = self.frame_pool.Close();
+    }
+}
+
+impl Win32WindowCapturer {
+    pub fn new(id: u32, title: String) -> Self {
+        Self {
+            id,
+            title,
+            wgc: None,
+            wgc_attempted: false,
+            gdi_fallback: GdiDibSurface::default(),
+        }
+    }
+
+    pub fn poll_scaled_frame(
+        &mut self,
+        resizer: &mut Resizer,
+        resolution: TargetResolution,
+        clamp_1080p: bool,
+    ) -> Result<CapturePoll, MediaError> {
+        let hwnd = resolve_hwnd(self.id, &self.title)?;
+        if unsafe { IsIconic(hwnd).as_bool() } {
+            // Minimized windows don't produce compositor surfaces until restored.
+            return Ok(CapturePoll::Unchanged);
+        }
+
+        if !self.wgc_attempted {
+            self.wgc_attempted = true;
+            match WgcSession::new(hwnd) {
+                Ok(session) => {
+                    debug!(id = self.id, title = %self.title, "Activated Windows.Graphics.Capture for window");
+                    self.wgc = Some(session);
+                }
+                Err(err) => {
+                    warn!(id = self.id, title = %self.title, "WGC unavailable ({err}); using PrintWindow DIB fallback");
+                }
+            }
+        }
+
+        if let Some(wgc) = self.wgc.as_mut() {
+            match wgc.poll_bgra() {
+                Ok(Some((w, h, bgra))) => {
+                    let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+                        resizer,
+                        bgra,
+                        w,
+                        h,
+                        resolution,
+                        clamp_1080p,
+                    )?;
+                    return Ok(CapturePoll::Frame(dst_w, dst_h, scaled));
+                }
+                Ok(None) => return Ok(CapturePoll::Unchanged),
+                Err(err) => {
+                    debug!("WGC poll failed ({err}), recreating session");
+                    self.wgc = None;
+                    self.wgc_attempted = false;
+                }
+            }
+        }
+
+        self.capture_gdi_fallback(hwnd, resizer, resolution, clamp_1080p)
+    }
+
+    fn capture_gdi_fallback(
+        &mut self,
+        hwnd: HWND,
+        resizer: &mut Resizer,
+        resolution: TargetResolution,
+        clamp_1080p: bool,
+    ) -> Result<CapturePoll, MediaError> {
+        unsafe {
+            let mut client = RECT::default();
+            let mut use_window_dc = false;
+            if GetClientRect(hwnd, &mut client).is_err()
+                || (client.right - client.left) <= 1
+                || (client.bottom - client.top) <= 1
+            {
+                GetWindowRect(hwnd, &mut client).map_err(|e| {
+                    MediaError::VideoCapture(format!("GetWindowRect failed: {e}"))
+                })?;
+                use_window_dc = true;
+            }
+            let w = (client.right - client.left).max(2) as u32;
+            let h = (client.bottom - client.top).max(2) as u32;
+
+            let hdc_src = GetDC(hwnd);
+            if hdc_src.is_invalid() {
+                return Ok(CapturePoll::Unchanged);
+            }
+
+            if !self.gdi_fallback.ensure_size(hdc_src, w, h) {
+                ReleaseDC(hwnd, hdc_src);
+                return Err(MediaError::VideoCapture("GDI DIB allocation failed".to_string()));
+            }
+
+            let ok_blt = BitBlt(
+                self.gdi_fallback.hdc_mem,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                hdc_src,
+                0,
+                0,
+                SRCCOPY,
+            )
+            .is_ok();
+            ReleaseDC(hwnd, hdc_src);
+
+            let total_bytes = (w as usize) * (h as usize) * 4;
+            let raw = std::slice::from_raw_parts(self.gdi_fallback.dib_ptr, total_bytes);
+            if !ok_blt || !has_non_zero_sample(raw) {
+                let flags = if use_window_dc {
+                    PRINT_WINDOW_FLAGS(2)
+                } else {
+                    PRINT_WINDOW_FLAGS(3)
+                };
+                let _ = PrintWindow(hwnd, self.gdi_fallback.hdc_mem, flags);
+            }
+
+            let raw_after = std::slice::from_raw_parts(self.gdi_fallback.dib_ptr, total_bytes);
+            let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+                resizer,
+                raw_after,
+                w,
+                h,
+                resolution,
+                clamp_1080p,
+            )?;
+            Ok(CapturePoll::Frame(dst_w, dst_h, scaled))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_texture_to_bgra_vec(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    staging_tex: &mut Option<ID3D11Texture2D>,
+    staging_dims: &mut (u32, u32),
+    src_tex: &ID3D11Texture2D,
+    out_bgra: &mut Vec<u8>,
+    out_w: &mut u32,
+    out_h: &mut u32,
+) -> Result<(), MediaError> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    src_tex.GetDesc(&mut desc);
+    let w = desc.Width;
+    let h = desc.Height;
+    if w == 0 || h == 0 {
+        return Err(MediaError::VideoCapture(
+            "Captured D3D11 texture has zero dimensions".to_string(),
+        ));
+    }
+
+    if staging_tex.is_none() || *staging_dims != (w, h) {
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut new_tex: Option<ID3D11Texture2D> = None;
+        device
+            .CreateTexture2D(&staging_desc, None, Some(&mut new_tex))
+            .map_err(|e| MediaError::VideoCapture(format!("CreateTexture2D staging: {e}")))?;
+        *staging_tex = new_tex;
+        *staging_dims = (w, h);
+    }
+
+    let staging = staging_tex.as_ref().unwrap();
+    context.CopyResource(staging, src_tex);
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    context
+        .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        .map_err(|e| MediaError::VideoCapture(format!("ID3D11DeviceContext::Map: {e}")))?;
+
+    let row_bytes = (w as usize) * 4;
+    let total_bytes = row_bytes * (h as usize);
+    if out_bgra.len() != total_bytes {
+        out_bgra.resize(total_bytes, 0);
+    }
+    let src_pitch = mapped.RowPitch as usize;
+    let src_ptr = mapped.pData.cast::<u8>();
+    if src_pitch == row_bytes {
+        std::ptr::copy_nonoverlapping(src_ptr, out_bgra.as_mut_ptr(), total_bytes);
+    } else {
+        for row in 0..(h as usize) {
+            std::ptr::copy_nonoverlapping(
+                src_ptr.add(row * src_pitch),
+                out_bgra.as_mut_ptr().add(row * row_bytes),
+                row_bytes,
+            );
+        }
+    }
+
+    context.Unmap(staging, 0);
+    *out_w = w;
+    *out_h = h;
+    Ok(())
+}
+
+struct GdiDibSurface {
+    hdc_mem: HDC,
+    hbitmap: HBITMAP,
+    old_obj: HGDIOBJ,
+    dib_ptr: *mut u8,
+    width: u32,
+    height: u32,
+}
+
+impl Default for GdiDibSurface {
+    fn default() -> Self {
+        Self {
+            hdc_mem: HDC::default(),
+            hbitmap: HBITMAP::default(),
+            old_obj: HGDIOBJ::default(),
+            dib_ptr: null_mut(),
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+impl GdiDibSurface {
+    unsafe fn cleanup(&mut self) {
+        if !self.hdc_mem.is_invalid() {
+            if !self.old_obj.is_invalid() {
+                let _ = SelectObject(self.hdc_mem, self.old_obj);
+                self.old_obj = HGDIOBJ::default();
+            }
+            if !self.hbitmap.is_invalid() {
+                let _ = DeleteObject(self.hbitmap);
+                self.hbitmap = HBITMAP::default();
+            }
+            let _ = DeleteDC(self.hdc_mem);
+            self.hdc_mem = HDC::default();
+        }
+        self.dib_ptr = null_mut();
+        self.width = 0;
+        self.height = 0;
+    }
+
+    unsafe fn ensure_size(&mut self, hdc_ref: HDC, width: u32, height: u32) -> bool {
+        if !self.hdc_mem.is_invalid()
+            && !self.dib_ptr.is_null()
+            && self.width == width
+            && self.height == height
+        {
+            return true;
+        }
+        self.cleanup();
+
+        let hdc_mem = CreateCompatibleDC(hdc_ref);
+        if hdc_mem.is_invalid() {
+            return false;
+        }
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut c_void = null_mut();
+        let hbitmap = match CreateDIBSection(
+            hdc_mem,
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            windows::Win32::Foundation::HANDLE::default(),
+            0,
+        ) {
+            Ok(hbmp) if !hbmp.is_invalid() && !bits.is_null() => hbmp,
+            _ => {
+                let _ = DeleteDC(hdc_mem);
+                return false;
+            }
+        };
+
+        let old_obj = SelectObject(hdc_mem, hbitmap);
+        self.hdc_mem = hdc_mem;
+        self.hbitmap = hbitmap;
+        self.old_obj = old_obj;
+        self.dib_ptr = bits.cast::<u8>();
+        self.width = width;
+        self.height = height;
+        true
+    }
+}
+
+impl Drop for GdiDibSurface {
+    fn drop(&mut self) {
+        unsafe {
+            self.cleanup();
+        }
+    }
+}
+
+fn is_ignored_system_title(title: &str) -> bool {
+    matches!(
+        title,
+        "Program Manager"
+            | "Windows Input Experience"
+            | "Microsoft Text Input Application"
+            | "MSCTFIME UI"
+            | "Default IME"
+    )
+}
+
+unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = &mut *(lparam.0 as *mut Vec<CaptureTarget>);
+
+    if !IsWindowVisible(hwnd).as_bool() {
+        return BOOL(1);
+    }
+
+    let shell_hwnd = GetShellWindow();
+    if !shell_hwnd.0.is_null() && hwnd == shell_hwnd {
+        return BOOL(1);
+    }
+
+    let is_minimized = IsIconic(hwnd).as_bool();
+    if !is_minimized {
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast::<c_void>(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return BOOL(1);
+        }
+    }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+    let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+    let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
+
+    if (is_tool_window || is_no_activate) && !is_app_window {
+        return BOOL(1);
+    }
+
+    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+        if !owner.0.is_null() && !is_app_window {
+            return BOOL(1);
+        }
+    }
+
+    let text_len = GetWindowTextLengthW(hwnd);
+    if text_len <= 0 {
+        return BOOL(1);
+    }
+
+    let mut buf = vec![0u16; (text_len as usize) + 1];
+    let copied = GetWindowTextW(hwnd, &mut buf);
+    if copied <= 0 {
+        return BOOL(1);
+    }
+
+    let title = String::from_utf16_lossy(&buf[..copied as usize])
+        .trim()
+        .to_string();
+    if title.is_empty() || is_ignored_system_title(&title) {
+        return BOOL(1);
+    }
+
+    if !is_minimized {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_ok()
+            && ((rect.right - rect.left) <= 1 || (rect.bottom - rect.top) <= 1)
+        {
+            return BOOL(1);
+        }
+    }
+
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+    out.push(CaptureTarget::Window {
+        id: hwnd.0 as usize as u32,
+        title,
+        pid,
+    });
+
+    BOOL(1)
+}
+
+pub fn list_windows_win32() -> Vec<CaptureTarget> {
+    let mut windows: Vec<CaptureTarget> = Vec::new();
+    unsafe {
+        let lparam = LPARAM((&mut windows as *mut Vec<CaptureTarget>) as isize);
+        let _ = EnumWindows(Some(enum_windows_proc), lparam);
+    }
+    windows
+}
+
+pub fn resolve_hwnd(id: u32, title_hint: &str) -> Result<HWND, MediaError> {
+    let candidate = HWND(id as usize as *mut c_void);
+    if unsafe { IsWindow(candidate).as_bool() } {
+        return Ok(candidate);
+    }
+
+    for target in list_windows_win32() {
+        if let CaptureTarget::Window {
+            id: win_id, title, ..
+        } = target
+        {
+            if win_id == id || (!title_hint.is_empty() && title == title_hint) {
+                return Ok(HWND(win_id as usize as *mut c_void));
+            }
+        }
+    }
+
+    Err(MediaError::SourceNotFound(format!(
+        "Window id={id} ({title_hint}) closed or not found"
+    )))
+}

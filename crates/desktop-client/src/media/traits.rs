@@ -44,7 +44,7 @@ impl RawAudioFrame {
 }
 
 pub trait VideoCapturer: Send + Sync + 'static {
-    /// Starts capturing frames at `fps` and `resolution`, sending scaled RGBA frames to `tx`
+    /// Starts capturing frames at `fps` and `resolution`, sending scaled frames to `tx`
     /// until `cancel` is triggered.
     fn start_capture(
         &self,
@@ -65,4 +65,32 @@ pub trait AudioCapturer: Send + Sync + 'static {
         tx: mpsc::Sender<RawAudioFrame>,
         cancel: CancellationToken,
     ) -> Result<(), MediaError>;
+
+    /// Starts capturing audio and surfaces non-fatal fallback notices via `warning_tx`.
+    fn start_capture_with_warnings(
+        &self,
+        mode: AudioCaptureMode,
+        tx: mpsc::Sender<RawAudioFrame>,
+        _warning_tx: Option<mpsc::UnboundedSender<String>>,
+        cancel: CancellationToken,
+    ) -> Result<(), MediaError> {
+        self.start_capture(mode, tx, cancel)
+    }
+}
+
+/// Uniform H.264 encoder interface implemented by hardware MFT and tuned OpenH264.
+pub trait VideoEncoder: Send + 'static {
+    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError>;
+    fn request_keyframe(&mut self);
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError>;
+    fn backend_name(&self) -> &'static str;
+}
+
+/// Uniform H.264 decoder outputting tightly-packed BGRA pixels for direct `RenderImage` upload.
+pub trait VideoDecoder: Send + 'static {
+    fn decode_annex_b_bgra(
+        &mut self,
+        annex_b: &[u8],
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError>;
+    fn backend_name(&self) -> &'static str;
 }

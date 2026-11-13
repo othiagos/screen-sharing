@@ -1,4 +1,6 @@
-pub mod commands;
+extern crate gpui_kit as gpui;
+
+pub mod config;
 pub mod media;
-pub mod p2p;
-pub mod signaling;
+pub mod net;
+pub mod ui;

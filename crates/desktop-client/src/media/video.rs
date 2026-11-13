@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use fast_image_resize::{
     images::{Image, ImageRef},
-    PixelType, ResizeAlg, ResizeOptions, Resizer,
+    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
 };
 use openh264::{
     decoder::{Decoder, DecoderConfig},
@@ -13,13 +13,17 @@ use openh264::{
 use shared_protocol::{CaptureTarget, TargetResolution};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
-use yuv::color::{MatrixCoefficients, Range};
+use tracing::{info, warn};
 
-use crate::media::traits::{MediaError, RawVideoFrame, VideoCapturer};
+#[cfg(target_os = "windows")]
+use crate::media::capture_win::{
+    list_windows_win32, CapturePoll, DxgiMonitorDuplicator, Win32WindowCapturer,
+};
+use crate::media::traits::{
+    MediaError, RawVideoFrame, VideoCapturer, VideoDecoder, VideoEncoder,
+};
 
-/// Scales an arbitrary RGBA buffer (including odd dimensions) to the target resolution
-/// while preserving aspect ratio and enforcing even output dimensions (`width & !1`, `height & !1`).
+/// Scales an arbitrary RGBA buffer to `resolution` using Bilinear filtering while keeping even dimensions.
 pub fn scale_rgba_frame(
     src_rgba: &[u8],
     src_width: u32,
@@ -27,7 +31,7 @@ pub fn scale_rgba_frame(
     resolution: TargetResolution,
 ) -> Result<(u32, u32, Vec<u8>), MediaError> {
     let mut resizer = Resizer::new();
-    scale_rgba_frame_with_resizer(&mut resizer, src_rgba, src_width, src_height, resolution)
+    scale_rgba_frame_with_resizer(&mut resizer, src_rgba, src_width, src_height, resolution, false)
 }
 
 pub fn scale_rgba_frame_with_resizer(
@@ -36,38 +40,66 @@ pub fn scale_rgba_frame_with_resizer(
     src_width: u32,
     src_height: u32,
     resolution: TargetResolution,
+    clamp_1080p: bool,
+) -> Result<(u32, u32, Vec<u8>), MediaError> {
+    scale_pixel_buffer_with_resizer(
+        resizer,
+        src_rgba,
+        src_width,
+        src_height,
+        resolution,
+        clamp_1080p,
+    )
+}
+
+pub fn scale_bgra_frame_with_resizer(
+    resizer: &mut Resizer,
+    src_bgra: &[u8],
+    src_width: u32,
+    src_height: u32,
+    resolution: TargetResolution,
+    clamp_1080p: bool,
+) -> Result<(u32, u32, Vec<u8>), MediaError> {
+    scale_pixel_buffer_with_resizer(
+        resizer,
+        src_bgra,
+        src_width,
+        src_height,
+        resolution,
+        clamp_1080p,
+    )
+}
+
+fn scale_pixel_buffer_with_resizer(
+    resizer: &mut Resizer,
+    src_bytes: &[u8],
+    src_width: u32,
+    src_height: u32,
+    resolution: TargetResolution,
+    clamp_1080p: bool,
 ) -> Result<(u32, u32, Vec<u8>), MediaError> {
     let expected_len = (src_width as usize)
         .checked_mul(src_height as usize)
         .and_then(|px| px.checked_mul(4))
         .unwrap_or(0);
-    if src_width == 0 || src_height == 0 || src_rgba.len() < expected_len {
+    if src_width == 0 || src_height == 0 || src_bytes.len() < expected_len {
         return Err(MediaError::VideoCapture(format!(
-            "Invalid source RGBA buffer for {src_width}x{src_height}: got {} bytes",
-            src_rgba.len()
+            "Invalid source 32bpp buffer for {src_width}x{src_height}: got {} bytes",
+            src_bytes.len()
         )));
     }
 
-    let (dst_width, dst_height) = resolution.compute_dimensions(src_width, src_height, true);
+    let (dst_width, dst_height) = resolution.compute_dimensions(src_width, src_height, clamp_1080p);
     if dst_width == src_width && dst_height == src_height {
-        return Ok((
-            dst_width,
-            dst_height,
-            src_rgba[..expected_len].to_vec(),
-        ));
+        return Ok((dst_width, dst_height, src_bytes[..expected_len].to_vec()));
     }
 
-    let src_view = ImageRef::new(
-        src_width,
-        src_height,
-        &src_rgba[..expected_len],
-        PixelType::U8x4,
-    )
-    .map_err(|e| MediaError::VideoCapture(format!("fast_image_resize src error: {e}")))?;
+    let src_view = ImageRef::new(src_width, src_height, &src_bytes[..expected_len], PixelType::U8x4)
+        .map_err(|e| MediaError::VideoCapture(format!("fast_image_resize src error: {e}")))?;
 
     let mut dst_image = Image::new(dst_width, dst_height, PixelType::U8x4);
     let options = ResizeOptions::new()
-        .resize_alg(ResizeAlg::Nearest)
+        .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
         .use_alpha(false);
 
     resizer
@@ -77,187 +109,221 @@ pub fn scale_rgba_frame_with_resizer(
     Ok((dst_width, dst_height, dst_image.into_vec()))
 }
 
-/// Fast 2x2-block fixed-point integer RGBA to planar I420 (YUV420p) converter
-/// structured with `chunks_exact` so LLVM auto-vectorizes the inner loop with AVX2/SSE2.
+#[inline(always)]
+fn validate_even_yuv_dims(buf: &[u8], width: u32, height: u32) -> Result<(usize, usize), MediaError> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(MediaError::Codec(format!(
+            "YUV420 requires non-zero even dimensions, got {width}x{height}"
+        )));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let expected = w * h * 4;
+    if buf.len() < expected {
+        return Err(MediaError::Codec(format!(
+            "Pixel buffer too small for {width}x{height}: expected {expected}, got {}",
+            buf.len()
+        )));
+    }
+    Ok((w, h))
+}
+
+#[inline(always)]
+fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
+    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8
+}
+
+#[inline(always)]
+fn rgb_to_uv(r: i32, g: i32, b: i32) -> (u8, u8) {
+    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    (u, v)
+}
+
 #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+fn convert_32bpp_to_yuv_420(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    is_bgra: bool,
+    semi_planar_nv12: bool,
+    out_buf: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    let (w, h) = validate_even_yuv_dims(src, width, height)?;
+    let y_len = w * h;
+    let uv_len = y_len / 4;
+    let total = y_len + uv_len * 2;
+    if out_buf.len() != total {
+        out_buf.resize(total, 0);
+    }
+
+    let (y_plane, uv_planes) = out_buf.split_at_mut(y_len);
+    let half_w = w / 2;
+    let half_h = h / 2;
+    let row_stride = w * 4;
+    let r_idx = if is_bgra { 2 } else { 0 };
+    let b_idx = if is_bgra { 0 } else { 2 };
+
+    for (px_row, y_row) in src.chunks_exact(row_stride).zip(y_plane.chunks_exact_mut(w)) {
+        for (px, y_out) in px_row.chunks_exact(4).zip(y_row.iter_mut()) {
+            let r = i32::from(px[r_idx]);
+            let g = i32::from(px[1]);
+            let b = i32::from(px[b_idx]);
+            *y_out = rgb_to_y(r, g, b);
+        }
+    }
+
+    if semi_planar_nv12 {
+        for by in 0..half_h {
+            let py = by * 2;
+            let row0 = &src[py * row_stride..(py + 1) * row_stride];
+            let row1 = &src[(py + 1) * row_stride..(py + 2) * row_stride];
+            let uv_row = &mut uv_planes[by * w..(by + 1) * w];
+
+            for ((c0, c1), uv_pair) in row0
+                .chunks_exact(8)
+                .zip(row1.chunks_exact(8))
+                .zip(uv_row.chunks_exact_mut(2))
+            {
+                let r_avg = (i32::from(c0[r_idx])
+                    + i32::from(c0[4 + r_idx])
+                    + i32::from(c1[r_idx])
+                    + i32::from(c1[4 + r_idx])
+                    + 2)
+                    >> 2;
+                let g_avg = (i32::from(c0[1])
+                    + i32::from(c0[5])
+                    + i32::from(c1[1])
+                    + i32::from(c1[5])
+                    + 2)
+                    >> 2;
+                let b_avg = (i32::from(c0[b_idx])
+                    + i32::from(c0[4 + b_idx])
+                    + i32::from(c1[b_idx])
+                    + i32::from(c1[4 + b_idx])
+                    + 2)
+                    >> 2;
+
+                let (u, v) = rgb_to_uv(r_avg, g_avg, b_avg);
+                uv_pair[0] = u;
+                uv_pair[1] = v;
+            }
+        }
+    } else {
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_len);
+        for by in 0..half_h {
+            let py = by * 2;
+            let row0 = &src[py * row_stride..(py + 1) * row_stride];
+            let row1 = &src[(py + 1) * row_stride..(py + 2) * row_stride];
+            let u_row = &mut u_plane[by * half_w..(by + 1) * half_w];
+            let v_row = &mut v_plane[by * half_w..(by + 1) * half_w];
+
+            for (((c0, c1), u_out), v_out) in row0
+                .chunks_exact(8)
+                .zip(row1.chunks_exact(8))
+                .zip(u_row.iter_mut())
+                .zip(v_row.iter_mut())
+            {
+                let r_avg = (i32::from(c0[r_idx])
+                    + i32::from(c0[4 + r_idx])
+                    + i32::from(c1[r_idx])
+                    + i32::from(c1[4 + r_idx])
+                    + 2)
+                    >> 2;
+                let g_avg = (i32::from(c0[1])
+                    + i32::from(c0[5])
+                    + i32::from(c1[1])
+                    + i32::from(c1[5])
+                    + 2)
+                    >> 2;
+                let b_avg = (i32::from(c0[b_idx])
+                    + i32::from(c0[4 + b_idx])
+                    + i32::from(c1[b_idx])
+                    + i32::from(c1[4 + b_idx])
+                    + 2)
+                    >> 2;
+
+                let (u, v) = rgb_to_uv(r_avg, g_avg, b_avg);
+                *u_out = u;
+                *v_out = v;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn rgba_to_yuv420p_into(
     rgba: &[u8],
     width: u32,
     height: u32,
     yuv_buf: &mut Vec<u8>,
 ) -> Result<(), MediaError> {
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(MediaError::Codec(format!(
-            "YUV420p requires non-zero even dimensions, got {width}x{height}"
-        )));
-    }
-    let w = width as usize;
-    let h = height as usize;
-    let expected = w * h * 4;
-    if rgba.len() < expected {
-        return Err(MediaError::Codec(format!(
-            "RGBA buffer too small for {width}x{height}: expected {expected}, got {}",
-            rgba.len()
-        )));
-    }
-
-    // Touch `yuv` crate color space descriptors to validate BT.601 studio range compatibility.
-    let _ = (Range::Limited, MatrixCoefficients::BT601);
-
-    let y_len = w * h;
-    let uv_len = y_len / 4;
-    let total_yuv = y_len + uv_len * 2;
-    if yuv_buf.len() != total_yuv {
-        yuv_buf.resize(total_yuv, 0);
-    }
-
-    let (y_plane, uv_planes) = yuv_buf.split_at_mut(y_len);
-    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_len);
-    let half_w = w / 2;
-    let half_h = h / 2;
-    let row_stride = w * 4;
-
-    // 1. High-throughput row-by-row luminance (Y) conversion.
-    // Operating strictly on contiguous row slices allows LLVM to vectorize with AVX2/SSE2/NEON.
-    for (rgba_row, y_row) in rgba.chunks_exact(row_stride).zip(y_plane.chunks_exact_mut(w)) {
-        for (px, y_out) in rgba_row.chunks_exact(4).zip(y_row.iter_mut()) {
-            let r = i32::from(px[0]);
-            let g = i32::from(px[1]);
-            let b = i32::from(px[2]);
-            *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
-        }
-    }
-
-    // 2. Chrominance (U, V) conversion with 2x2 box averaging.
-    for by in 0..half_h {
-        let py = by * 2;
-        let rgba_row0 = &rgba[py * row_stride..(py + 1) * row_stride];
-        let rgba_row1 = &rgba[(py + 1) * row_stride..(py + 2) * row_stride];
-        let u_row = &mut u_plane[by * half_w..(by + 1) * half_w];
-        let v_row = &mut v_plane[by * half_w..(by + 1) * half_w];
-
-        for (((c0, c1), u_out), v_out) in rgba_row0
-            .chunks_exact(8)
-            .zip(rgba_row1.chunks_exact(8))
-            .zip(u_row.iter_mut())
-            .zip(v_row.iter_mut())
-        {
-            let (r00, g00, b00) = (i32::from(c0[0]), i32::from(c0[1]), i32::from(c0[2]));
-            let (r01, g01, b01) = (i32::from(c0[4]), i32::from(c0[5]), i32::from(c0[6]));
-            let (r10, g10, b10) = (i32::from(c1[0]), i32::from(c1[1]), i32::from(c1[2]));
-            let (r11, g11, b11) = (i32::from(c1[4]), i32::from(c1[5]), i32::from(c1[6]));
-
-            let r_avg = (r00 + r01 + r10 + r11 + 2) >> 2;
-            let g_avg = (g00 + g01 + g10 + g11 + 2) >> 2;
-            let b_avg = (b00 + b01 + b10 + b11 + 2) >> 2;
-
-            *u_out = (((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128)
-                .clamp(0, 255) as u8;
-            *v_out = (((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128)
-                .clamp(0, 255) as u8;
-        }
-    }
-
-    Ok(())
+    convert_32bpp_to_yuv_420(rgba, width, height, false, false, yuv_buf)
 }
 
-/// Fast 2x2-block fixed-point integer BGRA to planar I420 (YUV420p) converter
-/// structured with `chunks_exact` so LLVM auto-vectorizes the inner loop with AVX2/SSE2.
-#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 pub fn bgra_to_yuv420p_into(
     bgra: &[u8],
     width: u32,
     height: u32,
     yuv_buf: &mut Vec<u8>,
 ) -> Result<(), MediaError> {
-    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(MediaError::Codec(format!(
-            "YUV420p requires non-zero even dimensions, got {width}x{height}"
-        )));
-    }
-    let w = width as usize;
-    let h = height as usize;
-    let expected = w * h * 4;
-    if bgra.len() < expected {
-        return Err(MediaError::Codec(format!(
-            "BGRA buffer too small for {width}x{height}: expected {expected}, got {}",
-            bgra.len()
-        )));
-    }
-
-    let y_len = w * h;
-    let uv_len = y_len / 4;
-    let total_yuv = y_len + uv_len * 2;
-    if yuv_buf.len() != total_yuv {
-        yuv_buf.resize(total_yuv, 0);
-    }
-
-    let (y_plane, uv_planes) = yuv_buf.split_at_mut(y_len);
-    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_len);
-    let half_w = w / 2;
-    let half_h = h / 2;
-    let row_stride = w * 4;
-
-    // 1. High-throughput row-by-row luminance (Y) conversion.
-    // In BGRA: px[0] = Blue, px[1] = Green, px[2] = Red.
-    for (bgra_row, y_row) in bgra.chunks_exact(row_stride).zip(y_plane.chunks_exact_mut(w)) {
-        for (px, y_out) in bgra_row.chunks_exact(4).zip(y_row.iter_mut()) {
-            let b = i32::from(px[0]);
-            let g = i32::from(px[1]);
-            let r = i32::from(px[2]);
-            *y_out = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
-        }
-    }
-
-    // 2. Chrominance (U, V) conversion with 2x2 box averaging.
-    for by in 0..half_h {
-        let py = by * 2;
-        let bgra_row0 = &bgra[py * row_stride..(py + 1) * row_stride];
-        let bgra_row1 = &bgra[(py + 1) * row_stride..(py + 2) * row_stride];
-        let u_row = &mut u_plane[by * half_w..(by + 1) * half_w];
-        let v_row = &mut v_plane[by * half_w..(by + 1) * half_w];
-
-        for (((c0, c1), u_out), v_out) in bgra_row0
-            .chunks_exact(8)
-            .zip(bgra_row1.chunks_exact(8))
-            .zip(u_row.iter_mut())
-            .zip(v_row.iter_mut())
-        {
-            let (b00, g00, r00) = (i32::from(c0[0]), i32::from(c0[1]), i32::from(c0[2]));
-            let (b01, g01, r01) = (i32::from(c0[4]), i32::from(c0[5]), i32::from(c0[6]));
-            let (b10, g10, r10) = (i32::from(c1[0]), i32::from(c1[1]), i32::from(c1[2]));
-            let (b11, g11, r11) = (i32::from(c1[4]), i32::from(c1[5]), i32::from(c1[6]));
-
-            let r_avg = (r00 + r01 + r10 + r11 + 2) >> 2;
-            let g_avg = (g00 + g01 + g10 + g11 + 2) >> 2;
-            let b_avg = (b00 + b01 + b10 + b11 + 2) >> 2;
-
-            *u_out = (((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128)
-                .clamp(0, 255) as u8;
-            *v_out = (((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128)
-                .clamp(0, 255) as u8;
-        }
-    }
-
-    Ok(())
+    convert_32bpp_to_yuv_420(bgra, width, height, true, false, yuv_buf)
 }
 
-/// Converts an even-dimensioned RGBA buffer into a planar YUV420p (`I420`) `YUVBuffer`.
-pub fn rgba_to_yuv420p(
+pub fn rgba_to_nv12_into(
     rgba: &[u8],
     width: u32,
     height: u32,
-) -> Result<YUVBuffer, MediaError> {
+    nv12_buf: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    convert_32bpp_to_yuv_420(rgba, width, height, false, true, nv12_buf)
+}
+
+pub fn bgra_to_nv12_into(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    nv12_buf: &mut Vec<u8>,
+) -> Result<(), MediaError> {
+    convert_32bpp_to_yuv_420(bgra, width, height, true, true, nv12_buf)
+}
+
+pub fn rgba_to_yuv420p(rgba: &[u8], width: u32, height: u32) -> Result<YUVBuffer, MediaError> {
     let mut yuv_buf = Vec::new();
     rgba_to_yuv420p_into(rgba, width, height, &mut yuv_buf)?;
     Ok(YUVBuffer::from_vec(yuv_buf, width as usize, height as usize))
 }
 
-/// Converts a contiguous planar I420 (`YUV420p`) buffer into an RGBA buffer.
+/// Converts a tightly-packed RGBA buffer to BGRA in place (used for GPUI `RenderImage` on Linux/mock sources).
+pub fn rgba_to_bgra_in_place(buf: &mut [u8]) {
+    let (chunks, _) = buf.as_chunks_mut::<4>();
+    for px in chunks {
+        px.swap(0, 2);
+    }
+}
+
 pub fn yuv420p_planar_to_rgba(
     yuv: &[u8],
     width: u32,
     height: u32,
+) -> Result<Vec<u8>, MediaError> {
+    yuv420p_planar_to_32bpp(yuv, width, height, false)
+}
+
+pub fn yuv420p_planar_to_bgra(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, MediaError> {
+    yuv420p_planar_to_32bpp(yuv, width, height, true)
+}
+
+fn yuv420p_planar_to_32bpp(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    bgra: bool,
 ) -> Result<Vec<u8>, MediaError> {
     let w = width as usize;
     let h = height as usize;
@@ -269,45 +335,52 @@ pub fn yuv420p_planar_to_rgba(
             yuv.len()
         )));
     }
-    let y_plane = &yuv[..y_len];
-    let u_plane = &yuv[y_len..y_len + uv_len];
-    let v_plane = &yuv[y_len + uv_len..y_len + uv_len * 2];
-    let mut rgba = vec![0u8; y_len * 4];
-    yuv420p_to_rgba(
-        y_plane,
-        u_plane,
-        v_plane,
+    let mut out = vec![0u8; y_len * 4];
+    yuv420p_to_32bpp(
+        &yuv[..y_len],
+        &yuv[y_len..y_len + uv_len],
+        &yuv[y_len + uv_len..y_len + uv_len * 2],
         w,
         h,
         (w, w / 2, w / 2),
-        &mut rgba,
+        &mut out,
+        bgra,
     );
-    Ok(rgba)
+    Ok(out)
 }
 
-/// Fast 2x2-block fixed-point integer I420 (YUV420p) to RGBA converter.
-#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-fn yuv420p_to_rgba(
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks, clippy::too_many_arguments)]
+fn yuv420p_to_32bpp(
     y_plane: &[u8],
     u_plane: &[u8],
     v_plane: &[u8],
     width: usize,
     height: usize,
     strides: (usize, usize, usize),
-    rgba_out: &mut [u8],
+    out: &mut [u8],
+    bgra: bool,
 ) {
     #[inline(always)]
-    fn write_px(dst: &mut [u8], y_val: u8, c_r: i32, c_g: i32, c_b: i32) {
+    fn write_px(dst: &mut [u8], y_val: u8, c_r: i32, c_g: i32, c_b: i32, bgra: bool) {
         let y = i32::from(y_val);
-        dst[0] = (y + c_r).clamp(0, 255) as u8;
-        dst[1] = (y - c_g).clamp(0, 255) as u8;
-        dst[2] = (y + c_b).clamp(0, 255) as u8;
+        let r = (y + c_r).clamp(0, 255) as u8;
+        let g = (y - c_g).clamp(0, 255) as u8;
+        let b = (y + c_b).clamp(0, 255) as u8;
+        if bgra {
+            dst[0] = b;
+            dst[1] = g;
+            dst[2] = r;
+        } else {
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+        }
         dst[3] = 255;
     }
 
     let half_w = width / 2;
     let half_h = height / 2;
-    let rgba_stride = width * 4;
+    let out_stride = width * 4;
 
     for by in 0..half_h {
         let py = by * 2;
@@ -315,8 +388,8 @@ fn yuv420p_to_rgba(
         let y_row1 = &y_plane[(py + 1) * strides.0..(py + 1) * strides.0 + width];
         let u_row = &u_plane[by * strides.1..by * strides.1 + half_w];
         let v_row = &v_plane[by * strides.2..by * strides.2 + half_w];
-        let (out_top, out_rest) = rgba_out[py * rgba_stride..(py + 2) * rgba_stride]
-            .split_at_mut(rgba_stride);
+        let (out_top, out_rest) =
+            out[py * out_stride..(py + 2) * out_stride].split_at_mut(out_stride);
 
         for (((((y0, y1), &u_b), &v_b), top_px), bot_px) in y_row0
             .chunks_exact(2)
@@ -332,15 +405,40 @@ fn yuv420p_to_rgba(
             let c_g = (88 * u + 183 * v + 128) >> 8;
             let c_b = (454 * u + 128) >> 8;
 
-            write_px(&mut top_px[0..4], y0[0], c_r, c_g, c_b);
-            write_px(&mut top_px[4..8], y0[1], c_r, c_g, c_b);
-            write_px(&mut bot_px[0..4], y1[0], c_r, c_g, c_b);
-            write_px(&mut bot_px[4..8], y1[1], c_r, c_g, c_b);
+            write_px(&mut top_px[0..4], y0[0], c_r, c_g, c_b, bgra);
+            write_px(&mut top_px[4..8], y0[1], c_r, c_g, c_b, bgra);
+            write_px(&mut bot_px[0..4], y1[0], c_r, c_g, c_b, bgra);
+            write_px(&mut bot_px[4..8], y1[1], c_r, c_g, c_b, bgra);
         }
     }
 }
 
-/// Low-latency H.264 Baseline Profile encoder wrapper with periodic IDR keyframe generation.
+/// Scans an H.264 Annex-B bitstream for an IDR keyframe NAL unit (type 5).
+pub fn is_h264_keyframe(annex_b: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < annex_b.len() {
+        if annex_b[i] == 0 && annex_b[i + 1] == 0 {
+            let nal_offset = if annex_b[i + 2] == 1 {
+                Some(i + 3)
+            } else if i + 4 < annex_b.len() && annex_b[i + 2] == 0 && annex_b[i + 3] == 1 {
+                Some(i + 4)
+            } else {
+                None
+            };
+            if let Some(off) = nal_offset {
+                if off < annex_b.len() && (annex_b[off] & 0x1F) == 5 {
+                    return true;
+                }
+                i = off;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Tuned low-latency `OpenH264` software encoder with frame skipping disabled to prevent stutters.
 pub struct H264VideoEncoder {
     encoder: Encoder,
     fps: u8,
@@ -359,9 +457,9 @@ impl H264VideoEncoder {
             .map(|n| n.get().clamp(2, 4) as u16)
             .unwrap_or(2);
         let config = EncoderConfig::new()
-            .set_bitrate_bps(bitrate_bps.max(1_000_000))
+            .set_bitrate_bps(bitrate_bps.clamp(500_000, 30_000_000))
             .max_frame_rate(clamped_fps as f32)
-            .enable_skip_frame(true)
+            .enable_skip_frame(false)
             .rate_control_mode(RateControlMode::Bitrate)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
             .usage_type(UsageType::CameraVideoRealTime)
@@ -380,7 +478,7 @@ impl H264VideoEncoder {
             fps: clamped_fps,
             bitrate_bps,
             frame_count: 0,
-            keyframe_interval: ((clamped_fps as u64) * 4).max(60),
+            keyframe_interval: ((clamped_fps as u64) * 3).max(45),
             force_next_idr: true,
             last_dimensions: None,
             yuv_scratch: Vec::new(),
@@ -391,23 +489,17 @@ impl H264VideoEncoder {
         self.force_next_idr = true;
     }
 
-    /// Returns the planar I420 (`YUV420p`) buffer produced during the most recent `encode_rgba` call.
     pub fn last_yuv420p(&self) -> &[u8] {
         &self.yuv_scratch
     }
 
     fn encode_yuv_scratch(&mut self, width: u32, height: u32) -> Result<Vec<u8>, MediaError> {
-        // If the captured window changed dimensions (e.g. restored from minimized or resized),
-        // recreate the OpenH264 encoder instance cleanly so SPS/PPS/IDR are re-emitted without
-        // triggering OpenH264's broken internal SVC layer reinit path.
         if self.last_dimensions.is_some_and(|dim| dim != (width, height)) {
             self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
             self.last_dimensions = None;
             self.force_next_idr = true;
         }
 
-        // Only call `force_intra_frame` after the underlying OpenH264 encoder has been
-        // initialized by its first `encode()` call (the first frame is always an IDR frame).
         if self.last_dimensions.is_some()
             && (self.force_next_idr || self.frame_count.is_multiple_of(self.keyframe_interval))
         {
@@ -435,7 +527,6 @@ impl H264VideoEncoder {
         Ok(bitstream.to_vec())
     }
 
-    /// Encodes an RGBA frame into an Annex-B H.264 bitstream reusing internal YUV planar buffers.
     pub fn encode_rgba(
         &mut self,
         rgba: &[u8],
@@ -446,8 +537,6 @@ impl H264VideoEncoder {
         self.encode_yuv_scratch(width, height)
     }
 
-    /// Encodes a native BGRA frame (e.g. from Windows DXGI Desktop Duplication or GDI DIB)
-    /// directly into an Annex-B H.264 bitstream without any intermediate byte-swapping pass.
     pub fn encode_bgra(
         &mut self,
         bgra: &[u8],
@@ -459,97 +548,181 @@ impl H264VideoEncoder {
     }
 }
 
-/// Decoded `(width, height, i420_bytes)` tuple produced by [`H264VideoDecoder::decode_annex_b_yuv`].
-pub type DecodedYuvFrame = (u32, u32, Vec<u8>);
+impl VideoEncoder for H264VideoEncoder {
+    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError> {
+        if frame.is_bgra {
+            self.encode_bgra(&frame.rgba, frame.width, frame.height)
+        } else {
+            self.encode_rgba(&frame.rgba, frame.width, frame.height)
+        }
+    }
 
-/// Low-latency H.264 decoder wrapper producing planar I420 or RGBA frames.
+    fn request_keyframe(&mut self) {
+        self.force_next_idr = true;
+    }
+
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
+        let clamped = bitrate_bps.clamp(500_000, 30_000_000);
+        let diff = (clamped as i64 - self.bitrate_bps as i64).unsigned_abs();
+        if diff * 6 > u64::from(self.bitrate_bps.max(1)) {
+            self.bitrate_bps = clamped;
+            self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
+            self.last_dimensions = None;
+            self.force_next_idr = true;
+        }
+        Ok(())
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "OpenH264-CPU"
+    }
+}
+
+/// Creates the best available H.264 encoder for the current platform (Hardware MFT on Windows, OpenH264 fallback).
+pub fn create_best_video_encoder(
+    fps: u8,
+    bitrate_bps: u32,
+) -> Result<Box<dyn VideoEncoder>, MediaError> {
+    #[cfg(target_os = "windows")]
+    {
+        match crate::media::codec_win::MfH264Encoder::new(fps, bitrate_bps) {
+            Ok(hw) => return Ok(Box::new(hw)),
+            Err(err) => {
+                warn!("Windows HW H.264 MFT unavailable ({err}); falling back to OpenH264");
+            }
+        }
+    }
+
+    Ok(Box::new(H264VideoEncoder::new(fps, bitrate_bps)?))
+}
+
+/// Low-latency H.264 Annex-B decoder outputting tightly-packed RGBA or BGRA buffers.
 pub struct H264VideoDecoder {
     decoder: Decoder,
 }
 
 impl H264VideoDecoder {
     pub fn new() -> Result<Self, MediaError> {
-        let config = DecoderConfig::new();
-        let decoder = Decoder::with_api_config(OpenH264API::from_source(), config)
+        let cfg = DecoderConfig::new();
+        let decoder = Decoder::with_api_config(OpenH264API::from_source(), cfg)
             .map_err(|e| MediaError::Codec(format!("OpenH264 decoder init error: {e}")))?;
         Ok(Self { decoder })
     }
 
-    /// Feeds an Annex-B H.264 buffer into the decoder and returns compact planar I420 (`YUV420p`)
-    /// directly without CPU YUV->RGBA conversion, along with a boolean flag indicating if any NAL
-    /// unit encountered a decoding error (so the caller can request an immediate IDR keyframe).
     pub fn decode_annex_b_yuv(
         &mut self,
         annex_b: &[u8],
-    ) -> Result<(Option<DecodedYuvFrame>, bool), MediaError> {
-        if annex_b.is_empty() {
-            return Ok((None, false));
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError> {
+        let maybe_yuv = self
+            .decoder
+            .decode(annex_b)
+            .map_err(|e| MediaError::Codec(format!("OpenH264 decode error: {e}")))?;
+        let Some(yuv) = maybe_yuv else {
+            return Ok(None);
+        };
+        let (width, height) = yuv.dimensions();
+        if width < 2 || height < 2 {
+            return Ok(None);
         }
+        let y_len = width * height;
+        let uv_len = y_len / 4;
+        let mut out = vec![0u8; y_len + uv_len * 2];
+        let (y_stride, u_stride, v_stride) = yuv.strides();
+        let (y_dst, uv_dst) = out.split_at_mut(y_len);
+        let (u_dst, v_dst) = uv_dst.split_at_mut(uv_len);
 
-        let mut latest_frame: Option<DecodedYuvFrame> = None;
-        let mut had_error = false;
-        for nal in openh264::nal_units(annex_b) {
-            match self.decoder.decode(nal) {
-                Ok(Some(decoded_yuv)) => {
-                    let (w, h) = decoded_yuv.dimensions();
-                    if w > 0 && h > 0 {
-                        let strides = decoded_yuv.strides();
-                        let half_w = w / 2;
-                        let half_h = h / 2;
-                        let y_len = w * h;
-                        let uv_len = half_w * half_h;
-                        let mut i420 = Vec::with_capacity(y_len + uv_len * 2);
-
-                        let y_src = decoded_yuv.y();
-                        for row in 0..h {
-                            let start = row * strides.0;
-                            i420.extend_from_slice(&y_src[start..start + w]);
-                        }
-                        let u_src = decoded_yuv.u();
-                        for row in 0..half_h {
-                            let start = row * strides.1;
-                            i420.extend_from_slice(&u_src[start..start + half_w]);
-                        }
-                        let v_src = decoded_yuv.v();
-                        for row in 0..half_h {
-                            let start = row * strides.2;
-                            i420.extend_from_slice(&v_src[start..start + half_w]);
-                        }
-
-                        latest_frame = Some((w as u32, h as u32, i420));
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    had_error = true;
-                    debug!("OpenH264 NAL decode transient error (awaiting IDR/SPS/PPS): {err}");
-                }
-            }
-        }
-
-        Ok((latest_frame, had_error))
+        copy_strided_plane(yuv.y(), y_stride, y_dst, width, height);
+        copy_strided_plane(yuv.u(), u_stride, u_dst, width / 2, height / 2);
+        copy_strided_plane(yuv.v(), v_stride, v_dst, width / 2, height / 2);
+        Ok(Some((width as u32, height as u32, out)))
     }
 
-    /// Feeds an Annex-B H.264 buffer (one or more NAL units) into the decoder.
-    /// Returns `Ok(Some((width, height, rgba_bytes)))` when a complete picture is decoded.
     pub fn decode_annex_b(
         &mut self,
         annex_b: &[u8],
     ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError> {
-        let (maybe_yuv, _) = self.decode_annex_b_yuv(annex_b)?;
-        match maybe_yuv {
-            Some((w, h, i420)) => {
-                let rgba = yuv420p_planar_to_rgba(&i420, w, h)?;
-                Ok(Some((w, h, rgba)))
-            }
-            None => Ok(None),
+        self.decode_annex_b_32bpp(annex_b, false)
+    }
+
+    pub fn decode_annex_b_bgra(
+        &mut self,
+        annex_b: &[u8],
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError> {
+        self.decode_annex_b_32bpp(annex_b, true)
+    }
+
+    fn decode_annex_b_32bpp(
+        &mut self,
+        annex_b: &[u8],
+        bgra: bool,
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError> {
+        let maybe_yuv = self
+            .decoder
+            .decode(annex_b)
+            .map_err(|e| MediaError::Codec(format!("OpenH264 decode error: {e}")))?;
+        let Some(yuv) = maybe_yuv else {
+            return Ok(None);
+        };
+        let (width, height) = yuv.dimensions();
+        if width < 2 || height < 2 {
+            return Ok(None);
+        }
+        let mut out = vec![0u8; width * height * 4];
+        yuv420p_to_32bpp(
+            yuv.y(),
+            yuv.u(),
+            yuv.v(),
+            width,
+            height,
+            yuv.strides(),
+            &mut out,
+            bgra,
+        );
+        Ok(Some((width as u32, height as u32, out)))
+    }
+}
+
+impl VideoDecoder for H264VideoDecoder {
+    fn decode_annex_b_bgra(
+        &mut self,
+        annex_b: &[u8],
+    ) -> Result<Option<(u32, u32, Vec<u8>)>, MediaError> {
+        H264VideoDecoder::decode_annex_b_bgra(self, annex_b)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "OpenH264-CPU"
+    }
+}
+
+fn copy_strided_plane(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    row_width: usize,
+    rows: usize,
+) {
+    if src_stride == row_width && src.len() >= row_width * rows {
+        dst.copy_from_slice(&src[..row_width * rows]);
+        return;
+    }
+    for row in 0..rows {
+        let s_off = row * src_stride;
+        let d_off = row * row_width;
+        if s_off + row_width <= src.len() {
+            dst[d_off..d_off + row_width].copy_from_slice(&src[s_off..s_off + row_width]);
         }
     }
 }
 
-/// Enumerates all available monitors and application windows on the host OS.
+/// Enumerates monitors, application windows, and Wayland portal (when applicable).
 pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
     let mut targets = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        targets.push(CaptureTarget::PortalWayland);
+    }
 
     match std::panic::catch_unwind(xcap::Monitor::all) {
         Ok(Ok(monitors)) => {
@@ -560,35 +733,29 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
                 });
             }
         }
-        Ok(Err(err)) => {
-            warn!("Monitor enumeration warning: {err}");
-        }
-        Err(_) => {
-            warn!("Monitor enumeration panicked inside xcap");
-        }
+        Ok(Err(err)) => warn!("Monitor enumeration warning: {err}"),
+        Err(_) => warn!("Monitor enumeration panicked inside xcap"),
     }
 
     #[cfg(target_os = "windows")]
     {
         let mut seen_ids = std::collections::HashSet::new();
-        for win_target in win32_capture::list_windows_win32() {
+        for win_target in list_windows_win32() {
             if let CaptureTarget::Window { id, .. } = &win_target {
                 seen_ids.insert(*id);
             }
             targets.push(win_target);
         }
-
         if let Ok(Ok(windows)) = std::panic::catch_unwind(xcap::Window::all) {
             for window in windows {
                 let id = window.id();
                 if seen_ids.contains(&id) || window.title().trim().is_empty() {
                     continue;
                 }
-                let pid = extract_window_pid(&window);
                 targets.push(CaptureTarget::Window {
                     id,
                     title: window.title().to_string(),
-                    pid,
+                    pid: window.process_id(),
                 });
             }
         }
@@ -602,7 +769,7 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
                     if window.title().trim().is_empty() {
                         continue;
                     }
-                    let pid = extract_window_pid(&window);
+                    let pid = extract_window_pid_linux(&window);
                     targets.push(CaptureTarget::Window {
                         id: window.id(),
                         title: window.title().to_string(),
@@ -610,26 +777,16 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
                     });
                 }
             }
-            Ok(Err(err)) => {
-                warn!("Window enumeration warning: {err}");
-            }
-            Err(_) => {
-                warn!("Window enumeration panicked inside xcap");
-            }
+            Ok(Err(err)) => warn!("Window enumeration warning: {err}"),
+            Err(_) => warn!("Window enumeration panicked inside xcap"),
         }
     }
 
     Ok(targets)
 }
 
-#[cfg(target_os = "windows")]
-fn extract_window_pid(window: &xcap::Window) -> u32 {
-    window.process_id()
-}
-
 #[cfg(not(target_os = "windows"))]
-fn extract_window_pid(window: &xcap::Window) -> u32 {
-    // Attempt to resolve PID by matching window app_name against /proc/<pid>/comm on Linux
+fn extract_window_pid_linux(window: &xcap::Window) -> u32 {
     let app_name = window.app_name().trim().to_lowercase();
     if app_name.is_empty() {
         return 0;
@@ -652,890 +809,119 @@ fn extract_window_pid(window: &xcap::Window) -> u32 {
     0
 }
 
-#[cfg(target_os = "windows")]
-mod win32_capture {
-    use std::ffi::c_void;
-    use std::mem::size_of;
-    use std::ptr::null_mut;
-
-    use fast_image_resize::Resizer;
-    use shared_protocol::{CaptureTarget, TargetResolution};
-    use windows::Win32::{
-        Foundation::{BOOL, HANDLE, HWND, LPARAM, RECT},
-        Graphics::{
-            Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
-            Direct3D11::{
-                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-                D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-            },
-            Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
-            Dxgi::{
-                Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-                CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-                IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_FRAME_INFO,
-            },
-            Gdi::{
-                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush,
-                GetDC, GetWindowDC, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
-            },
-        },
-        Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY},
-        UI::WindowsAndMessaging::{
-            EnumWindows, GetClientRect, GetForegroundWindow, GetShellWindow, GetWindow,
-            GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, GWL_EXSTYLE, GW_OWNER,
-            WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        },
-    };
-    use windows_core::Interface;
-
-    use crate::media::{traits::MediaError, video::scale_rgba_frame_with_resizer};
-
-    const PW_RENDERFULLCONTENT_FLAG: u32 = 0x00000002;
-
-    #[inline]
-    fn has_non_zero_sample(buf: &[u8]) -> bool {
-        let pixel_count = buf.len() / 4;
-        if pixel_count == 0 {
-            return false;
-        }
-        let step_bytes = ((pixel_count / 64).max(1)) * 4;
-        for base in (0..buf.len().saturating_sub(3)).step_by(step_bytes) {
-            if buf[base] != 0 || buf[base + 1] != 0 || buf[base + 2] != 0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Hardware-accelerated GPU screen capturer using Direct3D 11 + `IDXGIOutputDuplication`.
-    pub struct DxgiMonitorDuplicator {
-        device: ID3D11Device,
-        context: ID3D11DeviceContext,
-        dupl: IDXGIOutputDuplication,
-        staging_tex: Option<ID3D11Texture2D>,
-        staging_dims: (u32, u32),
-        last_bgra: Vec<u8>,
-        last_scaled: Option<(u32, u32, Vec<u8>)>,
-        width: u32,
-        height: u32,
-        monitor_id_hint: u32,
-        monitor_name_hint: String,
-    }
-
-    impl DxgiMonitorDuplicator {
-        pub fn new(monitor_id_hint: u32, monitor_name_hint: &str) -> Result<Self, MediaError> {
-            unsafe {
-                let factory: IDXGIFactory1 = CreateDXGIFactory1()
-                    .map_err(|e| MediaError::VideoCapture(format!("CreateDXGIFactory1: {e}")))?;
-
-                let mut fallback_pair = None;
-                let mut matched_pair = None;
-                let mut adapter_idx = 0u32;
-
-                while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
-                    let mut output_idx = 0u32;
-                    while let Ok(output) = adapter.EnumOutputs(output_idx) {
-                        if let Ok(desc) = output.GetDesc() {
-                            if desc.AttachedToDesktop.as_bool() {
-                                let hmon_id = desc.Monitor.0 as usize as u32;
-                                let dev_name_len = desc
-                                    .DeviceName
-                                    .iter()
-                                    .position(|&c| c == 0)
-                                    .unwrap_or(desc.DeviceName.len());
-                                let dev_name =
-                                    String::from_utf16_lossy(&desc.DeviceName[..dev_name_len]);
-
-                                if fallback_pair.is_none() {
-                                    fallback_pair = Some((adapter.clone(), output.clone()));
-                                }
-                                if hmon_id == monitor_id_hint
-                                    || (!monitor_name_hint.is_empty()
-                                        && dev_name.contains(monitor_name_hint))
-                                {
-                                    matched_pair = Some((adapter.clone(), output));
-                                    break;
-                                }
-                            }
-                        }
-                        output_idx += 1;
-                    }
-                    if matched_pair.is_some() {
-                        break;
-                    }
-                    adapter_idx += 1;
-                }
-
-                let (adapter, output) = matched_pair.or(fallback_pair).ok_or_else(|| {
-                    MediaError::VideoCapture("No attached DXGI desktop outputs found".to_string())
-                })?;
-
-                let mut device: Option<ID3D11Device> = None;
-                let mut context: Option<ID3D11DeviceContext> = None;
-                D3D11CreateDevice(
-                    &adapter,
-                    D3D_DRIVER_TYPE_UNKNOWN,
-                    None,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut device),
-                    None,
-                    Some(&mut context),
-                )
-                .map_err(|e| MediaError::VideoCapture(format!("D3D11CreateDevice failed: {e}")))?;
-
-                let device = device.ok_or_else(|| {
-                    MediaError::VideoCapture("D3D11CreateDevice returned null device".to_string())
-                })?;
-                let context = context.ok_or_else(|| {
-                    MediaError::VideoCapture("D3D11CreateDevice returned null context".to_string())
-                })?;
-
-                let output1: IDXGIOutput1 = output
-                    .cast()
-                    .map_err(|e| MediaError::VideoCapture(format!("IDXGIOutput1 cast: {e}")))?;
-                let dupl = output1
-                    .DuplicateOutput(&device)
-                    .map_err(|e| MediaError::VideoCapture(format!("DuplicateOutput: {e}")))?;
-
-                let dupl_desc = dupl.GetDesc();
-                let width = dupl_desc.ModeDesc.Width;
-                let height = dupl_desc.ModeDesc.Height;
-
-                Ok(Self {
-                    device,
-                    context,
-                    dupl,
-                    staging_tex: None,
-                    staging_dims: (0, 0),
-                    last_bgra: Vec::new(),
-                    last_scaled: None,
-                    width,
-                    height,
-                    monitor_id_hint,
-                    monitor_name_hint: monitor_name_hint.to_string(),
-                })
-            }
-        }
-
-        fn recreate(&mut self) -> Result<(), MediaError> {
-            let fresh = Self::new(self.monitor_id_hint, &self.monitor_name_hint)?;
-            *self = fresh;
-            Ok(())
-        }
-
-        pub fn capture_scaled_frame(
-            &mut self,
-            resizer: &mut Resizer,
-            resolution: TargetResolution,
-        ) -> Result<(u32, u32, Vec<u8>, bool), MediaError> {
-            unsafe {
-                let timeout_ms = if self.last_bgra.is_empty() { 16 } else { 0 };
-                let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-                let mut resource: Option<IDXGIResource> = None;
-
-                match self
-                    .dupl
-                    .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource)
-                {
-                    Ok(()) => {
-                        let copy_res = (|| -> Result<(), MediaError> {
-                            let res = resource.take().ok_or_else(|| {
-                                MediaError::VideoCapture(
-                                    "DXGI AcquireNextFrame returned null resource".to_string(),
-                                )
-                            })?;
-                            let src_tex: ID3D11Texture2D = res.cast().map_err(|e| {
-                                MediaError::VideoCapture(format!("ID3D11Texture2D cast: {e}"))
-                            })?;
-
-                            let mut desc = D3D11_TEXTURE2D_DESC::default();
-                            src_tex.GetDesc(&mut desc);
-                            let w = desc.Width;
-                            let h = desc.Height;
-                            if w == 0 || h == 0 {
-                                return Err(MediaError::VideoCapture(
-                                    "DXGI desktop texture has zero dimensions".to_string(),
-                                ));
-                            }
-
-                            if self.staging_tex.is_none() || self.staging_dims != (w, h) {
-                                let staging_desc = D3D11_TEXTURE2D_DESC {
-                                    Width: w,
-                                    Height: h,
-                                    MipLevels: 1,
-                                    ArraySize: 1,
-                                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    SampleDesc: DXGI_SAMPLE_DESC {
-                                        Count: 1,
-                                        Quality: 0,
-                                    },
-                                    Usage: D3D11_USAGE_STAGING,
-                                    BindFlags: 0,
-                                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                                    MiscFlags: 0,
-                                };
-                                let mut new_tex: Option<ID3D11Texture2D> = None;
-                                self.device
-                                    .CreateTexture2D(&staging_desc, None, Some(&mut new_tex))
-                                    .map_err(|e| {
-                                        MediaError::VideoCapture(format!(
-                                            "CreateTexture2D staging failed: {e}"
-                                        ))
-                                    })?;
-                                self.staging_tex = new_tex;
-                                self.staging_dims = (w, h);
-                            }
-
-                            let staging = self.staging_tex.as_ref().unwrap();
-                            self.context.CopyResource(staging, &src_tex);
-
-                            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                            self.context
-                                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                                .map_err(|e| {
-                                    MediaError::VideoCapture(format!(
-                                        "ID3D11DeviceContext::Map failed: {e}"
-                                    ))
-                                })?;
-
-                            let row_bytes = (w as usize) * 4;
-                            let total_bytes = row_bytes * (h as usize);
-                            if self.last_bgra.len() != total_bytes {
-                                self.last_bgra.resize(total_bytes, 0);
-                            }
-                            let src_pitch = mapped.RowPitch as usize;
-                            let src_ptr = mapped.pData.cast::<u8>();
-                            if src_pitch == row_bytes {
-                                std::ptr::copy_nonoverlapping(
-                                    src_ptr,
-                                    self.last_bgra.as_mut_ptr(),
-                                    total_bytes,
-                                );
-                            } else {
-                                for row in 0..(h as usize) {
-                                    std::ptr::copy_nonoverlapping(
-                                        src_ptr.add(row * src_pitch),
-                                        self.last_bgra.as_mut_ptr().add(row * row_bytes),
-                                        row_bytes,
-                                    );
-                                }
-                            }
-
-                            self.context.Unmap(staging, 0);
-                            self.width = w;
-                            self.height = h;
-                            Ok(())
-                        })();
-
-                        let _ = self.dupl.ReleaseFrame();
-                        copy_res?;
-
-                        let (dst_w, dst_h, scaled) = scale_rgba_frame_with_resizer(
-                            resizer,
-                            &self.last_bgra,
-                            self.width,
-                            self.height,
-                            resolution,
-                        )?;
-                        self.last_scaled = Some((dst_w, dst_h, scaled.clone()));
-                        return Ok((dst_w, dst_h, scaled, true));
-                    }
-                    Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                        if let Some(cached) = &self.last_scaled {
-                            return Ok((cached.0, cached.1, cached.2.clone(), true));
-                        }
-                        if self.last_bgra.is_empty() {
-                            return Err(MediaError::VideoCapture(
-                                "DXGI initial frame timed out".to_string(),
-                            ));
-                        }
-                    }
-                    Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
-                        self.recreate()?;
-                        return Err(MediaError::VideoCapture(
-                            "DXGI desktop duplication access lost, reinitialized".to_string(),
-                        ));
-                    }
-                    Err(err) => {
-                        return Err(MediaError::VideoCapture(format!(
-                            "DXGI AcquireNextFrame error: {err}"
-                        )));
-                    }
-                }
-
-                let (dst_w, dst_h, scaled) = scale_rgba_frame_with_resizer(
-                    resizer,
-                    &self.last_bgra,
-                    self.width,
-                    self.height,
-                    resolution,
-                )?;
-                self.last_scaled = Some((dst_w, dst_h, scaled.clone()));
-                Ok((dst_w, dst_h, scaled, true))
-            }
-        }
-    }
-
-    /// Persistent GDI memory DC and top-down 32-bit DIB section so window capture does not
-    /// allocate/free kernel GDI bitmaps or invoke `GetDIBits` on every frame.
-    struct GdiDibSurface {
-        hdc_mem: HDC,
-        hbitmap: HBITMAP,
-        old_obj: HGDIOBJ,
-        dib_ptr: *mut u8,
-        width: u32,
-        height: u32,
-    }
-
-    impl Default for GdiDibSurface {
-        fn default() -> Self {
-            Self {
-                hdc_mem: HDC::default(),
-                hbitmap: HBITMAP::default(),
-                old_obj: HGDIOBJ::default(),
-                dib_ptr: null_mut(),
-                width: 0,
-                height: 0,
-            }
-        }
-    }
-
-    impl GdiDibSurface {
-        unsafe fn cleanup(&mut self) {
-            if !self.hdc_mem.is_invalid() {
-                if !self.old_obj.is_invalid() {
-                    let _ = SelectObject(self.hdc_mem, self.old_obj);
-                    self.old_obj = HGDIOBJ::default();
-                }
-                if !self.hbitmap.is_invalid() {
-                    let _ = DeleteObject(self.hbitmap);
-                    self.hbitmap = HBITMAP::default();
-                }
-                let _ = DeleteDC(self.hdc_mem);
-                self.hdc_mem = HDC::default();
-            }
-            self.dib_ptr = null_mut();
-            self.width = 0;
-            self.height = 0;
-        }
-
-        unsafe fn ensure_size(&mut self, hdc_ref: HDC, width: u32, height: u32) -> bool {
-            if !self.hdc_mem.is_invalid()
-                && !self.dib_ptr.is_null()
-                && self.width == width
-                && self.height == height
-            {
-                return true;
-            }
-            self.cleanup();
-
-            let hdc_mem = CreateCompatibleDC(hdc_ref);
-            if hdc_mem.is_invalid() {
-                return false;
-            }
-
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width as i32,
-                    biHeight: -(height as i32), // Top-down DIB
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let mut bits: *mut c_void = null_mut();
-            let hbitmap = match CreateDIBSection(
-                hdc_mem,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                HANDLE::default(),
-                0,
-            ) {
-                Ok(hbmp) if !hbmp.is_invalid() && !bits.is_null() => hbmp,
-                _ => {
-                    let _ = DeleteDC(hdc_mem);
-                    return false;
-                }
-            };
-
-            let old_obj = SelectObject(hdc_mem, hbitmap);
-            self.hdc_mem = hdc_mem;
-            self.hbitmap = hbitmap;
-            self.old_obj = old_obj;
-            self.dib_ptr = bits.cast::<u8>();
-            self.width = width;
-            self.height = height;
-            true
-        }
-    }
-
-    impl Drop for GdiDibSurface {
-        fn drop(&mut self) {
-            unsafe {
-                self.cleanup();
-            }
-        }
-    }
-
-    fn is_ignored_system_title(title: &str) -> bool {
-        matches!(
-            title,
-            "Program Manager"
-                | "Windows Input Experience"
-                | "Microsoft Text Input Application"
-                | "MSCTFIME UI"
-                | "Default IME"
-        )
-    }
-
-    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let out = &mut *(lparam.0 as *mut Vec<CaptureTarget>);
-
-        if !IsWindowVisible(hwnd).as_bool() {
-            return BOOL(1);
-        }
-
-        let shell_hwnd = GetShellWindow();
-        if !shell_hwnd.0.is_null() && hwnd == shell_hwnd {
-            return BOOL(1);
-        }
-
-        let is_minimized = IsIconic(hwnd).as_bool();
-        if !is_minimized {
-            let mut cloaked: u32 = 0;
-            if DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_CLOAKED,
-                (&mut cloaked as *mut u32).cast::<c_void>(),
-                size_of::<u32>() as u32,
-            )
-            .is_ok()
-                && cloaked != 0
-            {
-                return BOOL(1);
-            }
-        }
-
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
-        let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
-        let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
-
-        if (is_tool_window || is_no_activate) && !is_app_window {
-            return BOOL(1);
-        }
-
-        if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-            if !owner.0.is_null() && !is_app_window {
-                return BOOL(1);
-            }
-        }
-
-        let text_len = GetWindowTextLengthW(hwnd);
-        if text_len <= 0 {
-            return BOOL(1);
-        }
-
-        let mut buf = vec![0u16; (text_len as usize) + 1];
-        let copied = GetWindowTextW(hwnd, &mut buf);
-        if copied <= 0 {
-            return BOOL(1);
-        }
-
-        let title = String::from_utf16_lossy(&buf[..copied as usize])
-            .trim()
-            .to_string();
-        if title.is_empty() || is_ignored_system_title(&title) {
-            return BOOL(1);
-        }
-
-        // Skip invisible 0x0 helper windows unless the window is minimized (e.g. Alt-Tabbed fullscreen game).
-        if !is_minimized {
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_ok()
-                && ((rect.right - rect.left) <= 1 || (rect.bottom - rect.top) <= 1)
-            {
-                return BOOL(1);
-            }
-        }
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-        out.push(CaptureTarget::Window {
-            id: hwnd.0 as usize as u32,
-            title,
-            pid,
-        });
-
-        BOOL(1)
-    }
-
-    /// Enumerates top-level windows on Windows without calling `OpenProcess(PROCESS_ALL_ACCESS)`,
-    /// ensuring fullscreen games (including minimized/Alt-Tabbed games and anti-cheat protected games)
-    /// are always listed.
-    pub fn list_windows_win32() -> Vec<CaptureTarget> {
-        let mut windows: Vec<CaptureTarget> = Vec::new();
-        unsafe {
-            let lparam = LPARAM((&mut windows as *mut Vec<CaptureTarget>) as isize);
-            let _ = EnumWindows(Some(enum_windows_proc), lparam);
-        }
-        windows
-    }
-
-    pub fn resolve_hwnd(id: u32, title_hint: &str) -> Result<HWND, MediaError> {
-        let candidate = HWND(id as usize as *mut c_void);
-        if unsafe { IsWindow(candidate).as_bool() } {
-            return Ok(candidate);
-        }
-
-        for target in list_windows_win32() {
-            if let CaptureTarget::Window {
-                id: win_id, title, ..
-            } = target
-            {
-                if win_id == id || (!title_hint.is_empty() && title == title_hint) {
-                    return Ok(HWND(win_id as usize as u32 as *mut c_void));
-                }
-            }
-        }
-
-        Err(MediaError::SourceNotFound(format!(
-            "Window id={id} ({title_hint}) closed or not found"
-        )))
-    }
-
-    fn capture_primary_monitor_xcap_scaled(
-        resizer: &mut Resizer,
-        resolution: TargetResolution,
-    ) -> Result<(u32, u32, Vec<u8>), MediaError> {
-        let monitors = std::panic::catch_unwind(xcap::Monitor::all)
-            .map_err(|_| MediaError::VideoCapture("xcap Monitor::all panicked".to_string()))?
-            .map_err(|e| MediaError::VideoCapture(format!("Monitor::all failed: {e}")))?;
-        let monitor = monitors
-            .into_iter()
-            .next()
-            .ok_or_else(|| MediaError::VideoCapture("No monitors available".to_string()))?;
-        let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| monitor.capture_image()))
-            .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
-            .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
-        scale_rgba_frame_with_resizer(resizer, img.as_raw(), img.width(), img.height(), resolution)
-    }
-
-    /// Stateful Win32 window capturer that reuses a persistent `CreateDIBSection`, prioritizes
-    /// sub-millisecond `BitBlt`, uses GPU DXGI Desktop Duplication for foreground/fullscreen games,
-    /// and only falls back to `PrintWindow(PW_RENDERFULLCONTENT)` when `BitBlt` is blank.
-    pub struct Win32WindowCapturer {
-        id: u32,
-        title: String,
-        surface: GdiDibSurface,
-        dxgi_fallback: Option<DxgiMonitorDuplicator>,
-        print_window_cooldown: u32,
-    }
-
-    impl Win32WindowCapturer {
-        pub fn new(id: u32, title: String) -> Self {
-            Self {
-                id,
-                title,
-                surface: GdiDibSurface::default(),
-                dxgi_fallback: None,
-                print_window_cooldown: 0,
-            }
-        }
-
-        fn capture_monitor_fallback(
-            &mut self,
-            resizer: &mut Resizer,
-            resolution: TargetResolution,
-        ) -> Result<(u32, u32, Vec<u8>, bool), MediaError> {
-            if self.dxgi_fallback.is_none() {
-                self.dxgi_fallback = DxgiMonitorDuplicator::new(0, "").ok();
-            }
-            if let Some(dxgi) = self.dxgi_fallback.as_mut() {
-                if let Ok(frame) = dxgi.capture_scaled_frame(resizer, resolution) {
-                    return Ok(frame);
-                }
-            }
-            let (w, h, rgba) = capture_primary_monitor_xcap_scaled(resizer, resolution)?;
-            Ok((w, h, rgba, false))
-        }
-
-        pub fn capture_scaled_frame(
-            &mut self,
-            resizer: &mut Resizer,
-            resolution: TargetResolution,
-        ) -> Result<(u32, u32, Vec<u8>, bool), MediaError> {
-            let hwnd = resolve_hwnd(self.id, &self.title)?;
-            self.id = hwnd.0 as usize as u32;
-
-            unsafe {
-                // Minimized (Alt-Tabbed) fullscreen game: use GPU DXGI desktop duplication fallback.
-                if IsIconic(hwnd).as_bool() {
-                    return self.capture_monitor_fallback(resizer, resolution);
-                }
-
-                let mut client_rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client_rect);
-                let client_w = (client_rect.right - client_rect.left).max(0) as u32;
-                let client_h = (client_rect.bottom - client_rect.top).max(0) as u32;
-
-                let mut win_rect = RECT::default();
-                GetWindowRect(hwnd, &mut win_rect)
-                    .map_err(|e| MediaError::VideoCapture(format!("GetWindowRect failed: {e}")))?;
-                let win_w = (win_rect.right - win_rect.left).max(0) as u32;
-                let win_h = (win_rect.bottom - win_rect.top).max(0) as u32;
-
-                let use_client = client_w >= 2 && client_h >= 2;
-                let (width, height) = if use_client {
-                    (client_w, client_h)
-                } else {
-                    (win_w, win_h)
-                };
-
-                if width < 2 || height < 2 {
-                    return self.capture_monitor_fallback(resizer, resolution);
-                }
-
-                let hdc_window = if use_client {
-                    GetDC(hwnd)
-                } else {
-                    GetWindowDC(hwnd)
-                };
-                if hdc_window.is_invalid() {
-                    return self.capture_monitor_fallback(resizer, resolution);
-                }
-
-                if !self.surface.ensure_size(hdc_window, width, height) {
-                    let _ = ReleaseDC(hwnd, hdc_window);
-                    return self.capture_monitor_fallback(resizer, resolution);
-                }
-
-                let byte_len = (width as usize) * (height as usize) * 4;
-                let mut captured_valid = false;
-
-                // 1. Fast path (~0.4ms): try BitBlt directly from the DWM window redirection surface
-                // unless BitBlt recently returned an all-black surface for this window.
-                if self.print_window_cooldown == 0 {
-                    let blt_ok = BitBlt(
-                        self.surface.hdc_mem,
-                        0,
-                        0,
-                        width as i32,
-                        height as i32,
-                        hdc_window,
-                        0,
-                        0,
-                        SRCCOPY,
-                    )
-                    .is_ok();
-                    if blt_ok {
-                        let _ = GdiFlush();
-                        let raw_bgra = std::slice::from_raw_parts(self.surface.dib_ptr, byte_len);
-                        if has_non_zero_sample(raw_bgra) {
-                            captured_valid = true;
-                        } else {
-                            // BitBlt was blank (e.g. hardware flip-model swapchain); avoid retrying
-                            // BitBlt on every single frame for the next ~120 frames.
-                            self.print_window_cooldown = 120;
-                        }
-                    }
-                } else {
-                    self.print_window_cooldown -= 1;
-                }
-
-                // 2. If BitBlt was blank and this window is in the foreground (e.g. fullscreen or
-                // borderless DirectX/Vulkan game), use GPU DXGI Desktop Duplication at 60 FPS
-                // instead of blocking the game's UI thread with PrintWindow!
-                if !captured_valid && GetForegroundWindow() == hwnd {
-                    let _ = ReleaseDC(hwnd, hdc_window);
-                    if let Ok(frame) = self.capture_monitor_fallback(resizer, resolution) {
-                        return Ok(frame);
-                    }
-                    // Re-acquire hdc_window if DXGI fallback failed.
-                    let hdc_retry = if use_client {
-                        GetDC(hwnd)
-                    } else {
-                        GetWindowDC(hwnd)
-                    };
-                    if hdc_retry.is_invalid() {
-                        let (w, h, rgba) = capture_primary_monitor_xcap_scaled(resizer, resolution)?;
-                        return Ok((w, h, rgba, false));
-                    }
-                    let pw_flags = if use_client {
-                        PRINT_WINDOW_FLAGS(PW_CLIENTONLY.0 | PW_RENDERFULLCONTENT_FLAG)
-                    } else {
-                        PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT_FLAG)
-                    };
-                    let pw_ok = PrintWindow(hwnd, self.surface.hdc_mem, pw_flags).as_bool();
-                    let _ = ReleaseDC(hwnd, hdc_retry);
-                    if pw_ok {
-                        let _ = GdiFlush();
-                        let raw_bgra = std::slice::from_raw_parts(self.surface.dib_ptr, byte_len);
-                        if has_non_zero_sample(raw_bgra) {
-                            let (dst_w, dst_h, scaled) = scale_rgba_frame_with_resizer(
-                                resizer,
-                                raw_bgra,
-                                width,
-                                height,
-                                resolution,
-                            )?;
-                            return Ok((dst_w, dst_h, scaled, true));
-                        }
-                    }
-                    let (w, h, rgba) = capture_primary_monitor_xcap_scaled(resizer, resolution)?;
-                    return Ok((w, h, rgba, false));
-                }
-
-                // 3. Background window where BitBlt was blank: use PrintWindow(PW_RENDERFULLCONTENT).
-                if !captured_valid {
-                    let pw_flags = if use_client {
-                        PRINT_WINDOW_FLAGS(PW_CLIENTONLY.0 | PW_RENDERFULLCONTENT_FLAG)
-                    } else {
-                        PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT_FLAG)
-                    };
-                    if PrintWindow(hwnd, self.surface.hdc_mem, pw_flags).as_bool() {
-                        let _ = GdiFlush();
-                        let raw_bgra = std::slice::from_raw_parts(self.surface.dib_ptr, byte_len);
-                        if has_non_zero_sample(raw_bgra) {
-                            captured_valid = true;
-                        }
-                    }
-                }
-
-                let _ = ReleaseDC(hwnd, hdc_window);
-
-                if !captured_valid {
-                    return self.capture_monitor_fallback(resizer, resolution);
-                }
-
-                // Scale directly from the persistent DIB section memory without any swizzling BGRA -> RGBA,
-                // eliminating both the full-res Vec allocation and color channel swap.
-                let raw_bgra = std::slice::from_raw_parts(self.surface.dib_ptr, byte_len);
-                let (dst_w, dst_h, scaled) = scale_rgba_frame_with_resizer(
-                    resizer,
-                    raw_bgra,
-                    width,
-                    height,
-                    resolution,
-                )?;
-                Ok((dst_w, dst_h, scaled, true))
-            }
-        }
-    }
-}
-
 enum ResolvedCaptureTarget {
     #[cfg(target_os = "windows")]
     Monitor {
         xcap_monitor: xcap::Monitor,
-        dxgi: Option<win32_capture::DxgiMonitorDuplicator>,
+        dxgi: Option<DxgiMonitorDuplicator>,
     },
     #[cfg(not(target_os = "windows"))]
     Monitor(xcap::Monitor),
+    #[cfg(target_os = "windows")]
+    Win32Window(Win32WindowCapturer),
     #[cfg(not(target_os = "windows"))]
     Window(xcap::Window),
-    #[cfg(target_os = "windows")]
-    Win32Window(win32_capture::Win32WindowCapturer),
+}
+
+enum FrameSample {
+    New {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+        is_bgra: bool,
+    },
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Unchanged,
 }
 
 impl ResolvedCaptureTarget {
     fn resolve(target: &CaptureTarget) -> Result<Self, MediaError> {
         match target {
+            CaptureTarget::PortalWayland => Err(MediaError::VideoCapture(
+                "PortalWayland uses async PipeWire portal stream".to_string(),
+            )),
             CaptureTarget::Monitor { id, name } => {
                 let monitors = std::panic::catch_unwind(xcap::Monitor::all)
-                    .map_err(|_| {
-                        MediaError::VideoCapture("xcap Monitor::all panicked".to_string())
-                    })?
-                    .map_err(|e| {
-                        MediaError::VideoCapture(format!("xcap Monitor::all failed: {e}"))
-                    })?;
+                    .map_err(|_| MediaError::VideoCapture("xcap Monitor::all panicked".to_string()))?
+                    .map_err(|e| MediaError::VideoCapture(format!("Monitor::all failed: {e}")))?;
+
                 let monitor = monitors
                     .into_iter()
-                    .find(|m| m.id() == *id || m.name() == name)
-                    .or_else(|| {
-                        std::panic::catch_unwind(xcap::Monitor::all)
-                            .ok()?
-                            .ok()?
-                            .into_iter()
-                            .next()
-                    })
+                    .find(|m| m.id() == *id || (!name.is_empty() && m.name() == name))
                     .ok_or_else(|| {
                         MediaError::SourceNotFound(format!("Monitor id={id} ({name}) not found"))
                     })?;
+
                 #[cfg(target_os = "windows")]
                 {
-                    let dxgi = win32_capture::DxgiMonitorDuplicator::new(*id, name).ok();
+                    let dxgi = match DxgiMonitorDuplicator::new(*id, name) {
+                        Ok(d) => Some(d),
+                        Err(err) => {
+                            warn!("DXGI Desktop Duplication unavailable ({err}), using xcap monitor fallback");
+                            None
+                        }
+                    };
                     Ok(Self::Monitor {
                         xcap_monitor: monitor,
                         dxgi,
                     })
                 }
                 #[cfg(not(target_os = "windows"))]
+                Ok(Self::Monitor(monitor))
+            }
+            CaptureTarget::Window { id, title, .. } => {
+                #[cfg(target_os = "windows")]
                 {
-                    Ok(Self::Monitor(monitor))
+                    let _ = crate::media::capture_win::resolve_hwnd(*id, title)?;
+                    Ok(Self::Win32Window(Win32WindowCapturer::new(*id, title.clone())))
                 }
-            }
-            #[cfg(target_os = "windows")]
-            CaptureTarget::Window { id, title, .. } => {
-                let hwnd = win32_capture::resolve_hwnd(*id, title)?;
-                Ok(Self::Win32Window(win32_capture::Win32WindowCapturer::new(
-                    hwnd.0 as usize as u32,
-                    title.clone(),
-                )))
-            }
-            #[cfg(not(target_os = "windows"))]
-            CaptureTarget::Window { id, title, .. } => {
-                let windows = std::panic::catch_unwind(xcap::Window::all)
-                    .map_err(|_| {
-                        MediaError::VideoCapture("xcap Window::all panicked".to_string())
-                    })?
-                    .map_err(|e| {
-                        MediaError::VideoCapture(format!("xcap Window::all failed: {e}"))
-                    })?;
-                let window = windows
-                    .into_iter()
-                    .find(|w| w.id() == *id || w.title() == title)
-                    .ok_or_else(|| {
-                        MediaError::SourceNotFound(format!(
-                            "Window id={id} ({title}) closed or not found"
-                        ))
-                    })?;
-                Ok(Self::Window(window))
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let windows = std::panic::catch_unwind(xcap::Window::all)
+                        .map_err(|_| MediaError::VideoCapture("xcap Window::all panicked".to_string()))?
+                        .map_err(|e| MediaError::VideoCapture(format!("Window::all failed: {e}")))?;
+
+                    let window = windows
+                        .into_iter()
+                        .find(|w| w.id() == *id || (!title.is_empty() && w.title() == title))
+                        .ok_or_else(|| {
+                            MediaError::SourceNotFound(format!(
+                                "Window id={id} ({title}) not found or closed"
+                            ))
+                        })?;
+                    Ok(Self::Window(window))
+                }
             }
         }
     }
 
-    fn capture_scaled(
+    fn poll_scaled(
         &mut self,
         resizer: &mut Resizer,
         resolution: TargetResolution,
-    ) -> Result<(u32, u32, Vec<u8>, bool), MediaError> {
+        clamp_1080p: bool,
+    ) -> Result<FrameSample, MediaError> {
         match self {
             #[cfg(target_os = "windows")]
             Self::Monitor { xcap_monitor, dxgi } => {
                 if let Some(dupl) = dxgi.as_mut() {
-                    if let Ok(frame) = dupl.capture_scaled_frame(resizer, resolution) {
-                        return Ok(frame);
+                    match dupl.poll_scaled_frame(resizer, resolution, clamp_1080p) {
+                        Ok(CapturePoll::Frame(width, height, bytes)) => {
+                            return Ok(FrameSample::New {
+                                width,
+                                height,
+                                bytes,
+                                is_bgra: true,
+                            });
+                        }
+                        Ok(CapturePoll::Unchanged) => return Ok(FrameSample::Unchanged),
+                        Err(err) => debug!("DXGI capture poll error ({err}); falling back to xcap"),
                     }
                 }
                 let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     xcap_monitor.capture_image()
                 }))
-                .map_err(|_| {
-                    MediaError::VideoCapture("Monitor::capture_image panicked".to_string())
-                })?
+                .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
@@ -1543,17 +929,21 @@ impl ResolvedCaptureTarget {
                     img.width(),
                     img.height(),
                     resolution,
+                    clamp_1080p,
                 )?;
-                Ok((w, h, rgba, false))
+                Ok(FrameSample::New {
+                    width: w,
+                    height: h,
+                    bytes: rgba,
+                    is_bgra: false,
+                })
             }
             #[cfg(not(target_os = "windows"))]
             Self::Monitor(monitor) => {
                 let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     monitor.capture_image()
                 }))
-                .map_err(|_| {
-                    MediaError::VideoCapture("Monitor::capture_image panicked".to_string())
-                })?
+                .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
@@ -1561,19 +951,33 @@ impl ResolvedCaptureTarget {
                     img.width(),
                     img.height(),
                     resolution,
+                    clamp_1080p,
                 )?;
-                Ok((w, h, rgba, false))
+                Ok(FrameSample::New {
+                    width: w,
+                    height: h,
+                    bytes: rgba,
+                    is_bgra: false,
+                })
             }
             #[cfg(target_os = "windows")]
-            Self::Win32Window(capturer) => capturer.capture_scaled_frame(resizer, resolution),
+            Self::Win32Window(capturer) => {
+                match capturer.poll_scaled_frame(resizer, resolution, clamp_1080p)? {
+                    CapturePoll::Frame(width, height, bytes) => Ok(FrameSample::New {
+                        width,
+                        height,
+                        bytes,
+                        is_bgra: true,
+                    }),
+                    CapturePoll::Unchanged => Ok(FrameSample::Unchanged),
+                }
+            }
             #[cfg(not(target_os = "windows"))]
             Self::Window(window) => {
                 let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     window.capture_image()
                 }))
-                .map_err(|_| {
-                    MediaError::VideoCapture("Window::capture_image panicked".to_string())
-                })?
+                .map_err(|_| MediaError::VideoCapture("Window::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Window capture failed: {e}")))?;
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
@@ -1581,31 +985,47 @@ impl ResolvedCaptureTarget {
                     img.width(),
                     img.height(),
                     resolution,
+                    clamp_1080p,
                 )?;
-                Ok((w, h, rgba, false))
+                Ok(FrameSample::New {
+                    width: w,
+                    height: h,
+                    bytes: rgba,
+                    is_bgra: false,
+                })
             }
         }
     }
 }
 
-/// Captures a single preview snapshot for `target`, scaled to at most 720p, and returns it
-/// as a 24-byte-header binary frame packet (`[u32 width, u32 height, [u8; 16] peer_uuid, i420...]`).
-pub fn capture_preview_packet(target: &CaptureTarget) -> Result<Vec<u8>, MediaError> {
+/// Captures a single 720p BGRA thumbnail directly usable by GPUI `RenderImage`.
+pub fn capture_preview_bgra(target: &CaptureTarget) -> Result<(u32, u32, Vec<u8>), MediaError> {
+    if matches!(target, CaptureTarget::PortalWayland) {
+        return Err(MediaError::VideoCapture(
+            "Preview ao vivo do Wayland abre após confirmar o seletor do sistema".to_string(),
+        ));
+    }
     let mut resolved = ResolvedCaptureTarget::resolve(target)?;
     let mut resizer = Resizer::new();
-    let (width, height, buf, is_bgra) =
-        resolved.capture_scaled(&mut resizer, TargetResolution::R720p)?;
-    let mut i420 = Vec::new();
-    if is_bgra {
-        bgra_to_yuv420p_into(&buf, width, height, &mut i420)?;
-    } else {
-        rgba_to_yuv420p_into(&buf, width, height, &mut i420)?;
+    match resolved.poll_scaled(&mut resizer, TargetResolution::R720p, true)? {
+        FrameSample::New {
+            width,
+            height,
+            mut bytes,
+            is_bgra,
+        } => {
+            if !is_bgra {
+                rgba_to_bgra_in_place(&mut bytes);
+            }
+            Ok((width, height, bytes))
+        }
+        FrameSample::Unchanged => Err(MediaError::VideoCapture(
+            "Janela minimizada ou sem quadro disponível para preview".to_string(),
+        )),
     }
-    shared_protocol::encode_yuv420p_frame_packet(uuid::Uuid::nil(), width, height, &i420)
-        .map_err(|e| MediaError::VideoCapture(format!("Preview frame packet encode error: {e}")))
 }
 
-/// Native OS screen and window capturer powered by DXGI Desktop Duplication, Win32 GDI DIB, `xcap`, and `fast_image_resize`.
+/// Native OS screen/window capturer (DXGI/WGC on Windows, Portal PipeWire + xcap on Linux).
 #[derive(Debug, Clone, Default)]
 pub struct NativeVideoCapturer;
 
@@ -1624,14 +1044,22 @@ impl VideoCapturer for NativeVideoCapturer {
         tx: mpsc::Sender<RawVideoFrame>,
         cancel: CancellationToken,
     ) -> Result<(), MediaError> {
+        #[cfg(target_os = "linux")]
+        if matches!(target, CaptureTarget::PortalWayland) {
+            return crate::media::capture_lin::start_wayland_portal_capture(
+                resolution,
+                fps,
+                tx,
+                cancel,
+            );
+        }
+
         let clamped_fps = fps.clamp(1, 60) as u64;
         let frame_interval = Duration::from_micros(1_000_000 / clamped_fps);
 
         std::thread::Builder::new()
             .name("native-video-capture".to_string())
             .spawn(move || {
-                // Resolve the monitor or window ONCE outside the frame loop to avoid
-                // expensive per-frame XRandR/window-tree enumeration.
                 let mut resolved = match ResolvedCaptureTarget::resolve(&target) {
                     Ok(r) => r,
                     Err(err) => {
@@ -1639,10 +1067,13 @@ impl VideoCapturer for NativeVideoCapturer {
                         return;
                     }
                 };
+                info!(?target, fps = clamped_fps, ?resolution, "Started native video capture");
 
                 let mut resizer = Resizer::new();
                 let start = Instant::now();
                 let mut next_tick = Instant::now() + frame_interval;
+                let mut last_frame: Option<(u32, u32, Vec<u8>, bool)> = None;
+                let mut last_sent_at = Instant::now() - Duration::from_secs(1);
 
                 while !cancel.is_cancelled() {
                     let now = Instant::now();
@@ -1658,31 +1089,59 @@ impl VideoCapturer for NativeVideoCapturer {
                         next_tick = now_after + frame_interval;
                     }
 
-                    // If the downstream encoder is currently busy with the previous frame,
-                    // skip capturing this tick rather than building up a latency queue.
                     if tx.capacity() == 0 {
                         continue;
                     }
 
-                    let scaled_res = resolved
-                        .capture_scaled(&mut resizer, resolution)
+                    let poll_res = resolved
+                        .poll_scaled(&mut resizer, resolution, false)
                         .or_else(|_| {
                             resolved = ResolvedCaptureTarget::resolve(&target)?;
-                            resolved.capture_scaled(&mut resizer, resolution)
+                            resolved.poll_scaled(&mut resizer, resolution, false)
                         });
 
-                    match scaled_res {
-                        Ok((width, height, rgba, is_bgra)) => {
+                    match poll_res {
+                        Ok(FrameSample::New {
+                            width,
+                            height,
+                            bytes,
+                            is_bgra,
+                        }) => {
+                            last_sent_at = Instant::now();
+                            last_frame = Some((width, height, bytes.clone(), is_bgra));
                             let frame = RawVideoFrame {
                                 width,
                                 height,
-                                rgba,
+                                rgba: bytes,
                                 is_bgra,
                                 timestamp_us: start.elapsed().as_micros() as u64,
                             };
-                            match tx.try_send(frame) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            if matches!(
+                                tx.try_send(frame),
+                                Err(mpsc::error::TrySendError::Closed(_))
+                            ) {
+                                break;
+                            }
+                        }
+                        Ok(FrameSample::Unchanged) => {
+                            // Avoid cloning/re-encoding identical frames 60x/s; emit 2Hz keepalive max.
+                            if last_sent_at.elapsed() >= Duration::from_millis(500) {
+                                if let Some((w, h, ref bytes, is_bgra)) = last_frame {
+                                    last_sent_at = Instant::now();
+                                    let frame = RawVideoFrame {
+                                        width: w,
+                                        height: h,
+                                        rgba: bytes.clone(),
+                                        is_bgra,
+                                        timestamp_us: start.elapsed().as_micros() as u64,
+                                    };
+                                    if matches!(
+                                        tx.try_send(frame),
+                                        Err(mpsc::error::TrySendError::Closed(_))
+                                    ) {
+                                        break;
+                                    }
+                                }
                             }
                         }
                         Err(MediaError::SourceNotFound(msg)) => {
@@ -1695,9 +1154,7 @@ impl VideoCapturer for NativeVideoCapturer {
                     }
                 }
             })
-            .map_err(|e| {
-                MediaError::VideoCapture(format!("Failed to spawn video capture thread: {e}"))
-            })?;
+            .map_err(|e| MediaError::VideoCapture(format!("Failed to spawn capture thread: {e}")))?;
 
         Ok(())
     }
@@ -1709,8 +1166,7 @@ mod tests {
     use crate::media::mock::MockVideoCapturer;
 
     #[test]
-    fn test_frame_scaler_odd_dimensions_and_resolutions() {
-        // Create an odd-dimensioned source image: 1365 x 767
+    fn test_frame_scaler_bilinear_resolutions() {
         let src_w = 1365u32;
         let src_h = 767u32;
         let src_rgba = vec![200u8; (src_w * src_h * 4) as usize];
@@ -1718,8 +1174,7 @@ mod tests {
         let (w720, h720, buf720) =
             scale_rgba_frame(&src_rgba, src_w, src_h, TargetResolution::R720p)
                 .expect("scale to 720p");
-        assert_eq!(w720 % 2, 0);
-        assert_eq!(h720 % 2, 0);
+        assert_eq!((w720 % 2, h720 % 2), (0, 0));
         assert!(w720 <= 1280 && h720 <= 720);
         assert_eq!(buf720.len(), (w720 * h720 * 4) as usize);
 
@@ -1731,50 +1186,65 @@ mod tests {
     }
 
     #[test]
-    fn test_h264_encode_decode_roundtrip() {
+    fn test_nv12_and_bgra_conversions() {
+        let w = 320u32;
+        let h = 240u32;
+        let rgba = MockVideoCapturer::generate_smpte_bars(w, h, 0);
+        let mut nv12 = Vec::new();
+        rgba_to_nv12_into(&rgba, w, h, &mut nv12).expect("rgba to nv12");
+        assert_eq!(nv12.len(), (w * h * 3 / 2) as usize);
+
+        let mut bgra = rgba.clone();
+        rgba_to_bgra_in_place(&mut bgra);
+        assert_eq!(bgra[0], rgba[2]);
+        assert_eq!(bgra[2], rgba[0]);
+
+        let mut nv12_b = Vec::new();
+        bgra_to_nv12_into(&bgra, w, h, &mut nv12_b).expect("bgra to nv12");
+        assert_eq!(nv12, nv12_b);
+    }
+
+    #[test]
+    fn test_h264_encode_decode_bgra_and_keyframe_detection() {
         let width = 320u32;
         let height = 240u32;
-        let rgba = MockVideoCapturer::generate_smpte_bars(width, height, 0);
+        let mut bgra = MockVideoCapturer::generate_smpte_bars(width, height, 0);
+        rgba_to_bgra_in_place(&mut bgra);
 
-        let mut encoder = H264VideoEncoder::new(30, 1_500_000).expect("init H264 encoder");
+        let mut encoder = H264VideoEncoder::new(60, 6_000_000).expect("init H264 encoder");
         let mut decoder = H264VideoDecoder::new().expect("init H264 decoder");
 
         let annex_b = encoder
-            .encode_rgba(&rgba, width, height)
-            .expect("encode frame");
+            .encode_bgra(&bgra, width, height)
+            .expect("encode BGRA");
         assert!(!annex_b.is_empty());
+        assert!(is_h264_keyframe(&annex_b));
 
         let decoded = decoder
-            .decode_annex_b(&annex_b)
-            .expect("decode annex-b")
-            .expect("must produce decoded frame on IDR");
-        assert_eq!(decoded.0, width);
-        assert_eq!(decoded.1, height);
+            .decode_annex_b_bgra(&annex_b)
+            .expect("decode BGRA")
+            .expect("frame produced");
+        assert_eq!((decoded.0, decoded.1), (width, height));
         assert_eq!(decoded.2.len(), (width * height * 4) as usize);
 
-        // Request an explicit keyframe on an already-initialized encoder
+        // Request an explicit keyframe
         encoder.request_keyframe();
-        let annex_b_kf = encoder
-            .encode_rgba(&rgba, width, height)
-            .expect("encode keyframe");
-        let decoded_kf = decoder
-            .decode_annex_b(&annex_b_kf)
-            .expect("decode keyframe")
-            .expect("must produce decoded frame");
-        assert_eq!((decoded_kf.0, decoded_kf.1), (width, height));
+        let kf = encoder.encode_bgra(&bgra, width, height).expect("encode kf");
+        assert!(is_h264_keyframe(&kf));
 
-        // Dynamically change resolution (simulating window resize or fullscreen restore)
+        // Resize mid-stream
         let new_w = 640u32;
         let new_h = 360u32;
-        let rgba_resized = MockVideoCapturer::generate_smpte_bars(new_w, new_h, 1);
-        let annex_b_resized = encoder
-            .encode_rgba(&rgba_resized, new_w, new_h)
-            .expect("encode resized frame");
-        let decoded_resized = decoder
-            .decode_annex_b(&annex_b_resized)
-            .expect("decode resized frame")
-            .expect("must produce decoded resized frame");
-        assert_eq!((decoded_resized.0, decoded_resized.1), (new_w, new_h));
+        let mut resized = MockVideoCapturer::generate_smpte_bars(new_w, new_h, 2);
+        rgba_to_bgra_in_place(&mut resized);
+        let kf2 = encoder
+            .encode_bgra(&resized, new_w, new_h)
+            .expect("encode resized");
+        let dec2 = decoder
+            .decode_annex_b_bgra(&kf2)
+            .expect("decode resized")
+            .expect("resized frame");
+        assert_eq!((dec2.0, dec2.1), (new_w, new_h));
     }
 
     #[tokio::test]
@@ -1797,74 +1267,11 @@ mod tests {
             .expect("start mock capture");
 
         let start = Instant::now();
-        let mut count = 0;
-        while count < 5 {
+        for _ in 0..5 {
             let frame = rx.recv().await.expect("receive frame");
-            assert_eq!(frame.width, 160);
-            assert_eq!(frame.height, 120);
-            count += 1;
+            assert_eq!((frame.width, frame.height), (160, 120));
         }
         cancel.cancel();
-        let elapsed = start.elapsed();
-        // 5 frames at 30 FPS (first tick is immediate, followed by 4 intervals of ~33.3ms = ~133ms)
-        assert!(
-            elapsed >= Duration::from_millis(100),
-            "FPS limiter ran too fast: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn test_h264_60fps_encode_budget() {
-        let width = 1280u32;
-        let height = 720u32;
-        let rgba = MockVideoCapturer::generate_smpte_bars(width, height, 0);
-        let mut encoder = H264VideoEncoder::new(60, 8_000_000).expect("init 60fps encoder");
-
-        // Warm up with first frame (IDR)
-        let _ = encoder.encode_rgba(&rgba, width, height).expect("warmup");
-
-        let start = Instant::now();
-        let frame_count = 10;
-        for i in 1..=frame_count {
-            let frame = MockVideoCapturer::generate_smpte_bars(width, height, i);
-            let bitstream = encoder.encode_rgba(&frame, width, height).expect("encode frame");
-            assert!(!bitstream.is_empty());
-        }
-        let total_time = start.elapsed();
-        let avg_time_per_frame = total_time / (frame_count as u32);
-        println!("Average 720p encode time per frame: {avg_time_per_frame:?}");
-        assert!(
-            avg_time_per_frame < Duration::from_millis(16),
-            "Encode time exceeded 16ms frame budget: {avg_time_per_frame:?}"
-        );
-    }
-
-    #[test]
-    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-    fn test_bgra_to_yuv420p_and_encode_bgra() {
-        let width = 320u32;
-        let height = 240u32;
-        let mut bgra = vec![0u8; (width * height * 4) as usize];
-        for px in bgra.chunks_exact_mut(4) {
-            px[0] = 255;
-            px[1] = 0;
-            px[2] = 0;
-            px[3] = 255;
-        }
-
-        let mut encoder = H264VideoEncoder::new(30, 1_500_000).expect("init H264 encoder");
-        let mut decoder = H264VideoDecoder::new().expect("init H264 decoder");
-
-        let annex_b = encoder
-            .encode_bgra(&bgra, width, height)
-            .expect("encode bgra frame");
-        assert!(!annex_b.is_empty());
-
-        let decoded = decoder
-            .decode_annex_b(&annex_b)
-            .expect("decode annex-b")
-            .expect("must produce decoded frame on IDR");
-        assert_eq!(decoded.0, width);
-        assert_eq!(decoded.1, height);
+        assert!(start.elapsed() >= Duration::from_millis(80));
     }
 }

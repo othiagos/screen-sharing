@@ -21,21 +21,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake pkg-config libclang-dev nasm \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
-            libxcb1-dev libxrandr-dev libdbus-1-dev
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+            libxcb1-dev libxrandr-dev libdbus-1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
           components: clippy
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
-
-      - name: Build WASM Frontend (client-ui)
-        run: cargo build -p client-ui --target wasm32-unknown-unknown --release
 
       - name: Run Clippy Lints
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -44,7 +40,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Build Linux Release Executables
-        run: cargo build --release -p desktop-client -p signaling-server
+        run: cargo build --release -p desktop-client -p sfu-server
 
       - name: Upload Linux Executables Artifact
         uses: actions/upload-artifact@v4
@@ -52,7 +48,7 @@ jobs:
           name: screen-sharing-linux-x64
           path: |
             target/release/desktop-client
-            target/release/signaling-server
+            target/release/sfu-server
 
   build-windows:
     name: Windows (Test & Build x64)
@@ -66,7 +62,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown,x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
           components: clippy
 
       - name: Install NASM (for OpenH264 SIMD acceleration)
@@ -75,9 +71,6 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Build WASM Frontend (client-ui)
-        run: cargo build -p client-ui --target wasm32-unknown-unknown --release
-
       - name: Run Clippy Lints (Windows)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -85,7 +78,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Build Windows Release Executables
-        run: cargo build --release -p desktop-client -p signaling-server
+        run: cargo build --release -p desktop-client -p sfu-server
 
       - name: Upload Windows Executables Artifact
         uses: actions/upload-artifact@v4
@@ -93,4 +86,4 @@ jobs:
           name: screen-sharing-windows-x64
           path: |
             target/release/desktop-client.exe
-            target/release/signaling-server.exe
+            target/release/sfu-server.exe

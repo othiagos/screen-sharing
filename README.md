@@ -1,13 +1,14 @@
 # Screen Sharing
 
+## Highlights
 
-## Features
-
-- **Direct Peer-to-Peer Streaming:** Video (H.264) and audio (Opus) flow directly between peers over WebRTC without intermediate media servers.
-- **Application-Isolated Audio Capture:** Captures audio from a specific application/process tree (Windows WASAPI Process Loopback and Linux PipeWire) or full system audio, preventing voice chat echo.
-- **On-Demand Stream Playback:** Joining a room uses minimal CPU and memory. Video and audio decoders are initialized only when you choose to watch a participant's live stream.
-- **Configurable Quality:** Supports 720p, 1080p, or native resolution at 15, 30, or 60 FPS.
-- **Unlimited Room Participants:** Any number of peers can join a room, watch active streams, or share their own screen.
+- **Centralized QUIC SFU (`sfu-server` via `quinn`):** Dedicated QUIC unidirectional streams per H.264 video frame eliminate TCP head-of-line blocking, while unreliable QUIC datagrams (with automatic stream fallback) deliver low-latency 20ms Opus audio.
+- **Native Hardware UI (`gpui-kit`):** Zero WebView/WebAssembly overhead — dark Discord/Parsec-style native window with direct GPU `RenderImage` BGRA video presentation, per-peer 0–200% audio mixer sliders, Grid/Focus/Fullscreen views, live preview Capture Picker, and real-time latency/bitrate stats (`Ctrl+Shift+S`).
+- **Stutter-Free Game Capture:**
+  - **Windows 10/11:** `Windows.Graphics.Capture` (`CreateFreeThreaded` + HWND validation to eliminate Alt-Tab desktop leaks), DXGI Desktop Duplication with idle frame deduplication, **Media Foundation Hardware H.264 MFT** (NVENC/AMF/QuickSync when available, `OpenH264` tuned fallback), and WASAPI Process Loopback.
+  - **Linux (Wayland & X11):** XDG Desktop Portal ScreenCast (`ashpd`) + PipeWire video streaming on Wayland, `xcap` on X11, bilinear SIMD scaling (`fast_image_resize`), and PipeWire per-application audio capture via `target.object` (`object.serial`).
+- **TLS 1.3 + TOFU Security:** Self-signed servers automatically display a **Trust-On-First-Use (TOFU)** SHA-256 fingerprint prompt and warn immediately if the pin changes. Supports `SFU_TLS_CERT`/`SFU_TLS_KEY` PEM files, optional `SFU_AUTH_TOKEN`, and per-room passwords.
+- **Audio Resilience:** 40ms per-peer jitter buffer with Opus Packet Loss Concealment (PLC), automatic drift trimming, and soft-clipped mixing.
 
 ## Prerequisites
 
@@ -15,19 +16,16 @@
 
 ```bash
 sudo apt update && sudo apt install -y \
-  curl build-essential cmake pkg-config libclang-dev \
-  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-  librsvg2-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
-  libxcb1-dev libxrandr-dev libdbus-1-dev
+  curl build-essential cmake pkg-config libclang-dev nasm \
+  libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
+  libxcb1-dev libxrandr-dev libdbus-1-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustup target add wasm32-unknown-unknown
 ```
 
 ### Windows 10 (Build 2004+) / Windows 11
-
-Run in PowerShell:
 
 ```powershell
 winget install Rustlang.Rustup
@@ -36,56 +34,54 @@ winget install NASM.NASM
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-Restart PowerShell and add the WebAssembly target:
-
-```powershell
-rustup target add wasm32-unknown-unknown
-```
-
 ## Building
 
-Always build with `--release` so real-time video encoding runs with full compiler optimizations:
+Always compile with `--release` so SIMD scaling and H.264/Opus encoding run at full speed:
 
 ```bash
-# 1. Build the WebAssembly frontend
-cargo build -p client-ui --target wasm32-unknown-unknown --release
-
-# 2. Build the signaling server and desktop client
-cargo build --release -p signaling-server -p desktop-client
+cargo build --release -p sfu-server -p desktop-client
 ```
 
-The compiled binaries will be placed in `target/release/desktop-client` (`desktop-client.exe` on Windows) and `target/release/signaling-server`.
+Binaries are written to `target/release/sfu-server` and `target/release/desktop-client` (`.exe` on Windows).
 
-## Usage
+## Running
 
-1. **Start the Signaling Server:**
+1. **Start the QUIC SFU Server** (default bind `0.0.0.0:4433` UDP):
    ```bash
-   cargo run --release -p signaling-server
+   SFU_AUTH_TOKEN="optional-secret" cargo run --release -p sfu-server
    ```
-   By default, the server listens on `ws://0.0.0.0:9001/ws` (configurable via `SIGNALING_BIND_ADDR` or `PORT`).
+   Optional environment variables:
+   - `SFU_BIND_ADDR` / `SFU_BIND`: bind address (default `0.0.0.0:4433`)
+   - `SFU_AUTH_TOKEN`: optional shared access token required on `Hello`
+   - `SFU_CERT_DIR`: persistent directory for auto-generated self-signed TLS certs (default `./.sfu-certs`)
+   - `SFU_PUBLIC_HOST`: comma-separated SAN DNS/IP entries when auto-generating certs
+   - `SFU_TLS_CERT` & `SFU_TLS_KEY`: explicit PEM cert/key paths (e.g., Let's Encrypt)
 
-2. **Launch the Desktop Client:**
+2. **Launch the Desktop Client**:
    ```bash
    cargo run --release -p desktop-client
    ```
+   - Enter `server:4433`, your nickname, and optional `auth_token`.
+   - Accept the server's SHA-256 TOFU fingerprint prompt on first connection.
+   - Click **Criar Nova Sala** or enter an existing Room ID and click **Entrar na Sala**.
+   - Click **Compartilhar Tela** to pick a Monitor, Window, or Wayland Portal, preview it live, select `720p`/`1080p`/`1440p`/`Nativa`, `15`/`30`/`60 FPS`, bitrate (`6`/`12`/`20 Mbps`/`Auto`), and audio mode.
 
-3. **Create or Join a Room:**
-   - Enter the signaling server URL (e.g., `ws://127.0.0.1:9001/ws` for local testing, `ws://<LAN_IP>:9001/ws` on a local network, or `wss://<DOMAIN>/ws` over the internet).
-   - Click **Create Room** to start a new room and share the generated **Room ID**, or paste an existing **Room ID** and click **Join Room**.
-   - Click **Watch Stream** next to any live participant to view their stream, or click **Share Screen** to broadcast your own display or application window.
+## Docker Deployment (`sfu-server`)
 
-## Deploying the Signaling Server
+The repository includes a multi-stage `Dockerfile` for `sfu-server`:
 
-Because media flows directly peer-to-peer, the signaling server only exchanges lightweight handshake messages and can be hosted on free container platforms:
+```bash
+docker build -t screenshare-sfu .
+docker run -d --name sfu \
+  -p 4433:4433/udp -p 4433:4433/tcp \
+  -e SFU_AUTH_TOKEN="your-secret" \
+  -v sfu_certs:/data/certs \
+  screenshare-sfu
+```
 
-- **Docker (Render, Koyeb, Fly.io):** Deploy the repository using the included `Dockerfile` (or `render.yaml`) and connect clients using `wss://<your-app-domain>/ws`.
-- **Cloudflare Quick Tunnel:** Expose a locally running signaling server without deploying to the cloud:
-  ```bash
-  cloudflared tunnel --url http://localhost:9001
-  ```
-  Then connect clients using `wss://<generated-subdomain>.trycloudflare.com/ws`.
+> Make sure UDP port `4433` is open in your cloud firewall / security group — QUIC runs over UDP.
 
-## Testing
+## Verification
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings

@@ -75,7 +75,7 @@ impl VideoCapturer for MockVideoCapturer {
         } else {
             self.base_height
         };
-        let (width, height) = resolution.compute_dimensions(src_w, src_h, true);
+        let (width, height) = resolution.compute_dimensions(src_w, src_h, false);
         let target_fps = fps.clamp(1, 60) as u64;
         let frame_interval = Duration::from_micros(1_000_000 / target_fps);
 

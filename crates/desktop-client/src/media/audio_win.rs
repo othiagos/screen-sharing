@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use windows::{
-    core::{implement, IUnknown, Interface, Result as WinResult, GUID, PCWSTR, PROPVARIANT},
+    core::{implement, IUnknown, Interface, Result as WinResult, GUID, PROPVARIANT},
     Win32::{
         Foundation::{CloseHandle, E_FAIL, HANDLE, S_OK, WAIT_OBJECT_0},
         Media::{
@@ -87,6 +87,16 @@ impl AudioCapturer for WindowsAudioCapturer {
         tx: mpsc::Sender<RawAudioFrame>,
         cancel: CancellationToken,
     ) -> Result<(), MediaError> {
+        self.start_capture_with_warnings(mode, tx, None, cancel)
+    }
+
+    fn start_capture_with_warnings(
+        &self,
+        mode: AudioCaptureMode,
+        tx: mpsc::Sender<RawAudioFrame>,
+        warning_tx: Option<mpsc::UnboundedSender<String>>,
+        cancel: CancellationToken,
+    ) -> Result<(), MediaError> {
         if matches!(mode, AudioCaptureMode::None) {
             return Ok(());
         }
@@ -95,7 +105,7 @@ impl AudioCapturer for WindowsAudioCapturer {
             .name("wasapi-audio-capture".to_string())
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_wasapi_capture_loop(mode, tx, cancel)
+                    run_wasapi_capture_loop(mode, tx, warning_tx, cancel)
                 }));
                 match res {
                     Ok(Ok(())) => {}
@@ -167,9 +177,9 @@ fn activate_process_loopback_client(pid: u32) -> Result<IAudioClient, MediaError
 
     let _operation = unsafe {
         ActivateAudioInterfaceAsync(
-            PCWSTR(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK.as_ptr()),
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID as *const GUID,
-            Some(&*prop_variant),
+            Some(&*prop_variant as *const PROPVARIANT),
             &handler,
         )
     }
@@ -197,6 +207,7 @@ fn activate_system_loopback_client() -> Result<IAudioClient, MediaError> {
 fn run_wasapi_capture_loop(
     mode: AudioCaptureMode,
     tx: mpsc::Sender<RawAudioFrame>,
+    warning_tx: Option<mpsc::UnboundedSender<String>>,
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
     unsafe {
@@ -210,10 +221,13 @@ fn run_wasapi_capture_loop(
                 match activate_process_loopback_client(pid) {
                     Ok(client) => client,
                     Err(err) => {
-                        warn!(
-                            pid,
-                            "Process Loopback activation failed ({err}); falling back to System Global Loopback"
+                        let msg = format!(
+                            "WASAPI: loopback isolado para PID {pid} indisponível ({err}); usando áudio global do sistema"
                         );
+                        warn!("{msg}");
+                        if let Some(wtx) = &warning_tx {
+                            let _ = wtx.send(msg);
+                        }
                         activate_system_loopback_client()?
                     }
                 }

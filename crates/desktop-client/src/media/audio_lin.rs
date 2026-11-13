@@ -72,6 +72,16 @@ impl AudioCapturer for PipeWireAudioCapturer {
         tx: mpsc::Sender<RawAudioFrame>,
         cancel: CancellationToken,
     ) -> Result<(), MediaError> {
+        self.start_capture_with_warnings(mode, tx, None, cancel)
+    }
+
+    fn start_capture_with_warnings(
+        &self,
+        mode: AudioCaptureMode,
+        tx: mpsc::Sender<RawAudioFrame>,
+        warning_tx: Option<mpsc::UnboundedSender<String>>,
+        cancel: CancellationToken,
+    ) -> Result<(), MediaError> {
         if matches!(mode, AudioCaptureMode::None) {
             return Ok(());
         }
@@ -79,7 +89,7 @@ impl AudioCapturer for PipeWireAudioCapturer {
         std::thread::Builder::new()
             .name("pipewire-audio-capture".to_string())
             .spawn(move || {
-                if let Err(err) = run_pipewire_capture_loop(mode, tx, cancel) {
+                if let Err(err) = run_pipewire_capture_loop(mode, tx, warning_tx, cancel) {
                     warn!("PipeWire audio capture loop exited: {err}");
                 }
             })
@@ -94,6 +104,7 @@ impl AudioCapturer for PipeWireAudioCapturer {
 fn run_pipewire_capture_loop(
     mode: AudioCaptureMode,
     tx: mpsc::Sender<RawAudioFrame>,
+    warning_tx: Option<mpsc::UnboundedSender<String>>,
     cancel: CancellationToken,
 ) -> Result<(), MediaError> {
     pw::init();
@@ -114,27 +125,30 @@ fn run_pipewire_capture_loop(
         _ => HashSet::new(),
     };
 
-    let matched_node_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
-    let matched_clone = Rc::clone(&matched_node_id);
+    let matched_target: Rc<RefCell<Option<(u32, String)>>> = Rc::new(RefCell::new(None));
+    let matched_clone = Rc::clone(&matched_target);
 
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            if global.type_ != pw::types::ObjectType::Node {
-                return;
-            }
-            if target_pids.is_empty() {
+            if global.type_ != pw::types::ObjectType::Node || target_pids.is_empty() {
                 return;
             }
             if let Some(props) = global.props {
                 if let Some(pid_str) = props.get(*pw::keys::APP_PROCESS_ID) {
                     if let Ok(node_pid) = pid_str.trim().parse::<u32>() {
                         if target_pids.contains(&node_pid) {
+                            let target_obj = props
+                                .get("object.serial")
+                                .map(str::to_string)
+                                .unwrap_or_else(|| global.id.to_string());
                             info!(
                                 node_id = global.id,
-                                node_pid, "Matched PipeWire audio node for target process tree"
+                                target_object = %target_obj,
+                                node_pid,
+                                "Matched PipeWire audio node for target process tree"
                             );
-                            *matched_clone.borrow_mut() = Some(global.id);
+                            *matched_clone.borrow_mut() = Some((global.id, target_obj));
                         }
                     }
                 }
@@ -162,14 +176,31 @@ fn run_pipewire_capture_loop(
         return Ok(());
     }
 
-    let resolved_node_id = *matched_node_id.borrow();
-    let props = match (mode, resolved_node_id) {
-        (AudioCaptureMode::ApplicationOnly { pid }, Some(node_id)) => {
-            debug!(pid, node_id, "Connecting PipeWire capture stream to application node");
+    let resolved_target = matched_target.borrow().clone();
+    let props = match (mode, resolved_target) {
+        (AudioCaptureMode::ApplicationOnly { pid }, Some((node_id, target_obj))) => {
+            debug!(pid, node_id, target_obj = %target_obj, "Connecting PipeWire capture stream to application node");
             properties! {
                 *pw::keys::MEDIA_TYPE => "Audio",
                 *pw::keys::MEDIA_CATEGORY => "Capture",
                 *pw::keys::MEDIA_ROLE => "Communication",
+                "target.object" => target_obj.as_str(),
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+            }
+        }
+        (AudioCaptureMode::ApplicationOnly { pid }, None) => {
+            let msg = format!(
+                "PipeWire: nó de áudio para PID {pid} não encontrado; usando áudio global do sistema"
+            );
+            warn!("{msg}");
+            if let Some(wtx) = &warning_tx {
+                let _ = wtx.send(msg);
+            }
+            properties! {
+                *pw::keys::MEDIA_TYPE => "Audio",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Communication",
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
             }
         }
         _ => {
@@ -183,7 +214,7 @@ fn run_pipewire_capture_loop(
         }
     };
 
-    let stream = pw::stream::Stream::new(&core, "p2p-screen-share-audio", props)
+    let stream = pw::stream::Stream::new(&core, "screenshare-sfu-audio", props)
         .map_err(|e| MediaError::AudioCapture(format!("PipeWire Stream::new failed: {e}")))?;
 
     let state = CaptureCallbackState {
@@ -267,7 +298,7 @@ fn run_pipewire_capture_loop(
     stream
         .connect(
             spa::utils::Direction::Input,
-            resolved_node_id,
+            None,
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
