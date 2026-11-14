@@ -1,8 +1,8 @@
-# Screen Sharing
+# Screen Share
 
 ## Highlights
 
-- **Centralized QUIC SFU (`sfu-server` via `quinn`):** Dedicated QUIC unidirectional streams per H.264 video frame eliminate TCP head-of-line blocking, while unreliable QUIC datagrams (with automatic stream fallback) deliver low-latency 20ms Opus audio.
+- **Centralized Low-Latency SFU (`sfu-server` via `quinn`):** Dedicated unidirectional streams per H.264 video frame eliminate TCP head-of-line blocking, while unreliable UDP datagrams (with automatic stream fallback) deliver low-latency 20ms Opus audio.
 - **Native Hardware UI (`gpui-kit`):** Zero WebView/WebAssembly overhead — dark Discord/Parsec-style native window with direct GPU `RenderImage` BGRA video presentation, per-peer 0–200% audio mixer sliders, Grid/Focus/Fullscreen views, live preview Capture Picker, and real-time latency/bitrate stats (`Ctrl+Shift+S`).
 - **Stutter-Free Game Capture:**
   - **Windows 10/11:** `Windows.Graphics.Capture` (`CreateFreeThreaded` + HWND validation to eliminate Alt-Tab desktop leaks), DXGI Desktop Duplication with idle frame deduplication, **Media Foundation Hardware H.264 MFT** (NVENC/AMF/QuickSync when available, `OpenH264` tuned fallback), and WASAPI Process Loopback.
@@ -47,7 +47,7 @@ Binaries are written to `target/release/sfu-server` and `target/release/desktop-
 
 ## Running
 
-1. **Start the QUIC SFU Server** (default bind `0.0.0.0:4433` UDP):
+1. **Start the SFU Server** (default bind `0.0.0.0:4433` UDP):
    ```bash
    SFU_AUTH_TOKEN="optional-secret" cargo run --release -p sfu-server
    ```

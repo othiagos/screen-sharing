@@ -62,15 +62,39 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Returns the OS-appropriate config file path.
     pub fn default_path() -> PathBuf {
+        if let Some(dirs) = ProjectDirs::from("com", "ScreenShare", "ScreenShare") {
+            return dirs.config_dir().join("config.json");
+        }
+        PathBuf::from(".screen-share.json")
+    }
+
+    /// Returns the previous pre-rebrand config path for transparent settings migration.
+    pub fn legacy_path() -> PathBuf {
         if let Some(dirs) = ProjectDirs::from("com", "ScreenSharing", "desktop-client") {
             return dirs.config_dir().join("config.json");
         }
         PathBuf::from(".screenshare-client.json")
     }
 
-    /// Loads config from the default OS path, returning defaults if missing or unreadable.
+    /// Loads config from `primary`, migrating from `legacy` if `primary` does not yet exist.
+    pub fn load_with_migration(primary: &Path, legacy: &Path) -> Self {
+        if primary.exists() {
+            if let Ok(cfg) = Self::load_from(primary) {
+                return cfg;
+            }
+        }
+        if legacy.exists() {
+            if let Ok(cfg) = Self::load_from(legacy) {
+                let _ = cfg.save_to(primary);
+                return cfg;
+            }
+        }
+        Self::default()
+    }
+
+    /// Loads config from the default OS path (migrating legacy config if present).
     pub fn load() -> Self {
-        Self::load_from(&Self::default_path()).unwrap_or_default()
+        Self::load_with_migration(&Self::default_path(), &Self::legacy_path())
     }
 
     /// Loads config from an explicit file path.
@@ -148,6 +172,27 @@ mod tests {
             loaded.pinned_fingerprint("play.example.com:4433"),
             Some("AABBCCDD")
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_legacy_migration() {
+        let dir = std::env::temp_dir().join(format!("ss_mig_{}", uuid::Uuid::new_v4()));
+        let legacy = dir.join("old").join("config.json");
+        let primary = dir.join("new").join("config.json");
+
+        let mut cfg = AppConfig {
+            server_addr: "sfu.example.com:4433".to_string(),
+            nickname: "MigratedUser".to_string(),
+            ..Default::default()
+        };
+        cfg.trust_fingerprint("sfu.example.com:4433", "11:22:33:44");
+        cfg.save_to(&legacy).expect("save legacy");
+
+        let migrated = AppConfig::load_with_migration(&primary, &legacy);
+        assert_eq!(migrated, cfg);
+        assert!(primary.exists(), "migrated config should be persisted to new path");
 
         let _ = fs::remove_dir_all(&dir);
     }

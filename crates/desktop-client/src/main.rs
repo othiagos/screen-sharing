@@ -42,7 +42,7 @@ fn main() {
         let rt = Arc::clone(&tokio_rt);
         let cfg = initial_config.clone();
         if let Err(err) = gpui_kit::open_window(options, cx, move |window, cx| {
-            window.set_window_title("ScreenShare QUIC");
+            window.set_window_title("Screen Share");
             cx.new(|cx| AppView::new(rt, cfg, window, cx))
         }) {
             tracing::error!("Failed to open main window: {err}");

@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 #[cfg(target_os = "windows")]
 use crate::media::capture_win::{
-    list_windows_win32, CapturePoll, DxgiMonitorDuplicator, Win32WindowCapturer,
+    list_windows_win32_with_dims, CapturePoll, DxgiMonitorDuplicator, Win32WindowCapturer,
 };
 use crate::media::traits::{
     MediaError, RawVideoFrame, VideoCapturer, VideoDecoder, VideoEncoder,
@@ -715,23 +715,110 @@ fn copy_strided_plane(
     }
 }
 
-/// Enumerates monitors, application windows, and Wayland portal (when applicable).
-pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
-    let mut targets = Vec::new();
+/// UI-facing metadata about an enumerable capture target (human label and source pixel size).
+#[derive(Debug, Clone)]
+pub struct CaptureSourceInfo {
+    pub target: CaptureTarget,
+    pub display_label: String,
+    pub source_dims: Option<(u32, u32)>,
+}
+
+/// Captured thumbnail paired with true source dimensions.
+#[derive(Debug, Clone)]
+pub struct PreviewCapture {
+    pub preview_width: u32,
+    pub preview_height: u32,
+    pub source_dims: (u32, u32),
+    pub bgra: Vec<u8>,
+}
+
+fn is_technical_or_generic_monitor_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.starts_with(r"\\.\") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("unknown monitor") || lower == "generic pnp monitor"
+}
+
+/// Formats a user-facing monitor label without technical OS device paths (`\\.\DISPLAY1`).
+pub fn format_monitor_display_label(
+    index_1_based: usize,
+    os_name: &str,
+    friendly_name: Option<&str>,
+) -> String {
+    let candidate = friendly_name
+        .map(str::trim)
+        .filter(|s| !is_technical_or_generic_monitor_name(s))
+        .or_else(|| {
+            let trimmed = os_name.trim();
+            (!is_technical_or_generic_monitor_name(trimmed)).then_some(trimmed)
+        });
+
+    match candidate {
+        Some(name) => format!("Monitor {index_1_based} — {name}"),
+        None => format!("Monitor {index_1_based}"),
+    }
+}
+
+fn query_monitor_physical_dims(monitor: &xcap::Monitor) -> Option<(u32, u32)> {
+    let w = monitor.width().ok().filter(|&v| v > 1)?;
+    let h = monitor.height().ok().filter(|&v| v > 1)?;
+    #[cfg(target_os = "windows")]
+    {
+        Some((w, h))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let scale = monitor
+            .scale_factor()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.1)
+            .unwrap_or(1.0);
+        let phys_w = ((w as f32) * scale).round() as u32;
+        let phys_h = ((h as f32) * scale).round() as u32;
+        (phys_w > 1 && phys_h > 1).then_some((phys_w, phys_h))
+    }
+}
+
+fn query_window_dims(window: &xcap::Window) -> Option<(u32, u32)> {
+    if window.is_minimized().unwrap_or(false) {
+        return None;
+    }
+    let w = window.width().ok().filter(|&v| v > 1)?;
+    let h = window.height().ok().filter(|&v| v > 1)?;
+    Some((w, h))
+}
+
+/// Enumerates monitors, application windows, and Wayland portal (when applicable) with UI metadata.
+pub fn list_capture_sources() -> Result<Vec<CaptureSourceInfo>, MediaError> {
+    let mut sources = Vec::new();
 
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        targets.push(CaptureTarget::PortalWayland);
+        sources.push(CaptureSourceInfo {
+            target: CaptureTarget::PortalWayland,
+            display_label: "Selecionar Tela/Janela pelo Portal Wayland".to_string(),
+            source_dims: None,
+        });
     }
 
     match std::panic::catch_unwind(xcap::Monitor::all) {
         Ok(Ok(monitors)) => {
-            for monitor in monitors {
+            for (idx, monitor) in monitors.into_iter().enumerate() {
                 let Ok(id) = monitor.id() else {
                     continue;
                 };
-                let name = monitor.name().unwrap_or_else(|_| format!("Monitor {id}"));
-                targets.push(CaptureTarget::Monitor { id, name });
+                let os_name = monitor.name().unwrap_or_else(|_| format!("Monitor {id}"));
+                let friendly = monitor.friendly_name().ok();
+                let display_label =
+                    format_monitor_display_label(idx + 1, &os_name, friendly.as_deref());
+                let source_dims = query_monitor_physical_dims(&monitor);
+                sources.push(CaptureSourceInfo {
+                    target: CaptureTarget::Monitor { id, name: os_name },
+                    display_label,
+                    source_dims,
+                });
             }
         }
         Ok(Err(err)) => warn!("Monitor enumeration warning: {err}"),
@@ -741,11 +828,19 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
     #[cfg(target_os = "windows")]
     {
         let mut seen_ids = std::collections::HashSet::new();
-        for win_target in list_windows_win32() {
-            if let CaptureTarget::Window { id, .. } = &win_target {
-                seen_ids.insert(*id);
-            }
-            targets.push(win_target);
+        for (win_target, dims) in list_windows_win32_with_dims() {
+            let display_label = match &win_target {
+                CaptureTarget::Window { id, title, .. } => {
+                    seen_ids.insert(*id);
+                    title.clone()
+                }
+                _ => continue,
+            };
+            sources.push(CaptureSourceInfo {
+                target: win_target,
+                display_label,
+                source_dims: dims,
+            });
         }
         if let Ok(Ok(windows)) = std::panic::catch_unwind(xcap::Window::all) {
             for window in windows {
@@ -755,13 +850,19 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
                 let Ok(title) = window.title() else {
                     continue;
                 };
-                if seen_ids.contains(&id) || title.trim().is_empty() {
+                let trimmed = title.trim().to_string();
+                if seen_ids.contains(&id) || trimmed.is_empty() {
                     continue;
                 }
-                targets.push(CaptureTarget::Window {
-                    id,
-                    title,
-                    pid: window.pid().unwrap_or(0),
+                let source_dims = query_window_dims(&window);
+                sources.push(CaptureSourceInfo {
+                    target: CaptureTarget::Window {
+                        id,
+                        title: trimmed.clone(),
+                        pid: window.pid().unwrap_or(0),
+                    },
+                    display_label: trimmed,
+                    source_dims,
                 });
             }
         }
@@ -775,14 +876,24 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
                     let Ok(title) = window.title() else {
                         continue;
                     };
-                    if title.trim().is_empty() {
+                    let trimmed = title.trim().to_string();
+                    if trimmed.is_empty() {
                         continue;
                     }
                     let Ok(id) = window.id() else {
                         continue;
                     };
                     let pid = extract_window_pid_linux(&window);
-                    targets.push(CaptureTarget::Window { id, title, pid });
+                    let source_dims = query_window_dims(&window);
+                    sources.push(CaptureSourceInfo {
+                        target: CaptureTarget::Window {
+                            id,
+                            title: trimmed.clone(),
+                            pid,
+                        },
+                        display_label: trimmed,
+                        source_dims,
+                    });
                 }
             }
             Ok(Err(err)) => warn!("Window enumeration warning: {err}"),
@@ -790,7 +901,15 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
         }
     }
 
-    Ok(targets)
+    Ok(sources)
+}
+
+/// Enumerates monitors, application windows, and Wayland portal (when applicable).
+pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
+    Ok(list_capture_sources()?
+        .into_iter()
+        .map(|s| s.target)
+        .collect())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -838,6 +957,8 @@ enum FrameSample {
     New {
         width: u32,
         height: u32,
+        source_width: u32,
+        source_height: u32,
         bytes: Vec<u8>,
         is_bgra: bool,
     },
@@ -928,9 +1049,13 @@ impl ResolvedCaptureTarget {
                 if let Some(dupl) = dxgi.as_mut() {
                     match dupl.poll_scaled_frame(resizer, resolution, clamp_1080p) {
                         Ok(CapturePoll::Frame(width, height, bytes)) => {
+                            let (source_width, source_height) =
+                                dupl.source_dims().unwrap_or((width, height));
                             return Ok(FrameSample::New {
                                 width,
                                 height,
+                                source_width,
+                                source_height,
                                 bytes,
                                 is_bgra: true,
                             });
@@ -946,17 +1071,20 @@ impl ResolvedCaptureTarget {
                 }))
                 .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
+                let (source_width, source_height) = (img.width(), img.height());
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
                     img.as_raw(),
-                    img.width(),
-                    img.height(),
+                    source_width,
+                    source_height,
                     resolution,
                     clamp_1080p,
                 )?;
                 Ok(FrameSample::New {
                     width: w,
                     height: h,
+                    source_width,
+                    source_height,
                     bytes: rgba,
                     is_bgra: false,
                 })
@@ -968,17 +1096,20 @@ impl ResolvedCaptureTarget {
                 }))
                 .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
+                let (source_width, source_height) = (img.width(), img.height());
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
                     img.as_raw(),
-                    img.width(),
-                    img.height(),
+                    source_width,
+                    source_height,
                     resolution,
                     clamp_1080p,
                 )?;
                 Ok(FrameSample::New {
                     width: w,
                     height: h,
+                    source_width,
+                    source_height,
                     bytes: rgba,
                     is_bgra: false,
                 })
@@ -986,12 +1117,18 @@ impl ResolvedCaptureTarget {
             #[cfg(target_os = "windows")]
             Self::Win32Window(capturer) => {
                 match capturer.poll_scaled_frame(resizer, resolution, clamp_1080p)? {
-                    CapturePoll::Frame(width, height, bytes) => Ok(FrameSample::New {
-                        width,
-                        height,
-                        bytes,
-                        is_bgra: true,
-                    }),
+                    CapturePoll::Frame(width, height, bytes) => {
+                        let (source_width, source_height) =
+                            capturer.last_source_dims().unwrap_or((width, height));
+                        Ok(FrameSample::New {
+                            width,
+                            height,
+                            source_width,
+                            source_height,
+                            bytes,
+                            is_bgra: true,
+                        })
+                    }
                     CapturePoll::Unchanged => Ok(FrameSample::Unchanged),
                 }
             }
@@ -1002,17 +1139,20 @@ impl ResolvedCaptureTarget {
                 }))
                 .map_err(|_| MediaError::VideoCapture("Window::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Window capture failed: {e}")))?;
+                let (source_width, source_height) = (img.width(), img.height());
                 let (w, h, rgba) = scale_rgba_frame_with_resizer(
                     resizer,
                     img.as_raw(),
-                    img.width(),
-                    img.height(),
+                    source_width,
+                    source_height,
                     resolution,
                     clamp_1080p,
                 )?;
                 Ok(FrameSample::New {
                     width: w,
                     height: h,
+                    source_width,
+                    source_height,
                     bytes: rgba,
                     is_bgra: false,
                 })
@@ -1021,8 +1161,8 @@ impl ResolvedCaptureTarget {
     }
 }
 
-/// Captures a single 720p BGRA thumbnail directly usable by GPUI `RenderImage`.
-pub fn capture_preview_bgra(target: &CaptureTarget) -> Result<(u32, u32, Vec<u8>), MediaError> {
+/// Captures a single 720p BGRA thumbnail alongside the original source resolution.
+pub fn capture_preview_with_source(target: &CaptureTarget) -> Result<PreviewCapture, MediaError> {
     if matches!(target, CaptureTarget::PortalWayland) {
         return Err(MediaError::VideoCapture(
             "Preview ao vivo do Wayland abre após confirmar o seletor do sistema".to_string(),
@@ -1034,18 +1174,31 @@ pub fn capture_preview_bgra(target: &CaptureTarget) -> Result<(u32, u32, Vec<u8>
         FrameSample::New {
             width,
             height,
+            source_width,
+            source_height,
             mut bytes,
             is_bgra,
         } => {
             if !is_bgra {
                 rgba_to_bgra_in_place(&mut bytes);
             }
-            Ok((width, height, bytes))
+            Ok(PreviewCapture {
+                preview_width: width,
+                preview_height: height,
+                source_dims: (source_width, source_height),
+                bgra: bytes,
+            })
         }
         FrameSample::Unchanged => Err(MediaError::VideoCapture(
             "Janela minimizada ou sem quadro disponível para preview".to_string(),
         )),
     }
+}
+
+/// Captures a single 720p BGRA thumbnail directly usable by GPUI `RenderImage`.
+pub fn capture_preview_bgra(target: &CaptureTarget) -> Result<(u32, u32, Vec<u8>), MediaError> {
+    let cap = capture_preview_with_source(target)?;
+    Ok((cap.preview_width, cap.preview_height, cap.bgra))
 }
 
 /// Native OS screen/window capturer (DXGI/WGC on Windows, Portal PipeWire + xcap on Linux).
@@ -1129,6 +1282,7 @@ impl VideoCapturer for NativeVideoCapturer {
                             height,
                             bytes,
                             is_bgra,
+                            ..
                         }) => {
                             last_sent_at = Instant::now();
                             last_frame = Some((width, height, bytes.clone(), is_bgra));
@@ -1296,5 +1450,29 @@ mod tests {
         }
         cancel.cancel();
         assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    fn test_format_monitor_display_label() {
+        assert_eq!(
+            format_monitor_display_label(1, r"\\.\DISPLAY1", Some("DELL U2720Q")),
+            "Monitor 1 — DELL U2720Q"
+        );
+        assert_eq!(
+            format_monitor_display_label(2, r"\\.\DISPLAY2", Some("Unknown Monitor 65537")),
+            "Monitor 2"
+        );
+        assert_eq!(
+            format_monitor_display_label(1, r"\\.\DISPLAY1", Some("Generic PnP Monitor")),
+            "Monitor 1"
+        );
+        assert_eq!(
+            format_monitor_display_label(1, "HDMI-1", Some("HDMI-1")),
+            "Monitor 1 — HDMI-1"
+        );
+        assert_eq!(
+            format_monitor_display_label(2, "", None),
+            "Monitor 2"
+        );
     }
 }

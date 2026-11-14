@@ -223,13 +223,13 @@ pub fn render_lobby(
                                     .text_xl()
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_color(fg)
-                                    .child("ScreenShare QUIC"),
+                                    .child("Screen Share"),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("SFU QUIC de baixa latência • Vídeo H.264 • Áudio Opus"),
+                                    .child("Compartilhamento de tela em baixa latência • Vídeo H.264 • Áudio Opus"),
                             ),
                     )
                     .child(

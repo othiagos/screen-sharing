@@ -67,6 +67,8 @@ pub struct AppView {
     frame_notify_flag: Arc<AtomicBool>,
 
     pub local_broadcast: Option<LocalBroadcastSession>,
+    pub local_broadcast_label: Option<String>,
+    pub show_local_preview: bool,
     pub room_id: String,
     pub local_peer_id: Option<PeerId>,
     pub peers: Vec<PeerInfo>,
@@ -129,6 +131,8 @@ impl AppView {
             event_rx: None,
             frame_notify_flag,
             local_broadcast: None,
+            local_broadcast_label: None,
+            show_local_preview: false,
             room_id: String::new(),
             local_peer_id: None,
             peers: Vec::new(),
@@ -225,7 +229,7 @@ impl AppView {
         self.pending_room_password = password;
         self.tofu_prompt = None;
         self.is_connecting = true;
-        self.status_message = Some(("Conectando ao servidor QUIC SFU...".into(), false));
+        self.status_message = Some(("Conectando ao servidor...".into(), false));
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let gen = self.connect_generation;
 
@@ -317,9 +321,9 @@ impl AppView {
     pub fn open_capture_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let modal = open_picker_dialog(&self.config, window, cx);
         let sub = cx.subscribe(&modal, |this, _, ev: &PickerModalEvent, cx| match ev {
-            PickerModalEvent::Start(stream_cfg) => {
+            PickerModalEvent::Start { config, label } => {
                 this.picker_state = None;
-                this.start_local_broadcast(stream_cfg.clone(), cx);
+                this.start_local_broadcast(config.clone(), label.clone(), cx);
             }
             PickerModalEvent::Cancelled => {
                 this.picker_state = None;
@@ -328,7 +332,12 @@ impl AppView {
         self.picker_state = Some((modal, sub));
     }
 
-    fn start_local_broadcast(&mut self, stream_cfg: StreamConfig, cx: &mut Context<Self>) {
+    fn start_local_broadcast(
+        &mut self,
+        stream_cfg: StreamConfig,
+        source_label: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(sfu) = self.sfu_client.clone() else {
             return;
         };
@@ -341,6 +350,8 @@ impl AppView {
         self.config.bitrate = stream_cfg.bitrate;
         let _ = self.config.save();
 
+        self.show_local_preview = false;
+        self.video_store.clear_local_preview();
         self.dismissed_warning = None;
         let _rt_guard = self.tokio_rt.enter();
         let flag = Arc::clone(&self.frame_notify_flag);
@@ -354,12 +365,36 @@ impl AppView {
             Some(preview_cb),
         ) {
             Ok(session) => {
+                session.set_local_preview_enabled(false);
                 self.broadcast_stats = Some(session.stats_snapshot());
                 self.local_broadcast = Some(session);
+                self.local_broadcast_label = Some(source_label);
                 self.ensure_pump_started(cx);
             }
             Err(err) => {
+                self.local_broadcast_label = None;
                 self.warning_banner = Some(format!("Erro ao iniciar captura: {err}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_local_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.local_broadcast.is_none() {
+            return;
+        }
+        self.show_local_preview = !self.show_local_preview;
+        if let Some(session) = &self.local_broadcast {
+            session.set_local_preview_enabled(self.show_local_preview);
+        }
+        if !self.show_local_preview {
+            self.video_store.clear_local_preview();
+            self.local_preview_slot.clear(window);
+            if matches!(self.stage_layout, StageLayout::Focus(VideoTileKey::LocalPreview)) {
+                self.stage_layout = StageLayout::Grid;
+            }
+            if self.is_fullscreen && self.subscribed_peers.is_empty() {
+                self.is_fullscreen = false;
             }
         }
         cx.notify();
@@ -369,6 +404,8 @@ impl AppView {
         if let (Some(session), Some(sfu)) = (self.local_broadcast.take(), self.sfu_client.as_ref()) {
             session.stop(sfu);
         }
+        self.show_local_preview = false;
+        self.local_broadcast_label = None;
         self.broadcast_stats = None;
         self.video_store.clear_local_preview();
         self.local_preview_slot.clear(window);
@@ -523,6 +560,8 @@ impl AppView {
         self.peer_sliders.clear();
         self.stage_layout = StageLayout::Grid;
         self.is_fullscreen = false;
+        self.show_local_preview = false;
+        self.local_broadcast_label = None;
         self.rtt_ms = None;
         self.broadcast_stats = None;
         self.warning_banner = None;

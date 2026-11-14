@@ -249,6 +249,10 @@ impl DxgiMonitorDuplicator {
             }
         }
     }
+
+    pub fn source_dims(&self) -> Option<(u32, u32)> {
+        (self.width > 1 && self.height > 1).then_some((self.width, self.height))
+    }
 }
 
 /// GPU window capturer backed by `Windows.Graphics.Capture` (WGC) for tear-free game capture
@@ -259,6 +263,7 @@ pub struct Win32WindowCapturer {
     wgc: Option<WgcSession>,
     wgc_attempted: bool,
     gdi_fallback: GdiDibSurface,
+    last_source_dims: Option<(u32, u32)>,
 }
 
 struct WgcSession {
@@ -440,7 +445,12 @@ impl Win32WindowCapturer {
             wgc: None,
             wgc_attempted: false,
             gdi_fallback: GdiDibSurface::default(),
+            last_source_dims: None,
         }
+    }
+
+    pub fn last_source_dims(&self) -> Option<(u32, u32)> {
+        self.last_source_dims
     }
 
     pub fn poll_scaled_frame(
@@ -471,6 +481,7 @@ impl Win32WindowCapturer {
         if let Some(wgc) = self.wgc.as_mut() {
             match wgc.poll_bgra() {
                 Ok(Some((w, h, bgra))) => {
+                    self.last_source_dims = Some((w, h));
                     let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
                         resizer,
                         bgra,
@@ -514,6 +525,7 @@ impl Win32WindowCapturer {
             }
             let w = (client.right - client.left).max(2) as u32;
             let h = (client.bottom - client.top).max(2) as u32;
+            self.last_source_dims = Some((w, h));
 
             let hdc_src = GetDC(hwnd);
             if hdc_src.is_invalid() {
@@ -758,7 +770,7 @@ fn is_ignored_system_title(title: &str) -> bool {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let out = &mut *(lparam.0 as *mut Vec<CaptureTarget>);
+    let out = &mut *(lparam.0 as *mut Vec<(CaptureTarget, Option<(u32, u32)>)>);
 
     if !IsWindowVisible(hwnd).as_bool() {
         return BOOL(1);
@@ -818,34 +830,48 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return BOOL(1);
     }
 
+    let mut dims = None;
     if !is_minimized {
         let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok()
-            && ((rect.right - rect.left) <= 1 || (rect.bottom - rect.top) <= 1)
-        {
-            return BOOL(1);
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            if w <= 1 || h <= 1 {
+                return BOOL(1);
+            }
+            dims = Some((w as u32, h as u32));
         }
     }
 
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
-    out.push(CaptureTarget::Window {
-        id: hwnd.0 as usize as u32,
-        title,
-        pid,
-    });
+    out.push((
+        CaptureTarget::Window {
+            id: hwnd.0 as usize as u32,
+            title,
+            pid,
+        },
+        dims,
+    ));
 
     BOOL(1)
 }
 
-pub fn list_windows_win32() -> Vec<CaptureTarget> {
-    let mut windows: Vec<CaptureTarget> = Vec::new();
+pub fn list_windows_win32_with_dims() -> Vec<(CaptureTarget, Option<(u32, u32)>)> {
+    let mut windows: Vec<(CaptureTarget, Option<(u32, u32)>)> = Vec::new();
     unsafe {
-        let lparam = LPARAM((&mut windows as *mut Vec<CaptureTarget>) as isize);
+        let lparam = LPARAM((&mut windows as *mut Vec<(CaptureTarget, Option<(u32, u32)>)>) as isize);
         let _ = EnumWindows(Some(enum_windows_proc), lparam);
     }
     windows
+}
+
+pub fn list_windows_win32() -> Vec<CaptureTarget> {
+    list_windows_win32_with_dims()
+        .into_iter()
+        .map(|(target, _)| target)
+        .collect()
 }
 
 pub fn resolve_hwnd(id: u32, title_hint: &str) -> Result<HWND, MediaError> {

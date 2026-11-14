@@ -2,7 +2,7 @@
 name = "desktop-client"
 version = "0.2.0"
 edition = "2021"
-description = "Native GPUI Kit desktop client with QUIC SFU transport and GPU-accelerated game capture"
+description = "Native GPUI Kit desktop client for Screen Share with GPU-accelerated game capture"
 
 [dependencies]
 shared-protocol = { workspace = true }

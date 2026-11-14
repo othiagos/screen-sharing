@@ -110,6 +110,65 @@ impl TargetResolution {
         let scaled_h = ((src_h as f64 * scale).round() as u32 & !1).max(2);
         (scaled_w, scaled_h)
     }
+
+    pub fn ordered_presets() -> [Self; 4] {
+        [Self::R720p, Self::R1080p, Self::R1440p, Self::Native]
+    }
+
+    /// Returns true if `(src_width, src_height)` meets or exceeds this preset's bounding box
+    /// (orientation-agnostic) without requiring upscaling beyond the source resolution.
+    pub fn is_supported_by_source(self, src_width: u32, src_height: u32) -> bool {
+        let src_long = src_width.max(src_height);
+        let src_short = src_width.min(src_height);
+        match self {
+            Self::R720p => src_long >= 1280 && src_short >= 720,
+            Self::R1080p => src_long >= 1920 && src_short >= 1080,
+            Self::R1440p => src_long >= 2560 && src_short >= 1440,
+            Self::Native => true,
+        }
+    }
+
+    /// Returns all resolution presets supported by `(src_width, src_height)` in ascending order,
+    /// always including `Native`.
+    pub fn supported_for_source(src_width: u32, src_height: u32) -> Vec<Self> {
+        Self::ordered_presets()
+            .into_iter()
+            .filter(|res| res.is_supported_by_source(src_width, src_height))
+            .collect()
+    }
+
+    /// Clamps `self` so it never selects a preset larger than `(src_width, src_height)`.
+    pub fn clamp_to_source(self, src_width: u32, src_height: u32) -> Self {
+        if self.is_supported_by_source(src_width, src_height) {
+            return self;
+        }
+        let descending = [Self::R1440p, Self::R1080p, Self::R720p];
+        let start = match self {
+            Self::R720p => 2,
+            Self::R1080p => 1,
+            Self::R1440p | Self::Native => 0,
+        };
+        descending[start..]
+            .iter()
+            .copied()
+            .find(|res| res.is_supported_by_source(src_width, src_height))
+            .unwrap_or(Self::Native)
+    }
+
+    /// Resolves `Native` to the matching tier for bitrate calculation when source dimensions are known.
+    pub fn effective_bitrate_tier(self, src_width: u32, src_height: u32) -> Self {
+        let clamped = self.clamp_to_source(src_width, src_height);
+        if !matches!(clamped, Self::Native) {
+            return clamped;
+        }
+        if Self::R1440p.is_supported_by_source(src_width, src_height) {
+            Self::R1440p
+        } else if Self::R1080p.is_supported_by_source(src_width, src_height) {
+            Self::R1080p
+        } else {
+            Self::R720p
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -573,6 +632,65 @@ mod tests {
         assert_eq!(
             TargetResolution::Native.compute_dimensions(2560, 1440, true),
             (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn test_target_resolution_supported_and_clamping() {
+        assert_eq!(
+            TargetResolution::supported_for_source(2560, 1440),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::R1440p,
+                TargetResolution::Native,
+            ]
+        );
+        assert_eq!(
+            TargetResolution::supported_for_source(1920, 1080),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::Native,
+            ]
+        );
+        assert_eq!(
+            TargetResolution::supported_for_source(1366, 768),
+            vec![TargetResolution::R720p, TargetResolution::Native]
+        );
+        assert_eq!(
+            TargetResolution::supported_for_source(900, 600),
+            vec![TargetResolution::Native]
+        );
+        // Portrait 1080x1920 still fits 1080p and 720p, not 1440p
+        assert_eq!(
+            TargetResolution::supported_for_source(1080, 1920),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::Native,
+            ]
+        );
+
+        assert_eq!(
+            TargetResolution::R1440p.clamp_to_source(1920, 1080),
+            TargetResolution::R1080p
+        );
+        assert_eq!(
+            TargetResolution::R1080p.clamp_to_source(900, 600),
+            TargetResolution::Native
+        );
+        assert_eq!(
+            TargetResolution::Native.effective_bitrate_tier(900, 600),
+            TargetResolution::R720p
+        );
+        assert_eq!(
+            TargetResolution::Native.effective_bitrate_tier(1920, 1080),
+            TargetResolution::R1080p
+        );
+        assert_eq!(
+            TargetResolution::Native.effective_bitrate_tier(3840, 2160),
+            TargetResolution::R1440p
         );
     }
 

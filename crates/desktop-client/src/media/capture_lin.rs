@@ -122,7 +122,7 @@ fn run_pipewire_video_loop(
         *pw::keys::MEDIA_ROLE => "Screen",
     };
 
-    let stream = pw::stream::StreamBox::new(&core, "screenshare-sfu-video", props)
+    let stream = pw::stream::StreamBox::new(&core, "screen-share-video", props)
         .map_err(|e| MediaError::VideoCapture(format!("PipeWire video Stream::new: {e}")))?;
 
     let state = Rc::new(RefCell::new(PwVideoState {

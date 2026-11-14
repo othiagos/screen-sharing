@@ -34,7 +34,7 @@ fn sync_video_slots(app: &mut AppView, window: &mut Window) {
         }
     }
 
-    if app.local_broadcast.is_some() {
+    if app.local_broadcast.is_some() && app.show_local_preview {
         if let Some(local_frame) = app.video_store.latest_local_preview() {
             app.local_preview_slot.sync(&local_frame, window);
         }
@@ -53,7 +53,10 @@ fn tile_info(
 ) {
     match key {
         VideoTileKey::LocalPreview => {
-            let label = SharedString::from("Sua Transmissão (Preview Local)");
+            let label = match &app.local_broadcast_label {
+                Some(src) => SharedString::from(format!("Sua Transmissão — {src}")),
+                None => SharedString::from("Sua Transmissão (Preview Local)"),
+            };
             let img_arc = app.local_preview_slot.image();
             let stats = app.broadcast_stats.as_ref().map(|bs| VideoTileStats {
                 width: bs.width,
@@ -166,41 +169,44 @@ pub fn render_stage(
         .collect();
     let has_remote_tiles = !stage_keys.is_empty();
     let has_local_broadcast = app.local_broadcast.is_some();
+    let show_local_preview = has_local_broadcast && app.show_local_preview;
 
-    if has_local_broadcast && !has_remote_tiles {
+    if show_local_preview && !has_remote_tiles {
         stage_keys.push(VideoTileKey::LocalPreview);
     }
 
     if app.is_fullscreen {
         let mut fs_keys = stage_keys.clone();
-        if has_local_broadcast && !fs_keys.contains(&VideoTileKey::LocalPreview) {
+        if show_local_preview && !fs_keys.contains(&VideoTileKey::LocalPreview) {
             fs_keys.push(VideoTileKey::LocalPreview);
         }
         let target_key = match app.stage_layout {
-            StageLayout::Focus(k) if fs_keys.contains(&k) => k,
-            _ => fs_keys.first().copied().unwrap_or(VideoTileKey::LocalPreview),
+            StageLayout::Focus(k) if fs_keys.contains(&k) => Some(k),
+            _ => fs_keys.first().copied(),
         };
-        let tile = build_clickable_tile(app, target_key, "fs-tile", false, false, cx);
+        if let Some(target_key) = target_key {
+            let tile = build_clickable_tile(app, target_key, "fs-tile", false, false, cx);
 
-        return div()
-            .size_full()
-            .relative()
-            .bg(black())
-            .child(tile)
-            .child(
-                div()
-                    .absolute()
-                    .right(px(14.))
-                    .bottom(px(14.))
-                    .px_3()
-                    .py_1p5()
-                    .rounded(cx.theme().radius)
-                    .bg(hsla(0., 0., 0., 0.72))
-                    .text_xs()
-                    .text_color(gpui_kit::white())
-                    .child("ESC ou duplo clique para sair da tela cheia"),
-            )
-            .into_any_element();
+            return div()
+                .size_full()
+                .relative()
+                .bg(black())
+                .child(tile)
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(14.))
+                        .bottom(px(14.))
+                        .px_3()
+                        .py_1p5()
+                        .rounded(cx.theme().radius)
+                        .bg(hsla(0., 0., 0., 0.72))
+                        .text_xs()
+                        .text_color(gpui_kit::white())
+                        .child("ESC ou duplo clique para sair da tela cheia"),
+                )
+                .into_any_element();
+        }
     }
 
     let copied_recently = app
@@ -223,7 +229,7 @@ pub fn render_stage(
     let first_available_key = stage_keys
         .first()
         .copied()
-        .or_else(|| has_local_broadcast.then_some(VideoTileKey::LocalPreview));
+        .or_else(|| show_local_preview.then_some(VideoTileKey::LocalPreview));
 
     let top_bar = h_flex()
         .h(px(54.))
@@ -322,6 +328,21 @@ pub fn render_stage(
                             cx.notify();
                         })),
                 )
+                .when(has_local_broadcast, |el| {
+                    el.child(
+                        Button::new("btn-toggle-local-preview")
+                            .compact()
+                            .outline()
+                            .label(if app.show_local_preview {
+                                "Ocultar Prévia"
+                            } else {
+                                "Ver Prévia"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_local_preview(window, cx);
+                            })),
+                    )
+                })
                 .child(if has_local_broadcast {
                     Button::new("btn-stop-share")
                         .danger()
@@ -484,7 +505,75 @@ pub fn render_stage(
                 .child(v_flex().gap_2().children(peer_cards)),
         );
 
-    let main_video_area = if stage_keys.is_empty() && !has_local_broadcast {
+    let main_video_area = if stage_keys.is_empty() && has_local_broadcast {
+        let source_desc = app
+            .local_broadcast_label
+            .as_deref()
+            .unwrap_or("Captura de tela ativa");
+        let stats_desc = match &app.broadcast_stats {
+            Some(bs) if bs.width > 0 && bs.height > 0 => format!(
+                "{source_desc} • {}×{} • {} FPS • {}",
+                bs.width, bs.height, bs.encoded_fps, bs.backend
+            ),
+            _ => source_desc.to_string(),
+        };
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(480.))
+                    .p_6()
+                    .gap_3()
+                    .items_center()
+                    .rounded(cx.theme().radius_lg)
+                    .bg(secondary)
+                    .border_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().w(px(10.)).h(px(10.)).rounded_full().bg(danger))
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui_kit::FontWeight::BOLD)
+                                    .text_color(fg)
+                                    .child("Você está transmitindo"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_xs()
+                            .text_color(fg)
+                            .child(SharedString::from(stats_desc)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Sua pré-visualização fica oculta por padrão para evitar distração e economizar recursos."),
+                    )
+                    .child(
+                        div().pt_1().child(
+                            Button::new("btn-empty-show-preview")
+                                .outline()
+                                .label("Ver minha transmissão")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_local_preview(window, cx);
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    } else if stage_keys.is_empty() {
         div()
             .size_full()
             .flex()
@@ -517,7 +606,7 @@ pub fn render_stage(
             .into_any_element()
     } else {
         let mut all_focusable = stage_keys.clone();
-        if has_local_broadcast && !all_focusable.contains(&VideoTileKey::LocalPreview) {
+        if show_local_preview && !all_focusable.contains(&VideoTileKey::LocalPreview) {
             all_focusable.push(VideoTileKey::LocalPreview);
         }
 
@@ -592,7 +681,7 @@ pub fn render_stage(
                     rows.into_any_element()
                 };
 
-                if has_local_broadcast && has_remote_tiles {
+                if show_local_preview && has_remote_tiles {
                     let pip_tile = build_clickable_tile(
                         app,
                         VideoTileKey::LocalPreview,

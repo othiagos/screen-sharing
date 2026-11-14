@@ -214,7 +214,7 @@ fn run_pipewire_capture_loop(
         }
     };
 
-    let stream = pw::stream::StreamBox::new(&core, "screenshare-sfu-audio", props)
+    let stream = pw::stream::StreamBox::new(&core, "screen-share-audio", props)
         .map_err(|e| MediaError::AudioCapture(format!("PipeWire Stream::new failed: {e}")))?;
 
     let state = CaptureCallbackState {

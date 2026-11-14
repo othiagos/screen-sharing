@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -311,6 +311,7 @@ impl MediaSink for PeerMediaReceiver {
 pub struct LocalBroadcastSession {
     cancel: CancellationToken,
     stats: Arc<Mutex<BroadcastStats>>,
+    preview_enabled: Arc<AtomicBool>,
 }
 
 impl LocalBroadcastSession {
@@ -339,6 +340,7 @@ impl LocalBroadcastSession {
         on_preview_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
+        let preview_enabled = Arc::new(AtomicBool::new(false));
         let initial_bitrate = config.bitrate.initial_bps(config.resolution, config.fps);
         let stats = Arc::new(Mutex::new(BroadcastStats {
             backend: "initializing".to_string(),
@@ -412,7 +414,9 @@ impl LocalBroadcastSession {
             let seq_v = Arc::clone(&video_seq);
             let stats_v = Arc::clone(&stats);
             let store_v = Arc::clone(&video_store);
+            let preview_enabled_v = Arc::clone(&preview_enabled);
             let is_auto_bitrate = matches!(config.bitrate, BitratePreset::Auto);
+            let config_resolution = config.resolution;
             let target_bps_init = initial_bitrate;
             let announce_fps = clamped_fps;
 
@@ -422,7 +426,7 @@ impl LocalBroadcastSession {
                     let mut encoder = encoder;
                     let mut current_bps = target_bps_init;
                     let min_bps = 1_500_000u32;
-                    let max_bps = 22_000_000u32;
+                    let mut max_bps = 22_000_000u32;
                     let mut last_dims = (0u32, 0u32);
                     let mut fps_win = Instant::now();
                     let mut frames_in_win = 0u32;
@@ -437,7 +441,23 @@ impl LocalBroadcastSession {
                         }
 
                         if last_dims != (frame.width, frame.height) && frame.width >= 2 {
+                            let is_first = last_dims == (0, 0);
                             last_dims = (frame.width, frame.height);
+                            if is_first && is_auto_bitrate {
+                                let tier = config_resolution
+                                    .effective_bitrate_tier(frame.width, frame.height);
+                                let scaled_init = BitratePreset::Auto.initial_bps(tier, announce_fps);
+                                if scaled_init < current_bps {
+                                    current_bps = scaled_init.max(min_bps);
+                                    let _ = encoder.set_bitrate(current_bps);
+                                }
+                                max_bps = match tier {
+                                    shared_protocol::TargetResolution::R720p => 9_000_000,
+                                    shared_protocol::TargetResolution::R1080p => 16_000_000,
+                                    _ => 22_000_000,
+                                };
+                                stats_v.lock().target_bitrate_kbps = current_bps / 1000;
+                            }
                             sfu_v.start_broadcast(StreamMetadata {
                                 width: frame.width,
                                 height: frame.height,
@@ -487,8 +507,10 @@ impl LocalBroadcastSession {
                                     }
                                 }
 
-                                // Update local preview at ~15fps max to save CPU memory copy
-                                if last_preview_update.elapsed() >= Duration::from_millis(66) {
+                                // Update local preview at ~15fps max only when broadcaster opted in
+                                if preview_enabled_v.load(Ordering::Acquire)
+                                    && last_preview_update.elapsed() >= Duration::from_millis(66)
+                                {
                                     last_preview_update = Instant::now();
                                     let preview_bgra = if frame.is_bgra {
                                         frame.rgba
@@ -574,7 +596,15 @@ impl LocalBroadcastSession {
             });
         }
 
-        Ok(Self { cancel, stats })
+        Ok(Self {
+            cancel,
+            stats,
+            preview_enabled,
+        })
+    }
+
+    pub fn set_local_preview_enabled(&self, enabled: bool) {
+        self.preview_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn stats_snapshot(&self) -> BroadcastStats {
