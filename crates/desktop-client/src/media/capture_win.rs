@@ -275,6 +275,8 @@ struct WgcSession {
     pool_size: SizeInt32,
 }
 
+type PolledBgra<'a> = (u32, u32, &'a [u8]);
+
 impl WgcSession {
     fn new(hwnd: HWND) -> Result<Self, MediaError> {
         unsafe {
@@ -367,7 +369,7 @@ impl WgcSession {
         }
     }
 
-    fn poll_bgra(&mut self) -> Result<Option<(u32, u32, &[u8])>, MediaError> {
+    fn poll_bgra(&mut self) -> Result<Option<PolledBgra<'_>>, MediaError> {
         let mut latest_frame = None;
         while let Ok(frame) = self.frame_pool.TryGetNextFrame() {
             latest_frame = Some(frame);

@@ -45,13 +45,15 @@ pub struct MfH264Encoder {
     pending_keyframe: bool,
 }
 
+type EncodeReply = (Result<Vec<u8>, MediaError>, Vec<u8>);
+
 enum MfCommand {
     Encode {
         width: u32,
         height: u32,
         nv12_buf: Vec<u8>,
         force_keyframe: bool,
-        reply: std_mpsc::SyncSender<(Result<Vec<u8>, MediaError>, Vec<u8>)>,
+        reply: std_mpsc::SyncSender<EncodeReply>,
     },
     SetBitrate {
         bitrate_bps: u32,
@@ -261,12 +263,10 @@ impl MfWorkerInner {
 
             let activates = std::slice::from_raw_parts_mut(activates_ptr, count as usize);
             let mut activated: Option<IMFTransform> = None;
-            for act_slot in activates.iter() {
-                if let Some(act) = act_slot {
-                    if let Ok(mft) = act.ActivateObject::<IMFTransform>() {
-                        activated = Some(mft);
-                        break;
-                    }
+            for act in activates.iter().flatten() {
+                if let Ok(mft) = act.ActivateObject::<IMFTransform>() {
+                    activated = Some(mft);
+                    break;
                 }
             }
             for act_slot in activates.iter_mut() {

@@ -109,9 +109,9 @@ fn run_pipewire_capture_loop(
 ) -> Result<(), MediaError> {
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoop::new(None)
+    let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| MediaError::AudioCapture(format!("PipeWire MainLoop init failed: {e}")))?;
-    let context = pw::context::Context::new(&mainloop)
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None)
         .map_err(|e| MediaError::AudioCapture(format!("PipeWire Context init failed: {e}")))?;
     let core = context
         .connect(None)
@@ -214,7 +214,7 @@ fn run_pipewire_capture_loop(
         }
     };
 
-    let stream = pw::stream::Stream::new(&core, "screenshare-sfu-audio", props)
+    let stream = pw::stream::StreamBox::new(&core, "screenshare-sfu-audio", props)
         .map_err(|e| MediaError::AudioCapture(format!("PipeWire Stream::new failed: {e}")))?;
 
     let state = CaptureCallbackState {

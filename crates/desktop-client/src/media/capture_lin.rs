@@ -95,7 +95,7 @@ struct PwVideoState {
     start: Instant,
     tx: mpsc::Sender<RawVideoFrame>,
     cancel: CancellationToken,
-    mainloop: pw::main_loop::MainLoop,
+    mainloop: pw::main_loop::MainLoopRc,
 }
 
 fn run_pipewire_video_loop(
@@ -108,9 +108,9 @@ fn run_pipewire_video_loop(
 ) -> Result<(), MediaError> {
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoop::new(None)
+    let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|e| MediaError::VideoCapture(format!("PipeWire MainLoop failed: {e}")))?;
-    let context = pw::context::Context::new(&mainloop)
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None)
         .map_err(|e| MediaError::VideoCapture(format!("PipeWire Context failed: {e}")))?;
     let core = context
         .connect_fd(pw_fd, None)
@@ -122,7 +122,7 @@ fn run_pipewire_video_loop(
         *pw::keys::MEDIA_ROLE => "Screen",
     };
 
-    let stream = pw::stream::Stream::new(&core, "screenshare-sfu-video", props)
+    let stream = pw::stream::StreamBox::new(&core, "screenshare-sfu-video", props)
         .map_err(|e| MediaError::VideoCapture(format!("PipeWire video Stream::new: {e}")))?;
 
     let state = Rc::new(RefCell::new(PwVideoState {
