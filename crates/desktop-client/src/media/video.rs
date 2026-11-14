@@ -727,10 +727,11 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
     match std::panic::catch_unwind(xcap::Monitor::all) {
         Ok(Ok(monitors)) => {
             for monitor in monitors {
-                targets.push(CaptureTarget::Monitor {
-                    id: monitor.id(),
-                    name: monitor.name().to_string(),
-                });
+                let Ok(id) = monitor.id() else {
+                    continue;
+                };
+                let name = monitor.name().unwrap_or_else(|_| format!("Monitor {id}"));
+                targets.push(CaptureTarget::Monitor { id, name });
             }
         }
         Ok(Err(err)) => warn!("Monitor enumeration warning: {err}"),
@@ -748,14 +749,19 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
         }
         if let Ok(Ok(windows)) = std::panic::catch_unwind(xcap::Window::all) {
             for window in windows {
-                let id = window.id();
-                if seen_ids.contains(&id) || window.title().trim().is_empty() {
+                let Ok(id) = window.id() else {
+                    continue;
+                };
+                let Ok(title) = window.title() else {
+                    continue;
+                };
+                if seen_ids.contains(&id) || title.trim().is_empty() {
                     continue;
                 }
                 targets.push(CaptureTarget::Window {
                     id,
-                    title: window.title().to_string(),
-                    pid: window.process_id(),
+                    title,
+                    pid: window.pid().unwrap_or(0),
                 });
             }
         }
@@ -766,15 +772,17 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
         match std::panic::catch_unwind(xcap::Window::all) {
             Ok(Ok(windows)) => {
                 for window in windows {
-                    if window.title().trim().is_empty() {
+                    let Ok(title) = window.title() else {
+                        continue;
+                    };
+                    if title.trim().is_empty() {
                         continue;
                     }
+                    let Ok(id) = window.id() else {
+                        continue;
+                    };
                     let pid = extract_window_pid_linux(&window);
-                    targets.push(CaptureTarget::Window {
-                        id: window.id(),
-                        title: window.title().to_string(),
-                        pid,
-                    });
+                    targets.push(CaptureTarget::Window { id, title, pid });
                 }
             }
             Ok(Err(err)) => warn!("Window enumeration warning: {err}"),
@@ -787,7 +795,10 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
 
 #[cfg(not(target_os = "windows"))]
 fn extract_window_pid_linux(window: &xcap::Window) -> u32 {
-    let app_name = window.app_name().trim().to_lowercase();
+    if let Some(pid) = window.pid().ok().filter(|&pid| pid != 0) {
+        return pid;
+    }
+    let app_name = window.app_name().unwrap_or_default().trim().to_lowercase();
     if app_name.is_empty() {
         return 0;
     }
@@ -847,7 +858,11 @@ impl ResolvedCaptureTarget {
 
                 let monitor = monitors
                     .into_iter()
-                    .find(|m| m.id() == *id || (!name.is_empty() && m.name() == name))
+                    .find(|m| {
+                        m.id().is_ok_and(|mid| mid == *id)
+                            || (!name.is_empty()
+                                && m.name().as_deref().is_ok_and(|mname| mname == name.as_str()))
+                    })
                     .ok_or_else(|| {
                         MediaError::SourceNotFound(format!("Monitor id={id} ({name}) not found"))
                     })?;
@@ -883,7 +898,13 @@ impl ResolvedCaptureTarget {
 
                     let window = windows
                         .into_iter()
-                        .find(|w| w.id() == *id || (!title.is_empty() && w.title() == title))
+                        .find(|w| {
+                            w.id().is_ok_and(|wid| wid == *id)
+                                || (!title.is_empty()
+                                    && w.title()
+                                        .as_deref()
+                                        .is_ok_and(|wtitle| wtitle == title.as_str()))
+                        })
                         .ok_or_else(|| {
                             MediaError::SourceNotFound(format!(
                                 "Window id={id} ({title}) not found or closed"

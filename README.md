@@ -20,7 +20,7 @@ sudo apt update && sudo apt install -y \
   libpipewire-0.3-dev libspa-0.2-dev libasound2-dev \
   libxcb1-dev libxrandr-dev libdbus-1-dev \
   libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
-  libfontconfig1-dev libfreetype-dev
+  libfontconfig1-dev libfreetype-dev libgbm-dev libegl-dev
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
