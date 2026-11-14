@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use std::ptr::null_mut;
+use std::sync::mpsc as std_mpsc;
 
 use tracing::{debug, info};
 use windows::core::{Interface, VARIANT};
@@ -33,7 +34,160 @@ use crate::media::traits::{MediaError, RawVideoFrame, VideoEncoder};
 use crate::media::video::{bgra_to_nv12_into, rgba_to_nv12_into};
 
 /// Windows Media Foundation Hardware H.264 encoder (NVENC / AMD AMF / Intel QSV).
+///
+/// Wraps all COM / D3D11 / Media Foundation interfaces inside a dedicated COM MTA
+/// worker thread so `MfH264Encoder` is strictly `Send + 'static` and `CoInitializeEx` /
+/// `MFStartup` always pair on the same thread as `MFShutdown` / `CoUninitialize`.
 pub struct MfH264Encoder {
+    tx: Option<std_mpsc::SyncSender<MfCommand>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    nv12_buf: Vec<u8>,
+    pending_keyframe: bool,
+}
+
+enum MfCommand {
+    Encode {
+        width: u32,
+        height: u32,
+        nv12_buf: Vec<u8>,
+        force_keyframe: bool,
+        reply: std_mpsc::SyncSender<(Result<Vec<u8>, MediaError>, Vec<u8>)>,
+    },
+    SetBitrate {
+        bitrate_bps: u32,
+        reply: std_mpsc::SyncSender<Result<(), MediaError>>,
+    },
+}
+
+struct ComMfGuard {
+    com_initialized: bool,
+    mf_started: bool,
+}
+
+impl ComMfGuard {
+    unsafe fn enter() -> Result<Self, MediaError> {
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let mut guard = Self {
+            com_initialized: hr.is_ok(),
+            mf_started: false,
+        };
+        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
+            .map_err(|e| MediaError::Codec(format!("MFStartup failed: {e}")))?;
+        guard.mf_started = true;
+        Ok(guard)
+    }
+}
+
+impl Drop for ComMfGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.mf_started {
+                let _ = MFShutdown();
+            }
+            if self.com_initialized {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+impl MfH264Encoder {
+    pub fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
+        let (init_tx, init_rx) = std_mpsc::sync_channel::<Result<(), MediaError>>(1);
+        let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<MfCommand>(1);
+
+        let worker = std::thread::Builder::new()
+            .name("mf-h264-worker".to_string())
+            .spawn(move || run_mf_worker(fps, bitrate_bps, init_tx, cmd_rx))
+            .map_err(|e| MediaError::Codec(format!("Failed to spawn MF H.264 worker thread: {e}")))?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx: Some(cmd_tx),
+                worker: Some(worker),
+                nv12_buf: Vec::new(),
+                pending_keyframe: false,
+            }),
+            Ok(Err(err)) => {
+                drop(cmd_tx);
+                let _ = worker.join();
+                Err(err)
+            }
+            Err(_) => {
+                drop(cmd_tx);
+                let _ = worker.join();
+                Err(MediaError::Codec(
+                    "MF H.264 worker thread terminated during initialization".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn send_command<R>(
+        &self,
+        build: impl FnOnce(std_mpsc::SyncSender<R>) -> MfCommand,
+    ) -> Result<R, MediaError> {
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            MediaError::Codec("Media Foundation encoder worker is stopped".to_string())
+        })?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        tx.send(build(reply_tx))
+            .map_err(|_| MediaError::Codec("Media Foundation encoder worker exited".to_string()))?;
+        reply_rx.recv().map_err(|_| {
+            MediaError::Codec("Media Foundation encoder worker dropped reply".to_string())
+        })
+    }
+}
+
+fn run_mf_worker(
+    fps: u8,
+    bitrate_bps: u32,
+    init_tx: std_mpsc::SyncSender<Result<(), MediaError>>,
+    cmd_rx: std_mpsc::Receiver<MfCommand>,
+) {
+    let _guard = match unsafe { ComMfGuard::enter() } {
+        Ok(guard) => guard,
+        Err(err) => {
+            let _ = init_tx.send(Err(err));
+            return;
+        }
+    };
+
+    let mut inner = match MfWorkerInner::new(fps, bitrate_bps) {
+        Ok(inner) => inner,
+        Err(err) => {
+            let _ = init_tx.send(Err(err));
+            return;
+        }
+    };
+
+    let _ = init_tx.send(Ok(()));
+
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            MfCommand::Encode {
+                width,
+                height,
+                nv12_buf,
+                force_keyframe,
+                reply,
+            } => {
+                if force_keyframe {
+                    inner.force_next_idr = true;
+                }
+                let res = inner.encode_nv12(width, height, &nv12_buf);
+                let _ = reply.send((res, nv12_buf));
+            }
+            MfCommand::SetBitrate { bitrate_bps, reply } => {
+                let res = inner.set_bitrate(bitrate_bps);
+                let _ = reply.send(res);
+            }
+        }
+    }
+    // `inner` drops before `_guard`, releasing all COM objects prior to MFShutdown/CoUninitialize.
+}
+
+struct MfWorkerInner {
     transform: IMFTransform,
     event_gen: Option<IMFMediaEventGenerator>,
     codec_api: Option<ICodecAPI>,
@@ -44,17 +198,11 @@ pub struct MfH264Encoder {
     configured_dims: Option<(u32, u32)>,
     force_next_idr: bool,
     frame_index: u64,
-    nv12_scratch: Vec<u8>,
 }
 
-impl MfH264Encoder {
-    pub fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
+impl MfWorkerInner {
+    fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|e| {
-                MediaError::Codec(format!("MFStartup failed: {e}"))
-            })?;
-
             let mut d3d_device: Option<ID3D11Device> = None;
             D3D11CreateDevice(
                 None,
@@ -169,7 +317,6 @@ impl MfH264Encoder {
                 configured_dims: None,
                 force_next_idr: true,
                 frame_index: 0,
-                nv12_scratch: Vec::new(),
             })
         }
     }
@@ -239,21 +386,10 @@ impl MfH264Encoder {
         debug!(width, height, fps = self.fps, bitrate = self.bitrate_bps, "Configured MF H.264 streams");
         Ok(())
     }
-}
 
-impl VideoEncoder for MfH264Encoder {
-    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError> {
-        let width = frame.width & !1;
-        let height = frame.height & !1;
-        if width < 2 || height < 2 {
-            return Err(MediaError::Codec("Video frame too small for MFT".to_string()));
-        }
-
-        if frame.is_bgra {
-            bgra_to_nv12_into(&frame.rgba, width, height, &mut self.nv12_scratch)?;
-        } else {
-            rgba_to_nv12_into(&frame.rgba, width, height, &mut self.nv12_scratch)?;
-        }
+    fn encode_nv12(&mut self, width: u32, height: u32, nv12_buf: &[u8]) -> Result<Vec<u8>, MediaError> {
+        let nv12_len = u32::try_from(nv12_buf.len())
+            .map_err(|_| MediaError::Codec("NV12 frame buffer exceeds 4 GiB".to_string()))?;
 
         unsafe {
             if self.configured_dims != Some((width, height)) {
@@ -267,14 +403,13 @@ impl VideoEncoder for MfH264Encoder {
                 }
             }
 
-            let nv12_len = self.nv12_scratch.len() as u32;
             let buffer = MFCreateMemoryBuffer(nv12_len)
                 .map_err(|e| MediaError::Codec(format!("MFCreateMemoryBuffer: {e}")))?;
             let mut ptr: *mut u8 = null_mut();
             buffer
                 .Lock(&mut ptr, None, None)
                 .map_err(|e| MediaError::Codec(format!("IMFMediaBuffer::Lock: {e}")))?;
-            std::ptr::copy_nonoverlapping(self.nv12_scratch.as_ptr(), ptr, nv12_len as usize);
+            std::ptr::copy_nonoverlapping(nv12_buf.as_ptr(), ptr, nv12_buf.len());
             let _ = buffer.Unlock();
             let _ = buffer.SetCurrentLength(nv12_len);
 
@@ -320,10 +455,6 @@ impl VideoEncoder for MfH264Encoder {
         }
     }
 
-    fn request_keyframe(&mut self) {
-        self.force_next_idr = true;
-    }
-
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
         let clamped = bitrate_bps.clamp(500_000, 35_000_000);
         self.bitrate_bps = clamped;
@@ -333,6 +464,42 @@ impl VideoEncoder for MfH264Encoder {
             }
         }
         Ok(())
+    }
+}
+
+impl VideoEncoder for MfH264Encoder {
+    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError> {
+        let width = frame.width & !1;
+        let height = frame.height & !1;
+        if width < 2 || height < 2 {
+            return Err(MediaError::Codec("Video frame too small for MFT".to_string()));
+        }
+
+        if frame.is_bgra {
+            bgra_to_nv12_into(&frame.rgba, width, height, &mut self.nv12_buf)?;
+        } else {
+            rgba_to_nv12_into(&frame.rgba, width, height, &mut self.nv12_buf)?;
+        }
+
+        let nv12_buf = std::mem::take(&mut self.nv12_buf);
+        let force_keyframe = std::mem::take(&mut self.pending_keyframe);
+        let (res, returned_buf) = self.send_command(|reply| MfCommand::Encode {
+            width,
+            height,
+            nv12_buf,
+            force_keyframe,
+            reply,
+        })?;
+        self.nv12_buf = returned_buf;
+        res
+    }
+
+    fn request_keyframe(&mut self) {
+        self.pending_keyframe = true;
+    }
+
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
+        self.send_command(|reply| MfCommand::SetBitrate { bitrate_bps, reply })?
     }
 
     fn backend_name(&self) -> &'static str {
@@ -388,9 +555,9 @@ unsafe fn extract_mft_output(
 
 impl Drop for MfH264Encoder {
     fn drop(&mut self) {
-        unsafe {
-            let _ = MFShutdown();
-            CoUninitialize();
+        drop(self.tx.take());
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
         }
     }
 }

@@ -915,7 +915,9 @@ impl ResolvedCaptureTarget {
                             });
                         }
                         Ok(CapturePoll::Unchanged) => return Ok(FrameSample::Unchanged),
-                        Err(err) => debug!("DXGI capture poll error ({err}); falling back to xcap"),
+                        Err(err) => {
+                            tracing::debug!("DXGI capture poll error ({err}); falling back to xcap");
+                        }
                     }
                 }
                 let img = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
