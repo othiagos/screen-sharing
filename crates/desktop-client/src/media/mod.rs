@@ -1,3 +1,4 @@
+pub mod adaptive;
 #[cfg(target_os = "linux")]
 pub mod audio_lin;
 pub mod audio_out;

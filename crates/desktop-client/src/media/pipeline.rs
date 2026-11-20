@@ -7,13 +7,14 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use shared_protocol::{
-    AudioCaptureMode, AudioPacketHeader, BitratePreset, PeerId, StreamConfig, StreamMetadata,
+    AudioCaptureMode, AudioPacketHeader, PeerId, StreamConfig, StreamMetadata, ThrottleReason,
     VideoFrameHeader, AUDIO_FLAG_OPUS, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::media::adaptive::{AdaptiveBitrateController, AdaptiveInputs};
 use crate::media::audio_out::{OpusAudioEncoder, PeerAudioMixer};
 use crate::media::default_os_audio_capturer;
 use crate::media::traits::{AudioCapturer, RawAudioFrame, RawVideoFrame, VideoCapturer};
@@ -43,7 +44,12 @@ pub struct BroadcastStats {
     pub width: u32,
     pub height: u32,
     pub encoded_fps: u32,
+    pub configured_fps: u32,
+    pub effective_fps: u32,
     pub target_bitrate_kbps: u32,
+    pub max_bitrate_kbps: u32,
+    pub throttle_reason: ThrottleReason,
+    pub dropped_frames: u64,
     pub warning: Option<String>,
 }
 
@@ -155,6 +161,7 @@ pub struct PeerMediaReceiver {
     decoders: Mutex<HashMap<PeerId, PeerDecoderHandle>>,
     sfu_handle: Mutex<Option<SfuClient>>,
     on_frame_notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    feedback_state: Mutex<HashMap<PeerId, (u32, u32, Instant)>>,
 }
 
 impl PeerMediaReceiver {
@@ -165,6 +172,7 @@ impl PeerMediaReceiver {
             decoders: Mutex::new(HashMap::new()),
             sfu_handle: Mutex::new(None),
             on_frame_notify: Mutex::new(None),
+            feedback_state: Mutex::new(HashMap::new()),
         })
     }
 
@@ -220,6 +228,7 @@ impl PeerMediaReceiver {
                 let mut fps_frames = 0u32;
                 let mut current_fps = 0u32;
                 let mut needs_keyframe = false;
+                let mut last_decode_fb = Instant::now() - Duration::from_secs(1);
 
                 while !worker_cancel.is_cancelled() {
                     let Some((header, payload)) = rx.blocking_recv() else {
@@ -274,6 +283,12 @@ impl PeerMediaReceiver {
                                     sfu.request_keyframe(peer_id);
                                 }
                             }
+                            if last_decode_fb.elapsed() >= Duration::from_millis(500) {
+                                last_decode_fb = Instant::now();
+                                if let Some(sfu) = &sfu_for_kf {
+                                    sfu.send_viewer_feedback(peer_id, 0, 1);
+                                }
+                            }
                         }
                     }
                 }
@@ -291,6 +306,36 @@ impl PeerMediaReceiver {
     }
 }
 
+impl PeerMediaReceiver {
+    fn note_viewer_drop_or_error(&self, broadcaster_id: PeerId, queue_drop: bool, decode_err: bool) {
+        let now = Instant::now();
+        let mut to_send: Option<(u32, u32)> = None;
+        {
+            let mut guard = self.feedback_state.lock();
+            let entry = guard
+                .entry(broadcaster_id)
+                .or_insert_with(|| (0, 0, now - Duration::from_secs(1)));
+            if queue_drop {
+                entry.0 = entry.0.saturating_add(1);
+            }
+            if decode_err {
+                entry.1 = entry.1.saturating_add(1);
+            }
+            if (entry.0 > 0 || entry.1 > 1) && now.duration_since(entry.2) >= Duration::from_millis(500) {
+                to_send = Some((entry.0, entry.1));
+                entry.0 = 0;
+                entry.1 = 0;
+                entry.2 = now;
+            }
+        }
+        if let Some((q, d)) = to_send {
+            if let Some(sfu) = self.sfu_handle.lock().as_ref() {
+                sfu.send_viewer_feedback(broadcaster_id, q, d);
+            }
+        }
+    }
+}
+
 impl MediaSink for PeerMediaReceiver {
     fn on_video_frame(&self, header: VideoFrameHeader, payload: Bytes) {
         let sender = self.get_or_spawn_decoder(header.sender_id);
@@ -298,6 +343,7 @@ impl MediaSink for PeerMediaReceiver {
             if let Some(sfu) = self.sfu_handle.lock().as_ref() {
                 sfu.request_keyframe(header.sender_id);
             }
+            self.note_viewer_drop_or_error(header.sender_id, true, false);
         }
     }
 
@@ -341,13 +387,20 @@ impl LocalBroadcastSession {
     ) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
         let preview_enabled = Arc::new(AtomicBool::new(false));
-        let initial_bitrate = config.bitrate.initial_bps(config.resolution, config.fps);
+        let clamped_fps = config.fps.clamp(1, 60);
+        let initial_bitrate = config.bitrate.initial_bps(config.resolution, clamped_fps);
+        let initial_max_bitrate = config.bitrate.max_bps(config.resolution, clamped_fps);
         let stats = Arc::new(Mutex::new(BroadcastStats {
             backend: "initializing".to_string(),
             width: 0,
             height: 0,
             encoded_fps: 0,
+            configured_fps: u32::from(clamped_fps),
+            effective_fps: u32::from(clamped_fps),
             target_bitrate_kbps: initial_bitrate / 1000,
+            max_bitrate_kbps: initial_max_bitrate / 1000,
+            throttle_reason: ThrottleReason::None,
+            dropped_frames: 0,
             warning: None,
         }));
 
@@ -355,7 +408,6 @@ impl LocalBroadcastSession {
         let (audio_tx, mut audio_rx) = mpsc::channel::<RawAudioFrame>(16);
         let (warning_tx, mut warning_rx) = mpsc::unbounded_channel::<String>();
 
-        let clamped_fps = config.fps.clamp(1, 60);
         let encoder = create_best_video_encoder(clamped_fps, initial_bitrate)?;
         let backend_name = encoder.backend_name().to_string();
         stats.lock().backend = backend_name.clone();
@@ -407,7 +459,7 @@ impl LocalBroadcastSession {
             });
         }
 
-        // Dedicated video encoding + QUIC UniStream dispatch thread
+        // Dedicated video encoding + adaptive control + QUIC UniStream dispatch thread
         {
             let cancel_v = cancel.clone();
             let sfu_v = sfu.clone();
@@ -415,48 +467,70 @@ impl LocalBroadcastSession {
             let stats_v = Arc::clone(&stats);
             let store_v = Arc::clone(&video_store);
             let preview_enabled_v = Arc::clone(&preview_enabled);
-            let is_auto_bitrate = matches!(config.bitrate, BitratePreset::Auto);
             let config_resolution = config.resolution;
-            let target_bps_init = initial_bitrate;
+            let config_bitrate = config.bitrate;
             let announce_fps = clamped_fps;
 
             std::thread::Builder::new()
                 .name("video-encode-worker".to_string())
                 .spawn(move || {
                     let mut encoder = encoder;
-                    let mut current_bps = target_bps_init;
-                    let min_bps = 1_500_000u32;
-                    let mut max_bps = 22_000_000u32;
+                    let mut controller = AdaptiveBitrateController::new(
+                        config_bitrate,
+                        config_resolution,
+                        announce_fps,
+                        Instant::now(),
+                    );
                     let mut last_dims = (0u32, 0u32);
                     let mut fps_win = Instant::now();
                     let mut frames_in_win = 0u32;
+                    let mut last_stats_sync = Instant::now();
+                    let mut last_encoded_at: Option<Instant> = None;
                     let mut last_preview_update = Instant::now() - Duration::from_secs(1);
+                    let mut pending_external_kf = false;
+                    let mut pending_gop_recovery = false;
+                    let mut dropped_frames: u64 = 0;
 
                     while !cancel_v.is_cancelled() {
-                        let Some(frame) = video_rx.blocking_recv() else {
+                        let Some(mut frame) = video_rx.blocking_recv() else {
                             break;
                         };
+                        while let Ok(newer) = video_rx.try_recv() {
+                            frame = newer;
+                        }
+
                         if sfu_v.take_force_keyframe() {
-                            encoder.request_keyframe();
+                            pending_external_kf = true;
+                        }
+
+                        // Pre-encode FPS pacing when effective FPS was stepped down dynamically by network
+                        let eff_fps = controller.effective_fps();
+                        if eff_fps < announce_fps && !pending_external_kf && !pending_gop_recovery {
+                            let target_interval =
+                                Duration::from_micros(1_000_000 / u64::from(eff_fps.max(1)));
+                            if last_encoded_at.is_some_and(|t| {
+                                t.elapsed() + Duration::from_millis(2) < target_interval
+                            }) {
+                                continue;
+                            }
                         }
 
                         if last_dims != (frame.width, frame.height) && frame.width >= 2 {
                             let is_first = last_dims == (0, 0);
                             last_dims = (frame.width, frame.height);
-                            if is_first && is_auto_bitrate {
-                                let tier = config_resolution
-                                    .effective_bitrate_tier(frame.width, frame.height);
-                                let scaled_init = BitratePreset::Auto.initial_bps(tier, announce_fps);
-                                if scaled_init < current_bps {
-                                    current_bps = scaled_init.max(min_bps);
-                                    let _ = encoder.set_bitrate(current_bps);
+                            if is_first {
+                                if controller.apply_source_resolution(
+                                    config_resolution,
+                                    frame.width,
+                                    frame.height,
+                                ) {
+                                    let _ = encoder.set_bitrate(controller.current_bps());
                                 }
-                                max_bps = match tier {
-                                    shared_protocol::TargetResolution::R720p => 9_000_000,
-                                    shared_protocol::TargetResolution::R1080p => 16_000_000,
-                                    _ => 22_000_000,
-                                };
-                                stats_v.lock().target_bitrate_kbps = current_bps / 1000;
+                                let mut st = stats_v.lock();
+                                st.width = frame.width;
+                                st.height = frame.height;
+                                st.target_bitrate_kbps = controller.current_bps() / 1000;
+                                st.max_bitrate_kbps = controller.max_bps() / 1000;
                             }
                             sfu_v.start_broadcast(StreamMetadata {
                                 width: frame.width,
@@ -467,8 +541,43 @@ impl LocalBroadcastSession {
                             });
                         }
 
+                        let telemetry_pre = sfu_v.path_telemetry();
+                        if pending_gop_recovery {
+                            // Wait until in-flight congestion subsides before encoding a clean IDR
+                            if telemetry_pre.in_flight_video > 3 {
+                                dropped_frames = dropped_frames.saturating_add(1);
+                                let hint = sfu_v.sfu_bitrate_hint();
+                                let decision = controller.step(
+                                    AdaptiveInputs {
+                                        telemetry: telemetry_pre,
+                                        sfu_target_max_bps: hint.and_then(|h| h.target_max_bps),
+                                        sfu_min_fps_cap: hint.and_then(|h| h.min_fps_cap),
+                                        sfu_source: hint
+                                            .map_or(ThrottleReason::None, |h| h.congestion_source),
+                                        frame_sent: false,
+                                    },
+                                    Instant::now(),
+                                );
+                                if decision.bitrate_changed {
+                                    let _ = encoder.set_bitrate(decision.target_bps);
+                                }
+                                if decision.fps_changed {
+                                    let _ = encoder.set_target_fps(decision.effective_fps);
+                                }
+                                continue;
+                            }
+                            pending_external_kf = true;
+                        }
+
+                        if pending_external_kf {
+                            encoder.request_keyframe();
+                            pending_external_kf = false;
+                        }
+
                         match encoder.encode_frame(&frame) {
                             Ok(annex_b) if !annex_b.is_empty() => {
+                                last_encoded_at = Some(Instant::now());
+
                                 let seq = seq_v.fetch_add(1, Ordering::Relaxed);
                                 let is_kf = is_h264_keyframe(&annex_b);
                                 let flags = VIDEO_FLAG_H264
@@ -482,29 +591,43 @@ impl LocalBroadcastSession {
                                     flags,
                                 };
 
-                                match sfu_v.send_video_frame(&hdr, &annex_b) {
+                                let frame_sent = match sfu_v.send_video_frame(&hdr, &annex_b) {
                                     Ok(true) => {
-                                        if is_auto_bitrate
-                                            && frames_in_win.is_multiple_of(30)
-                                            && current_bps < max_bps
-                                        {
-                                            current_bps = ((current_bps as f32) * 1.10) as u32;
-                                            current_bps = current_bps.min(max_bps);
-                                            let _ = encoder.set_bitrate(current_bps);
+                                        if pending_gop_recovery && is_kf {
+                                            pending_gop_recovery = false;
                                         }
+                                        true
                                     }
                                     Ok(false) => {
-                                        // Congested QUIC in-flight queue: back off bitrate smoothly if Auto
-                                        if is_auto_bitrate && current_bps > min_bps {
-                                            current_bps = ((current_bps as f32) * 0.78) as u32;
-                                            current_bps = current_bps.max(min_bps);
-                                            let _ = encoder.set_bitrate(current_bps);
-                                        }
+                                        dropped_frames = dropped_frames.saturating_add(1);
+                                        pending_gop_recovery = true;
+                                        false
                                     }
                                     Err(err) => {
                                         debug!("Video QUIC send stopped: {err}");
                                         break;
                                     }
+                                };
+
+                                let telemetry_now = sfu_v.path_telemetry();
+                                let hint = sfu_v.sfu_bitrate_hint();
+                                let decision = controller.step(
+                                    AdaptiveInputs {
+                                        telemetry: telemetry_now,
+                                        sfu_target_max_bps: hint.and_then(|h| h.target_max_bps),
+                                        sfu_min_fps_cap: hint.and_then(|h| h.min_fps_cap),
+                                        sfu_source: hint
+                                            .map_or(ThrottleReason::None, |h| h.congestion_source),
+                                        frame_sent,
+                                    },
+                                    Instant::now(),
+                                );
+
+                                if decision.bitrate_changed {
+                                    let _ = encoder.set_bitrate(decision.target_bps);
+                                }
+                                if decision.fps_changed {
+                                    let _ = encoder.set_target_fps(decision.effective_fps);
                                 }
 
                                 // Update local preview at ~15fps max only when broadcaster opted in
@@ -541,9 +664,26 @@ impl LocalBroadcastSession {
                                     st.width = frame.width;
                                     st.height = frame.height;
                                     st.encoded_fps = fps_now;
-                                    st.target_bitrate_kbps = current_bps / 1000;
+                                    st.configured_fps = u32::from(decision.configured_fps);
+                                    st.effective_fps = u32::from(decision.effective_fps);
+                                    st.target_bitrate_kbps = decision.target_bps / 1000;
+                                    st.max_bitrate_kbps = decision.max_bps / 1000;
+                                    st.throttle_reason = decision.reason;
+                                    st.dropped_frames = dropped_frames;
                                     frames_in_win = 0;
                                     fps_win = Instant::now();
+                                    last_stats_sync = Instant::now();
+                                } else if last_stats_sync.elapsed() >= Duration::from_millis(250) {
+                                    let mut st = stats_v.lock();
+                                    st.width = frame.width;
+                                    st.height = frame.height;
+                                    st.configured_fps = u32::from(decision.configured_fps);
+                                    st.effective_fps = u32::from(decision.effective_fps);
+                                    st.target_bitrate_kbps = decision.target_bps / 1000;
+                                    st.max_bitrate_kbps = decision.max_bps / 1000;
+                                    st.throttle_reason = decision.reason;
+                                    st.dropped_frames = dropped_frames;
+                                    last_stats_sync = Instant::now();
                                 }
                             }
                             Ok(_) => {}

@@ -7,8 +7,12 @@ use uuid::Uuid;
 pub type RoomId = String;
 pub type PeerId = Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const ALPN_SFU_QUIC: &[u8] = b"screenshare-sfu/1";
+
+pub const MIN_ADAPTIVE_BITRATE_BPS: u32 = 400_000;
+pub const SFU_MINORITY_FLOOR_BPS: u32 = 1_000_000;
+pub const MAX_ADAPTIVE_BITRATE_BPS: u32 = 22_000_000;
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_VIDEO_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -172,6 +176,26 @@ impl TargetResolution {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ThrottleReason {
+    #[default]
+    None,
+    Network,
+    Viewer,
+    Cpu,
+}
+
+impl ThrottleReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Normal",
+            Self::Network => "Rede",
+            Self::Viewer => "Espectador",
+            Self::Cpu => "CPU",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BitratePreset {
     Mbps6,
     #[default]
@@ -183,31 +207,59 @@ pub enum BitratePreset {
 impl BitratePreset {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Mbps6 => "6 Mbps",
-            Self::Mbps12 => "12 Mbps",
-            Self::Mbps20 => "20 Mbps",
-            Self::Auto => "Auto",
+            Self::Mbps6 => "Até 6 Mbps",
+            Self::Mbps12 => "Até 12 Mbps",
+            Self::Mbps20 => "Até 20 Mbps",
+            Self::Auto => "Auto (Adaptativo)",
         }
     }
 
-    pub fn initial_bps(self, resolution: TargetResolution, fps: u8) -> u32 {
+    /// Maximum bitrate ceiling (in bps) allowed for this preset, resolution tier, and FPS.
+    pub fn max_bps(self, resolution: TargetResolution, fps: u8) -> u32 {
+        let scale_fps = |base: u32| -> u32 {
+            if fps <= 20 {
+                (base * 6) / 10
+            } else if fps <= 35 {
+                (base * 8) / 10
+            } else {
+                base
+            }
+        };
+
         match self {
             Self::Mbps6 => 6_000_000,
             Self::Mbps12 => 12_000_000,
             Self::Mbps20 => 20_000_000,
             Self::Auto => {
                 let base = match resolution {
-                    TargetResolution::R720p => 6_000_000,
-                    TargetResolution::R1080p => 12_000_000,
-                    TargetResolution::R1440p | TargetResolution::Native => 16_000_000,
+                    TargetResolution::R720p => 9_000_000,
+                    TargetResolution::R1080p => 16_000_000,
+                    TargetResolution::R1440p | TargetResolution::Native => MAX_ADAPTIVE_BITRATE_BPS,
                 };
-                if fps <= 20 {
-                    base / 2
-                } else if fps <= 35 {
-                    (base * 3) / 4
-                } else {
-                    base
-                }
+                scale_fps(base).clamp(MIN_ADAPTIVE_BITRATE_BPS, MAX_ADAPTIVE_BITRATE_BPS)
+            }
+        }
+    }
+
+    /// Conservative starting bitrate (in bps) to avoid initial link saturation before probe-up.
+    pub fn initial_bps(self, resolution: TargetResolution, fps: u8) -> u32 {
+        let cap = self.max_bps(resolution, fps);
+        let tier_start = match resolution {
+            TargetResolution::R720p => 5_500_000,
+            TargetResolution::R1080p => 10_000_000,
+            TargetResolution::R1440p | TargetResolution::Native => 14_000_000,
+        };
+        let fps_scaled = if fps <= 20 {
+            (tier_start * 55) / 100
+        } else if fps <= 35 {
+            (tier_start * 75) / 100
+        } else {
+            tier_start
+        };
+        match self {
+            Self::Auto => fps_scaled.min(cap).max(MIN_ADAPTIVE_BITRATE_BPS),
+            Self::Mbps6 | Self::Mbps12 | Self::Mbps20 => {
+                ((cap * 8) / 10).min(cap).max(MIN_ADAPTIVE_BITRATE_BPS)
             }
         }
     }
@@ -295,6 +347,11 @@ pub enum ClientControl {
     RequestKeyframe {
         broadcaster_id: PeerId,
     },
+    ViewerFeedback {
+        broadcaster_id: PeerId,
+        queue_drops: u32,
+        decode_errors: u32,
+    },
     Ping {
         client_time_ms: u64,
     },
@@ -325,6 +382,11 @@ pub enum ServerControl {
         peer_id: PeerId,
     },
     ForceKeyframe,
+    BitrateHint {
+        target_max_bps: Option<u32>,
+        min_fps_cap: Option<u8>,
+        congestion_source: ThrottleReason,
+    },
     Pong {
         client_time_ms: u64,
     },
@@ -557,6 +619,11 @@ mod tests {
                 video: true,
                 audio: true,
             },
+            ClientControl::ViewerFeedback {
+                broadcaster_id: peer_id,
+                queue_drops: 2,
+                decode_errors: 1,
+            },
             ClientControl::Ping {
                 client_time_ms: 4242,
             },
@@ -571,19 +638,55 @@ mod tests {
             assert_eq!(msg, decoded);
         }
 
-        let server_msg = ServerControl::RoomJoined {
-            room_id: "ab12cd34".to_string(),
-            local_peer_id: peer_id,
-            peers: vec![PeerInfo {
-                peer_id,
-                nickname: "Player1".to_string(),
-                active_stream: None,
-            }],
-        };
-        let framed = encode_control_frame(&server_msg).expect("encode ServerControl");
-        let decoded: ServerControl =
-            decode_control_payload(&framed[4..]).expect("decode ServerControl");
-        assert_eq!(server_msg, decoded);
+        let server_msgs = vec![
+            ServerControl::RoomJoined {
+                room_id: "ab12cd34".to_string(),
+                local_peer_id: peer_id,
+                peers: vec![PeerInfo {
+                    peer_id,
+                    nickname: "Player1".to_string(),
+                    active_stream: None,
+                }],
+            },
+            ServerControl::BitrateHint {
+                target_max_bps: Some(1_200_000),
+                min_fps_cap: Some(30),
+                congestion_source: ThrottleReason::Viewer,
+            },
+            ServerControl::BitrateHint {
+                target_max_bps: None,
+                min_fps_cap: None,
+                congestion_source: ThrottleReason::None,
+            },
+        ];
+        for server_msg in server_msgs {
+            let framed = encode_control_frame(&server_msg).expect("encode ServerControl");
+            let decoded: ServerControl =
+                decode_control_payload(&framed[4..]).expect("decode ServerControl");
+            assert_eq!(server_msg, decoded);
+        }
+    }
+
+    #[test]
+    fn test_bitrate_preset_bounds_and_labels() {
+        assert_eq!(BitratePreset::Mbps6.label(), "Até 6 Mbps");
+        assert_eq!(BitratePreset::Mbps12.label(), "Até 12 Mbps");
+        assert_eq!(BitratePreset::Mbps20.label(), "Até 20 Mbps");
+        assert_eq!(BitratePreset::Auto.label(), "Auto (Adaptativo)");
+
+        assert_eq!(BitratePreset::Mbps12.max_bps(TargetResolution::R1080p, 60), 12_000_000);
+        assert!(
+            BitratePreset::Auto.initial_bps(TargetResolution::R1080p, 60)
+                <= BitratePreset::Auto.max_bps(TargetResolution::R1080p, 60)
+        );
+        assert!(
+            BitratePreset::Mbps6.initial_bps(TargetResolution::R720p, 30)
+                <= BitratePreset::Mbps6.max_bps(TargetResolution::R720p, 30)
+        );
+        assert!(
+            BitratePreset::Auto.max_bps(TargetResolution::R720p, 15)
+                < BitratePreset::Auto.max_bps(TargetResolution::R720p, 60)
+        );
     }
 
     #[test]

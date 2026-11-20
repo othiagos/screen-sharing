@@ -313,7 +313,7 @@ impl MfWorkerInner {
                 _dxgi_mgr: dxgi_mgr,
                 _d3d_device: d3d_device,
                 fps: fps.clamp(1, 60),
-                bitrate_bps: bitrate_bps.clamp(500_000, 35_000_000),
+                bitrate_bps: bitrate_bps.clamp(300_000, 35_000_000),
                 configured_dims: None,
                 force_next_idr: true,
                 frame_index: 0,
@@ -456,7 +456,11 @@ impl MfWorkerInner {
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
-        let clamped = bitrate_bps.clamp(500_000, 35_000_000);
+        let clamped = bitrate_bps.clamp(300_000, 35_000_000);
+        let diff = (clamped as i64 - self.bitrate_bps as i64).unsigned_abs();
+        if diff * 20 <= u64::from(self.bitrate_bps.max(1)) {
+            return Ok(());
+        }
         self.bitrate_bps = clamped;
         if let Some(api) = &self.codec_api {
             unsafe {

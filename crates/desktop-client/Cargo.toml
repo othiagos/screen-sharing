@@ -30,6 +30,7 @@ xcap = { workspace = true }
 fast_image_resize = { workspace = true }
 yuv = { workspace = true }
 openh264 = { workspace = true }
+openh264-sys2 = "0.6"
 
 cpal = { workspace = true }
 audiopus = { workspace = true }

@@ -1410,6 +1410,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "openh264",
+ "openh264-sys2",
  "parking_lot",
  "pipewire",
  "quinn",

@@ -5,7 +5,7 @@ use gpui_kit::{
     Div, ElementId, InteractiveElement, ObjectFit, ParentElement, RenderImage, SharedString,
     Stateful, Styled, StyledImage as _, Window, black, div, hsla, img, px,
 };
-use shared_protocol::PeerId;
+use shared_protocol::{PeerId, ThrottleReason};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,10 +19,38 @@ pub struct VideoTileStats {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub effective_fps: Option<u32>,
+    pub target_fps: Option<u32>,
     pub backend: Option<String>,
     pub bitrate_kbps: Option<u32>,
+    pub max_bitrate_kbps: Option<u32>,
+    pub throttle_reason: ThrottleReason,
     pub rtt_ms: Option<u32>,
     pub warning: Option<String>,
+}
+
+pub fn format_bitrate_compact(kbps: u32) -> String {
+    if kbps >= 1000 {
+        format!("{:.1} Mbps", kbps as f32 / 1000.0)
+    } else {
+        format!("{kbps} kbps")
+    }
+}
+
+pub fn is_significant_throttle(
+    reason: ThrottleReason,
+    bitrate_kbps: u32,
+    max_bitrate_kbps: u32,
+    effective_fps: u32,
+    configured_fps: u32,
+) -> bool {
+    if reason == ThrottleReason::None {
+        return false;
+    }
+    let fps_reduced = configured_fps > 0 && effective_fps > 0 && effective_fps < configured_fps;
+    let bitrate_reduced =
+        max_bitrate_kbps > 0 && bitrate_kbps < (max_bitrate_kbps.saturating_mul(70)) / 100;
+    fps_reduced || bitrate_reduced
 }
 
 /// Converts a tightly-packed BGRA8 buffer into a cached GPUI `RenderImage`.
@@ -140,12 +168,43 @@ pub fn render_video_tile(
     if show_stats {
         if let Some(st) = stats {
             let mut lines: Vec<String> = Vec::new();
-            lines.push(format!("{}x{} • {} fps", st.width, st.height, st.fps));
+            let eff_fps = st.effective_fps.unwrap_or(st.fps);
+            let show_throttle = is_significant_throttle(
+                st.throttle_reason,
+                st.bitrate_kbps.unwrap_or(0),
+                st.max_bitrate_kbps.unwrap_or(0),
+                eff_fps,
+                st.target_fps.unwrap_or(eff_fps),
+            );
+            let fps_text = match st.target_fps {
+                Some(target) if eff_fps < target && st.throttle_reason != ThrottleReason::None => {
+                    format!("{}/{} fps", st.fps, target)
+                }
+                _ => format!("{} fps", st.fps),
+            };
+            lines.push(format!("{}x{} • {fps_text}", st.width, st.height));
             if let Some(backend) = &st.backend {
                 lines.push(backend.clone());
             }
             if let Some(kbps) = st.bitrate_kbps {
-                lines.push(format!("{kbps} kbps"));
+                let br_str = match st.max_bitrate_kbps {
+                    Some(max_kbps)
+                        if max_kbps > 0
+                            && (st.throttle_reason != ThrottleReason::None
+                                || kbps < (max_kbps * 95) / 100) =>
+                    {
+                        format!(
+                            "{} / {}",
+                            format_bitrate_compact(kbps),
+                            format_bitrate_compact(max_kbps)
+                        )
+                    }
+                    _ => format_bitrate_compact(kbps),
+                };
+                lines.push(br_str);
+            }
+            if show_throttle {
+                lines.push(format!("Adaptado: {}", st.throttle_reason.label()));
             }
             if let Some(rtt) = st.rtt_ms {
                 lines.push(format!("RTT {rtt} ms"));
@@ -183,4 +242,45 @@ pub fn render_video_tile(
     }
 
     tile
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_significant_throttle_threshold() {
+        // Minor reduction (10 / 12 Mbps) with full target FPS stays quiet
+        assert!(!is_significant_throttle(
+            ThrottleReason::Network,
+            10_000,
+            12_000,
+            60,
+            60,
+        ));
+        // Significant bitrate reduction (< 70% of cap) surfaces badge
+        assert!(is_significant_throttle(
+            ThrottleReason::Network,
+            7_500,
+            12_000,
+            60,
+            60,
+        ));
+        // Any network FPS fallback (30 / 60) surfaces badge
+        assert!(is_significant_throttle(
+            ThrottleReason::Viewer,
+            11_500,
+            12_000,
+            30,
+            60,
+        ));
+        // Unthrottled session never surfaces badge
+        assert!(!is_significant_throttle(
+            ThrottleReason::None,
+            400,
+            12_000,
+            30,
+            60,
+        ));
+    }
 }

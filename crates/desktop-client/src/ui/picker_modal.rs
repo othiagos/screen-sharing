@@ -131,10 +131,10 @@ impl PickerModalState {
         });
 
         let bitrate_items = vec![
-            "Auto (Adaptativo)".to_string(),
-            "6 Mbps".to_string(),
-            "12 Mbps".to_string(),
-            "20 Mbps".to_string(),
+            BitratePreset::Auto.label().to_string(),
+            BitratePreset::Mbps6.label().to_string(),
+            BitratePreset::Mbps12.label().to_string(),
+            BitratePreset::Mbps20.label().to_string(),
         ];
         let br_idx = match config.bitrate {
             BitratePreset::Auto => 0,
@@ -475,11 +475,11 @@ impl PickerModalState {
             .selected_value()
             .map(String::as_str)
             .unwrap_or("Auto (Adaptativo)");
-        let bitrate = if br_str.starts_with("6") {
+        let bitrate = if br_str.contains("6 Mbps") {
             BitratePreset::Mbps6
-        } else if br_str.starts_with("12") {
+        } else if br_str.contains("12 Mbps") {
             BitratePreset::Mbps12
-        } else if br_str.starts_with("20") {
+        } else if br_str.contains("20 Mbps") {
             BitratePreset::Mbps20
         } else {
             BitratePreset::Auto

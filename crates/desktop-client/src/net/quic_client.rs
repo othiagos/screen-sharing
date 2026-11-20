@@ -1,15 +1,16 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use quinn::{Connection, Endpoint, RecvStream, SendDatagramError, SendStream};
 use shared_protocol::{
     decode_control_payload, encode_audio_packet, encode_control_frame, encode_video_packet,
     AudioPacketHeader, ClientControl, ControlErrorCode, PeerId, PeerInfo, RoomId, ServerControl,
-    StreamMetadata, VideoFrameHeader, AUDIO_HEADER_LEN, MAX_AUDIO_PACKET_BYTES,
+    StreamMetadata, ThrottleReason, VideoFrameHeader, AUDIO_HEADER_LEN, MAX_AUDIO_PACKET_BYTES,
     MAX_CONTROL_FRAME_BYTES, MAX_VIDEO_FRAME_BYTES, MEDIA_KIND_AUDIO, MEDIA_KIND_VIDEO,
     PROTOCOL_VERSION, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN,
 };
@@ -19,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::net::tls::{build_quic_client_config, sni_for_host, TofuCheckResult, TofuServerCertVerifier};
 
-const MAX_IN_FLIGHT_VIDEO_STREAMS: usize = 4;
+const MAX_IN_FLIGHT_VIDEO_STREAMS: usize = 6;
 
 /// High-level events emitted by `SfuClient` for the UI or application controller.
 #[derive(Debug, Clone)]
@@ -77,6 +78,8 @@ pub struct SfuClient {
     force_keyframe: Arc<AtomicBool>,
     rtt_ms: Arc<AtomicU64>,
     in_flight_video: Arc<AtomicUsize>,
+    send_stall_flag: Arc<AtomicBool>,
+    sfu_bitrate_hint: Arc<Mutex<Option<SfuBitrateHintSnapshot>>>,
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
 }
@@ -88,6 +91,27 @@ pub struct NetworkCounters {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub in_flight_video: usize,
+}
+
+/// Real-time QUIC path telemetry used by the adaptive bitrate controller.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuicPathTelemetry {
+    pub rtt_ms: u32,
+    pub cwnd_bytes: u64,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub in_flight_video: usize,
+    pub send_stall_flagged: bool,
+}
+
+/// Latest SFU viewer-congestion hint delivered to the broadcaster.
+#[derive(Debug, Clone, Copy)]
+pub struct SfuBitrateHintSnapshot {
+    pub target_max_bps: Option<u32>,
+    pub min_fps_cap: Option<u8>,
+    pub congestion_source: ThrottleReason,
+    pub updated_at: Instant,
 }
 
 /// Parameters required to connect and authenticate with an SFU node.
@@ -213,6 +237,8 @@ pub async fn connect_sfu(
     let force_keyframe = Arc::new(AtomicBool::new(false));
     let rtt_ms = Arc::new(AtomicU64::new(0));
     let in_flight_video = Arc::new(AtomicUsize::new(0));
+    let send_stall_flag = Arc::new(AtomicBool::new(false));
+    let sfu_bitrate_hint = Arc::new(Mutex::new(None));
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
 
@@ -222,6 +248,7 @@ pub async fn connect_sfu(
         event_tx.clone(),
         Arc::clone(&force_keyframe),
         Arc::clone(&rtt_ms),
+        Arc::clone(&sfu_bitrate_hint),
         cancel.clone(),
     );
     spawn_ping_loop(ctrl_tx.clone(), cancel.clone());
@@ -263,6 +290,8 @@ pub async fn connect_sfu(
         force_keyframe,
         rtt_ms,
         in_flight_video,
+        send_stall_flag,
+        sfu_bitrate_hint,
         bytes_sent,
         bytes_received,
     }))
@@ -294,6 +323,8 @@ impl SfuClient {
     }
 
     pub fn stop_broadcast(&self) {
+        *self.sfu_bitrate_hint.lock() = None;
+        self.send_stall_flag.store(false, Ordering::Release);
         self.send_control(ClientControl::StopBroadcast);
     }
 
@@ -309,6 +340,19 @@ impl SfuClient {
         self.send_control(ClientControl::RequestKeyframe { broadcaster_id });
     }
 
+    pub fn send_viewer_feedback(
+        &self,
+        broadcaster_id: PeerId,
+        queue_drops: u32,
+        decode_errors: u32,
+    ) {
+        self.send_control(ClientControl::ViewerFeedback {
+            broadcaster_id,
+            queue_drops,
+            decode_errors,
+        });
+    }
+
     /// Consumes and resets any server-requested IDR keyframe trigger.
     pub fn take_force_keyframe(&self) -> bool {
         self.force_keyframe.swap(false, Ordering::AcqRel)
@@ -316,12 +360,40 @@ impl SfuClient {
 
     /// Snapshot of current RTT and byte counters.
     pub fn counters(&self) -> NetworkCounters {
+        let ping_rtt = self.rtt_ms.load(Ordering::Relaxed) as u32;
+        let quic_rtt = self.conn.rtt().as_millis() as u32;
         NetworkCounters {
-            rtt_ms: self.rtt_ms.load(Ordering::Relaxed) as u32,
+            rtt_ms: if ping_rtt > 0 { ping_rtt } else { quic_rtt },
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             in_flight_video: self.in_flight_video.load(Ordering::Relaxed),
         }
+    }
+
+    /// Reads current QUIC path telemetry (RTT, cwnd, loss, congestion events, queue depth).
+    pub fn path_telemetry(&self) -> QuicPathTelemetry {
+        let path = self.conn.stats().path;
+        let path_rtt_ms = path.rtt.as_millis() as u32;
+        let fallback_rtt = self.rtt_ms.load(Ordering::Relaxed) as u32;
+        QuicPathTelemetry {
+            rtt_ms: if path_rtt_ms > 0 {
+                path_rtt_ms
+            } else {
+                fallback_rtt
+            },
+            cwnd_bytes: path.cwnd,
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+            congestion_events: path.congestion_events,
+            in_flight_video: self.in_flight_video.load(Ordering::Acquire),
+            send_stall_flagged: self.send_stall_flag.swap(false, Ordering::AcqRel),
+        }
+    }
+
+    /// Returns the latest non-expired SFU bitrate hint received for the local broadcaster.
+    pub fn sfu_bitrate_hint(&self) -> Option<SfuBitrateHintSnapshot> {
+        let guard = self.sfu_bitrate_hint.lock();
+        guard.filter(|snap| snap.updated_at.elapsed() <= Duration::from_secs(6))
     }
 
     /// Enqueues an encoded H.264 frame over an independent QUIC UniStream (prevents frame head-of-line stalling).
@@ -336,10 +408,12 @@ impl SfuClient {
         let len = packet.len() as u64;
         let conn = self.conn.clone();
         let in_flight = Arc::clone(&self.in_flight_video);
+        let send_stall_flag = Arc::clone(&self.send_stall_flag);
         let bytes_sent = Arc::clone(&self.bytes_sent);
 
         in_flight.fetch_add(1, Ordering::AcqRel);
         self.rt_handle.spawn(async move {
+            let started = Instant::now();
             let result = async {
                 let mut send = conn.open_uni().await?;
                 if is_keyframe {
@@ -352,6 +426,9 @@ impl SfuClient {
             .await;
 
             in_flight.fetch_sub(1, Ordering::AcqRel);
+            if started.elapsed() >= Duration::from_millis(180) {
+                send_stall_flag.store(true, Ordering::Release);
+            }
             if let Err(err) = result {
                 debug!("Failed sending QUIC video UniStream: {err}");
             } else {
@@ -447,6 +524,7 @@ fn spawn_control_reader(
     event_tx: mpsc::UnboundedSender<SfuEvent>,
     force_keyframe: Arc<AtomicBool>,
     rtt_ms: Arc<AtomicU64>,
+    sfu_bitrate_hint: Arc<Mutex<Option<SfuBitrateHintSnapshot>>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -497,6 +575,18 @@ fn spawn_control_reader(
                 ServerControl::ForceKeyframe => {
                     force_keyframe.store(true, Ordering::Release);
                     let _ = event_tx.send(SfuEvent::ForceKeyframe);
+                }
+                ServerControl::BitrateHint {
+                    target_max_bps,
+                    min_fps_cap,
+                    congestion_source,
+                } => {
+                    *sfu_bitrate_hint.lock() = Some(SfuBitrateHintSnapshot {
+                        target_max_bps,
+                        min_fps_cap,
+                        congestion_source,
+                        updated_at: Instant::now(),
+                    });
                 }
                 ServerControl::Error { code, message } => {
                     let _ = event_tx.send(SfuEvent::ServerError { code, message });

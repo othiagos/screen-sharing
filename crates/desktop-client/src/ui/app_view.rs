@@ -583,7 +583,12 @@ impl AppView {
                 let keep_going = this.update(cx, |app, cx| {
                     let has_events = app.drain_sfu_events(cx);
                     let has_frames = app.frame_notify_flag.swap(false, Ordering::AcqRel);
-                    let periodic = last_stats_tick.elapsed() >= Duration::from_millis(500);
+                    let stats_interval = if app.local_broadcast.is_some() {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_millis(500)
+                    };
+                    let periodic = last_stats_tick.elapsed() >= stats_interval;
                     if periodic {
                         last_stats_tick = Instant::now();
                         if let Some(sfu) = &app.sfu_client {

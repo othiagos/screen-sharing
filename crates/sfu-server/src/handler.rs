@@ -1,4 +1,6 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -125,6 +127,7 @@ pub async fn handle_quic_connection(conn: Connection, state: Arc<SfuState>) {
 
     // 2. Outbound video UniStream sender
     let conn_vid_w = conn.clone();
+    let peer_vid_w = Arc::clone(&peer);
     let cancel_vid_w = cancel.clone();
     let video_writer = tokio::spawn(async move {
         loop {
@@ -132,11 +135,55 @@ pub async fn handle_quic_connection(conn: Connection, state: Arc<SfuState>) {
                 _ = cancel_vid_w.cancelled() => break,
                 maybe_item = video_rx.recv() => {
                     let Some(OutboundMedia::Video { packet, .. }) = maybe_item else { break };
+                    let started = Instant::now();
                     let Ok(mut stream) = conn_vid_w.open_uni().await else { break };
                     if stream.write_all(&packet).await.is_err() {
                         break;
                     }
                     let _ = stream.finish();
+                    if started.elapsed() >= Duration::from_millis(180) {
+                        peer_vid_w.slow_outbound_flag.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+    });
+
+    // 2b. Periodic viewer path congestion monitor (RTT / loss / queue depth)
+    let conn_mon = conn.clone();
+    let state_mon = Arc::clone(&state);
+    let cancel_mon = cancel.clone();
+    let link_monitor = tokio::spawn(async move {
+        let mut prev_stats = conn_mon.stats().path;
+        let mut baseline_rtt_ms: Option<u64> = None;
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel_mon.cancelled() => break,
+                _ = tick.tick() => {
+                    let path = conn_mon.stats().path;
+                    let lost_delta = path.lost_packets.saturating_sub(prev_stats.lost_packets);
+                    let sent_delta = path.sent_packets.saturating_sub(prev_stats.sent_packets);
+                    let cong_delta = path.congestion_events.saturating_sub(prev_stats.congestion_events);
+                    prev_stats = path;
+
+                    let rtt_ms = path.rtt.as_millis() as u64;
+                    if rtt_ms > 0 {
+                        baseline_rtt_ms = Some(match baseline_rtt_ms {
+                            Some(b) => b.min(rtt_ms),
+                            None => rtt_ms,
+                        });
+                    }
+                    let rtt_inflated = baseline_rtt_ms.is_some_and(|b| {
+                        rtt_ms > (b.saturating_mul(2)).max(b + 80) && rtt_ms > 150
+                    });
+                    let high_loss = sent_delta >= 12 && lost_delta.saturating_mul(100) >= sent_delta.saturating_mul(3);
+                    let severe_loss = sent_delta >= 12 && lost_delta.saturating_mul(100) >= sent_delta.saturating_mul(7);
+                    let path_congested = cong_delta >= 2 || high_loss || rtt_inflated;
+                    let path_severe = cong_delta >= 5 || severe_loss;
+
+                    state_mon.evaluate_viewer_link(peer_id, path_congested, path_severe);
                 }
             }
         }
@@ -246,6 +293,7 @@ pub async fn handle_quic_connection(conn: Connection, state: Arc<SfuState>) {
     cancel.cancel();
     ctrl_writer.abort();
     video_writer.abort();
+    link_monitor.abort();
     audio_writer.abort();
     uni_reader.abort();
     dg_reader.abort();
@@ -289,6 +337,13 @@ fn handle_client_control(
         }
         ClientControl::RequestKeyframe { broadcaster_id } => {
             state.request_keyframe(peer_id, broadcaster_id);
+        }
+        ClientControl::ViewerFeedback {
+            broadcaster_id,
+            queue_drops,
+            decode_errors,
+        } => {
+            state.report_viewer_feedback(peer_id, broadcaster_id, queue_drops, decode_errors);
         }
         ClientControl::Ping { client_time_ms } => {
             peer.send_control(ServerControl::Pong { client_time_ms });

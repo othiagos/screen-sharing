@@ -83,6 +83,9 @@ pub trait VideoEncoder: Send + 'static {
     fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError>;
     fn request_keyframe(&mut self);
     fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError>;
+    fn set_target_fps(&mut self, _fps: u8) -> Result<(), MediaError> {
+        Ok(())
+    }
     fn backend_name(&self) -> &'static str;
 }
 

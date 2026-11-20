@@ -65,7 +65,7 @@ Binaries are written to `target/release/sfu-server` and `target/release/desktop-
    - Enter `server:4433`, your nickname, and optional `auth_token`.
    - Accept the server's SHA-256 TOFU fingerprint prompt on first connection.
    - Click **Criar Nova Sala** or enter an existing Room ID and click **Entrar na Sala**.
-   - Click **Compartilhar Tela** to pick a Monitor, Window, or Wayland Portal, preview it live, select `720p`/`1080p`/`1440p`/`Nativa`, `15`/`30`/`60 FPS`, bitrate (`6`/`12`/`20 Mbps`/`Auto`), and audio mode.
+   - Click **Compartilhar Tela** to pick a Monitor, Window, or Wayland Portal, preview it live, select `720p`/`1080p`/`1440p`/`Nativa`, `15`/`30`/`60 FPS`, adaptive bitrate (`Auto`, `Até 6 Mbps`, `Até 12 Mbps`, `Até 20 Mbps`), and audio mode.
 
 ## Docker Deployment (`sfu-server`)
 

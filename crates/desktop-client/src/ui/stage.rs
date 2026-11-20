@@ -1,5 +1,8 @@
 use crate::ui::app_view::{AppView, StageLayout};
-use crate::ui::video_surface::{VideoTileKey, VideoTileStats, render_video_tile};
+use crate::ui::video_surface::{
+    VideoTileKey, VideoTileStats, format_bitrate_compact, is_significant_throttle,
+    render_video_tile,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{ActiveTheme, Disableable as _, h_flex, v_flex};
@@ -8,7 +11,7 @@ use gpui_kit::{
     ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, RenderImage,
     SharedString, StatefulInteractiveElement as _, Styled, Window, black, div, hsla, px,
 };
-use shared_protocol::PeerId;
+use shared_protocol::{PeerId, ThrottleReason};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,9 +64,17 @@ fn tile_info(
             let stats = app.broadcast_stats.as_ref().map(|bs| VideoTileStats {
                 width: bs.width,
                 height: bs.height,
-                fps: bs.encoded_fps,
+                fps: if bs.encoded_fps > 0 {
+                    bs.encoded_fps
+                } else {
+                    bs.effective_fps
+                },
+                effective_fps: (bs.effective_fps > 0).then_some(bs.effective_fps),
+                target_fps: (bs.configured_fps > 0).then_some(bs.configured_fps),
                 backend: Some(bs.backend.clone()),
                 bitrate_kbps: Some(bs.target_bitrate_kbps),
+                max_bitrate_kbps: (bs.max_bitrate_kbps > 0).then_some(bs.max_bitrate_kbps),
+                throttle_reason: bs.throttle_reason,
                 rtt_ms: app.rtt_ms,
                 warning: bs.warning.clone(),
             });
@@ -90,8 +101,12 @@ fn tile_info(
                     width: f.width,
                     height: f.height,
                     fps: f.fps_estimate,
+                    effective_fps: None,
+                    target_fps: meta_opt.map(|m| u32::from(m.fps)),
                     backend: meta_opt.map(|m| m.codec_name.clone()),
                     bitrate_kbps: None,
+                    max_bitrate_kbps: None,
+                    throttle_reason: ThrottleReason::None,
                     rtt_ms: app.rtt_ms,
                     warning: None,
                 })
@@ -100,8 +115,12 @@ fn tile_info(
                         width: m.width,
                         height: m.height,
                         fps: u32::from(m.fps),
+                        effective_fps: None,
+                        target_fps: Some(u32::from(m.fps)),
                         backend: Some(m.codec_name.clone()),
                         bitrate_kbps: None,
+                        max_bitrate_kbps: None,
+                        throttle_reason: ThrottleReason::None,
                         rtt_ms: app.rtt_ms,
                         warning: None,
                     })
@@ -510,12 +529,53 @@ pub fn render_stage(
             .local_broadcast_label
             .as_deref()
             .unwrap_or("Captura de tela ativa");
-        let stats_desc = match &app.broadcast_stats {
-            Some(bs) if bs.width > 0 && bs.height > 0 => format!(
-                "{source_desc} • {}×{} • {} FPS • {}",
-                bs.width, bs.height, bs.encoded_fps, bs.backend
-            ),
-            _ => source_desc.to_string(),
+        let (stats_desc, adapt_badge) = match &app.broadcast_stats {
+            Some(bs) if bs.width > 0 && bs.height > 0 => {
+                let shown_fps = if bs.encoded_fps > 0 {
+                    bs.encoded_fps
+                } else {
+                    bs.effective_fps
+                };
+                let fps_txt = if bs.effective_fps > 0
+                    && bs.effective_fps < bs.configured_fps
+                    && bs.throttle_reason != ThrottleReason::None
+                {
+                    format!("{shown_fps}/{} FPS", bs.configured_fps)
+                } else {
+                    format!("{shown_fps} FPS")
+                };
+                let br_txt = if bs.max_bitrate_kbps > 0
+                    && (bs.throttle_reason != ThrottleReason::None
+                        || bs.target_bitrate_kbps < (bs.max_bitrate_kbps * 95) / 100)
+                {
+                    format!(
+                        "{} / {}",
+                        format_bitrate_compact(bs.target_bitrate_kbps),
+                        format_bitrate_compact(bs.max_bitrate_kbps)
+                    )
+                } else {
+                    format_bitrate_compact(bs.target_bitrate_kbps)
+                };
+                let desc = format!(
+                    "{source_desc} • {}×{} • {fps_txt} • {br_txt} • {}",
+                    bs.width, bs.height, bs.backend
+                );
+                let show_badge = is_significant_throttle(
+                    bs.throttle_reason,
+                    bs.target_bitrate_kbps,
+                    bs.max_bitrate_kbps,
+                    bs.effective_fps,
+                    bs.configured_fps,
+                );
+                let badge = show_badge.then(|| {
+                    format!(
+                        "Bitrate/FPS reduzido automaticamente ({})",
+                        bs.throttle_reason.label()
+                    )
+                });
+                (desc, badge)
+            }
+            _ => (source_desc.to_string(), None),
         };
         div()
             .size_full()
@@ -524,7 +584,7 @@ pub fn render_stage(
             .justify_center()
             .child(
                 v_flex()
-                    .w(px(480.))
+                    .w(px(500.))
                     .p_6()
                     .gap_3()
                     .items_center()
@@ -553,6 +613,20 @@ pub fn render_stage(
                             .text_color(fg)
                             .child(SharedString::from(stats_desc)),
                     )
+                    .when_some(adapt_badge, |el, msg| {
+                        el.child(
+                            div()
+                                .px_2p5()
+                                .py_1()
+                                .rounded(cx.theme().radius)
+                                .bg(hsla(0.11, 0.85, 0.35, 0.22))
+                                .border_1()
+                                .border_color(hsla(0.11, 0.85, 0.45, 0.55))
+                                .text_xs()
+                                .text_color(fg)
+                                .child(SharedString::from(msg)),
+                        )
+                    })
                     .child(
                         div()
                             .w_full()
