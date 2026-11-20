@@ -234,9 +234,10 @@ async fn test_headless_three_peer_quic_sfu_stream_and_auth() -> anyhow::Result<(
     assert_eq!(sample_frame.width, 640);
     assert_eq!(sample_frame.height, 360);
     assert_eq!(
-        sample_frame.bgra.len(),
+        sample_frame.bgra_len,
         (sample_frame.width * sample_frame.height * 4) as usize
     );
+    assert!(sample_frame.image.is_some());
 
     // 6. Late joiner ViewerB joins 700ms+ into stream, subscribes (verifies forced IDR keyframe)
     let mut viewer_b =
@@ -332,7 +333,7 @@ impl VideoCapturer for EndingVideoCapturer {
                 let frame = RawVideoFrame {
                     width: 320,
                     height: 180,
-                    rgba: MockVideoCapturer::generate_smpte_bars(320, 180, idx),
+                    rgba: MockVideoCapturer::generate_smpte_bars(320, 180, idx).into(),
                     is_bgra: false,
                     timestamp_us: idx * 33_333,
                 };

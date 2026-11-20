@@ -9158,12 +9158,11 @@ dependencies = [
 
 [[package]]
 name = "yuv"
-version = "0.1.10"
+version = "0.8.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb00ec278d3f05b635a766c22205efb5825592d93c955c8021e1dfe21de5a6d"
+checksum = "3d109d1eacc7b034329873d2d848039b365c65ab7d751b19ee84e4921c62c607"
 dependencies = [
  "num-traits",
- "rgb",
 ]
 
 [[package]]

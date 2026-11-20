@@ -3,6 +3,7 @@
 use std::ptr::null_mut;
 use std::sync::mpsc as std_mpsc;
 
+use bytes::BytesMut;
 use tracing::{debug, info};
 use windows::core::{Interface, VARIANT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -33,7 +34,7 @@ use windows::Win32::System::Com::{
 };
 
 use crate::media::traits::{MediaError, RawVideoFrame, VideoEncoder};
-use crate::media::video::{bgra_to_nv12_into, rgba_to_nv12_into};
+use crate::media::video::{bgra_to_nv12_into, is_h264_keyframe, rgba_to_nv12_into};
 
 /// Windows Media Foundation Hardware H.264 encoder (NVENC / AMD AMF / Intel QSV).
 ///
@@ -44,16 +45,18 @@ pub struct MfH264Encoder {
     tx: Option<std_mpsc::SyncSender<MfCommand>>,
     worker: Option<std::thread::JoinHandle<()>>,
     nv12_buf: Vec<u8>,
+    out_scratch: Vec<u8>,
     pending_keyframe: bool,
 }
 
-type EncodeReply = (Result<Vec<u8>, MediaError>, Vec<u8>);
+type EncodeReply = (Result<bool, MediaError>, Vec<u8>, Vec<u8>);
 
 enum MfCommand {
     Encode {
         width: u32,
         height: u32,
         nv12_buf: Vec<u8>,
+        out_buf: Vec<u8>,
         force_keyframe: bool,
         reply: std_mpsc::SyncSender<EncodeReply>,
     },
@@ -115,6 +118,7 @@ impl MfH264Encoder {
                 tx: Some(cmd_tx),
                 worker: Some(worker),
                 nv12_buf: Vec::new(),
+                out_scratch: Vec::with_capacity(256 * 1024),
                 pending_keyframe: false,
             }),
             Ok(Err(err)) => {
@@ -179,14 +183,15 @@ fn run_mf_worker(
                 width,
                 height,
                 nv12_buf,
+                mut out_buf,
                 force_keyframe,
                 reply,
             } => {
                 if force_keyframe {
                     inner.force_next_idr = true;
                 }
-                let res = inner.encode_nv12(width, height, &nv12_buf);
-                let _ = reply.send((res, nv12_buf));
+                let res = inner.encode_nv12(width, height, &nv12_buf, &mut out_buf);
+                let _ = reply.send((res, nv12_buf, out_buf));
             }
             MfCommand::SetBitrate {
                 target_bps,
@@ -420,7 +425,14 @@ impl MfWorkerInner {
         Ok(())
     }
 
-    fn encode_nv12(&mut self, width: u32, height: u32, nv12_buf: &[u8]) -> Result<Vec<u8>, MediaError> {
+    fn encode_nv12(
+        &mut self,
+        width: u32,
+        height: u32,
+        nv12_buf: &[u8],
+        annex_b: &mut Vec<u8>,
+    ) -> Result<bool, MediaError> {
+        annex_b.clear();
         let nv12_len = u32::try_from(nv12_buf.len())
             .map_err(|_| MediaError::Codec("NV12 frame buffer exceeds 4 GiB".to_string()))?;
 
@@ -429,6 +441,7 @@ impl MfWorkerInner {
                 self.configure_streams(width, height)?;
             }
 
+            let requested_idr = self.force_next_idr;
             if self.force_next_idr {
                 self.force_next_idr = false;
                 if let Some(api) = &self.codec_api {
@@ -458,7 +471,7 @@ impl MfWorkerInner {
             if let Some(gen) = &self.event_gen {
                 // Async MFT loop: deliver input once METransformNeedInput arrives, then read output.
                 let mut sent_input = false;
-                let mut annex_b = Vec::new();
+                let mut is_clean = false;
                 for _ in 0..16 {
                     let ev = gen.GetEvent(MF_EVENT_FLAG_NONE).map_err(|e| {
                         MediaError::Codec(format!("MFT GetEvent failed: {e}"))
@@ -470,20 +483,19 @@ impl MfWorkerInner {
                         })?;
                         sent_input = true;
                     } else if ev_type == METransformHaveOutput {
-                        extract_mft_output(&self.transform, &mut annex_b)?;
+                        is_clean |= extract_mft_output(&self.transform, annex_b)?;
                         if sent_input && !annex_b.is_empty() {
-                            return Ok(annex_b);
+                            return Ok(is_clean || (requested_idr && is_h264_keyframe(annex_b)));
                         }
                     }
                 }
-                Ok(annex_b)
+                Ok(is_clean || (requested_idr && is_h264_keyframe(annex_b)))
             } else {
                 self.transform
                     .ProcessInput(0, &sample, 0)
                     .map_err(|e| MediaError::Codec(format!("Sync MFT ProcessInput: {e}")))?;
-                let mut annex_b = Vec::new();
-                let _ = extract_mft_output(&self.transform, &mut annex_b);
-                Ok(annex_b)
+                let is_clean = extract_mft_output(&self.transform, annex_b).unwrap_or(false);
+                Ok(is_clean || (requested_idr && is_h264_keyframe(annex_b)))
             }
         }
     }
@@ -548,7 +560,11 @@ impl MfWorkerInner {
 }
 
 impl VideoEncoder for MfH264Encoder {
-    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError> {
+    fn encode_frame_into(
+        &mut self,
+        frame: &RawVideoFrame,
+        out_annex_b: &mut BytesMut,
+    ) -> Result<bool, MediaError> {
         let width = frame.width & !1;
         let height = frame.height & !1;
         if width < 2 || height < 2 {
@@ -562,16 +578,23 @@ impl VideoEncoder for MfH264Encoder {
         }
 
         let nv12_buf = std::mem::take(&mut self.nv12_buf);
+        let out_buf = std::mem::take(&mut self.out_scratch);
         let force_keyframe = std::mem::take(&mut self.pending_keyframe);
-        let (res, returned_buf) = self.send_command(|reply| MfCommand::Encode {
+        let (res, returned_nv12, returned_out) = self.send_command(|reply| MfCommand::Encode {
             width,
             height,
             nv12_buf,
+            out_buf,
             force_keyframe,
             reply,
         })?;
-        self.nv12_buf = returned_buf;
-        res
+        self.nv12_buf = returned_nv12;
+        self.out_scratch = returned_out;
+        let is_kf = res?;
+        if !self.out_scratch.is_empty() {
+            out_annex_b.extend_from_slice(&self.out_scratch);
+        }
+        Ok(is_kf)
     }
 
     fn request_keyframe(&mut self) {
@@ -598,7 +621,7 @@ impl VideoEncoder for MfH264Encoder {
 unsafe fn extract_mft_output(
     transform: &IMFTransform,
     out_bytes: &mut Vec<u8>,
-) -> Result<(), MediaError> {
+) -> Result<bool, MediaError> {
     let stream_info = transform
         .GetOutputStreamInfo(0)
         .map_err(|e| MediaError::Codec(format!("GetOutputStreamInfo: {e}")))?;
@@ -626,8 +649,9 @@ unsafe fn extract_mft_output(
     let _ = std::mem::ManuallyDrop::take(&mut out_buf[0].pEvents);
     res.map_err(|e| MediaError::Codec(format!("MFT ProcessOutput: {e}")))?;
 
+    let mut is_clean = false;
     if let Some(sample) = sample_opt {
-        let _is_clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+        is_clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
         if let Ok(contiguous) = sample.ConvertToContiguousBuffer() {
             let mut ptr: *mut u8 = null_mut();
             let mut cur_len = 0u32;
@@ -638,7 +662,7 @@ unsafe fn extract_mft_output(
             }
         }
     }
-    Ok(())
+    Ok(is_clean)
 }
 
 impl Drop for MfH264Encoder {

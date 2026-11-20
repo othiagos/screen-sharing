@@ -94,7 +94,7 @@ impl VideoCapturer for MockVideoCapturer {
                         let frame = RawVideoFrame {
                             width,
                             height,
-                            rgba,
+                            rgba: rgba.into(),
                             is_bgra: false,
                             timestamp_us: start.elapsed().as_micros() as u64,
                         };

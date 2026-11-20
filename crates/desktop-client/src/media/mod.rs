@@ -21,7 +21,10 @@ pub use audio_out::{OpusAudioDecoder, OpusAudioEncoder, PeerAudioMixer};
 pub use pipeline::{
     BroadcastStats, DecodedVideoFrame, LocalBroadcastSession, PeerMediaReceiver, PeerVideoStore,
 };
-pub use traits::{AudioCapturer, MediaError, RawAudioFrame, RawVideoFrame, VideoCapturer};
+pub use traits::{
+    AudioCapturer, FrameBufferPool, MediaError, RawAudioFrame, RawVideoFrame, SharedFrameBuffer,
+    VideoCapturer,
+};
 
 /// Returns the default platform-specific `AudioCapturer` implementation.
 pub fn default_os_audio_capturer() -> Arc<dyn AudioCapturer> {

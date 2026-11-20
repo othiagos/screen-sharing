@@ -412,6 +412,25 @@ impl VideoFrameHeader {
         dst.put_slice(self.sender_id.as_bytes());
     }
 
+    /// Writes the 36-byte binary header directly into the first `VIDEO_HEADER_LEN` bytes of `dst`.
+    pub fn write_prefix(&self, dst: &mut [u8]) -> Result<(), ProtocolError> {
+        if dst.len() < VIDEO_HEADER_LEN {
+            return Err(ProtocolError::FrameTooShort {
+                expected: VIDEO_HEADER_LEN,
+                actual: dst.len(),
+            });
+        }
+        dst[0] = MEDIA_KIND_VIDEO;
+        dst[1] = self.flags;
+        dst[2..4].copy_from_slice(&0u16.to_le_bytes());
+        dst[4..8].copy_from_slice(&self.frame_seq.to_le_bytes());
+        dst[8..16].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        dst[16..18].copy_from_slice(&self.width.to_le_bytes());
+        dst[18..20].copy_from_slice(&self.height.to_le_bytes());
+        dst[20..36].copy_from_slice(self.sender_id.as_bytes());
+        Ok(())
+    }
+
     pub fn decode(buf: &[u8]) -> Result<(Self, &[u8]), ProtocolError> {
         if buf.len() < VIDEO_HEADER_LEN {
             return Err(ProtocolError::FrameTooShort {
@@ -711,6 +730,15 @@ mod tests {
         assert_eq!(dec_hdr, v_hdr);
         assert!(dec_hdr.is_keyframe());
         assert_eq!(dec_payload, payload.as_slice());
+
+        // Verify in-place prefix framing matches encode_video_packet bit-for-bit
+        let mut in_place = BytesMut::with_capacity(VIDEO_HEADER_LEN + payload.len());
+        in_place.resize(VIDEO_HEADER_LEN, 0);
+        in_place.extend_from_slice(&payload);
+        v_hdr
+            .write_prefix(&mut in_place[..VIDEO_HEADER_LEN])
+            .expect("write_prefix");
+        assert_eq!(in_place.freeze(), v_pkt);
 
         let a_hdr = AudioPacketHeader {
             sender_id,

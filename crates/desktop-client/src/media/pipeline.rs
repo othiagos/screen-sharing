@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use gpui_kit::RenderImage;
 use parking_lot::Mutex;
 use shared_protocol::{
     sanitize_video_fps, vbr_bitrate_range, AudioCaptureMode, AudioPacketHeader, CaptureTarget,
     PeerId, StreamConfig, StreamMetadata, ThrottleReason, VideoFrameHeader, AUDIO_FLAG_OPUS,
-    VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
+    MAX_VIDEO_FRAME_BYTES, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -20,19 +21,33 @@ use crate::media::audio_out::{OpusAudioEncoder, PeerAudioMixer};
 use crate::media::default_os_audio_capturer;
 use crate::media::traits::{AudioCapturer, RawAudioFrame, RawVideoFrame, VideoCapturer};
 use crate::media::video::{
-    create_best_video_encoder, is_h264_keyframe, rgba_to_bgra_in_place, H264VideoDecoder,
-    NativeVideoCapturer,
+    create_best_video_encoder, rgba_to_bgra_in_place, H264VideoDecoder, NativeVideoCapturer,
 };
 use crate::net::{MediaSink, SfuClient};
 
 const DECODER_QUEUE_CAPACITY: usize = 4;
 
-/// Decoded latest BGRA video frame ready for GPUI `RenderImage` presentation.
+/// Converts a tightly-packed BGRA8 buffer into a cached GPUI `RenderImage` without copying pixels.
+pub fn bgra_to_render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if bgra.len() != expected {
+        return None;
+    }
+    let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(width, height, bgra)?;
+    let frame = image::Frame::new(buf);
+    Some(Arc::new(RenderImage::new(smallvec::smallvec![frame])))
+}
+
+/// Decoded latest BGRA video frame ready for zero-copy GPUI `RenderImage` presentation.
 #[derive(Clone)]
 pub struct DecodedVideoFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
+    pub bgra_len: usize,
+    pub image: Option<Arc<RenderImage>>,
     pub generation: u64,
     pub frame_id: u32,
     pub fps_estimate: u32,
@@ -86,6 +101,8 @@ impl PeerVideoStore {
         fps_estimate: u32,
     ) {
         let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let bgra_len = bgra.len();
+        let image = bgra_to_render_image(width, height, bgra);
         let slot = self
             .peers
             .entry(peer_id)
@@ -94,7 +111,8 @@ impl PeerVideoStore {
         *slot.lock() = Some(DecodedVideoFrame {
             width,
             height,
-            bgra,
+            bgra_len,
+            image,
             generation: gen,
             frame_id,
             fps_estimate,
@@ -103,10 +121,13 @@ impl PeerVideoStore {
 
     pub fn update_local_preview(&self, width: u32, height: u32, bgra: Vec<u8>, fps: u32) {
         let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let bgra_len = bgra.len();
+        let image = bgra_to_render_image(width, height, bgra);
         *self.local_preview.lock() = Some(DecodedVideoFrame {
             width,
             height,
-            bgra,
+            bgra_len,
+            image,
             generation: gen,
             frame_id: gen as u32,
             fps_estimate: fps,
@@ -504,6 +525,7 @@ impl LocalBroadcastSession {
                     let mut pending_external_kf = false;
                     let mut pending_gop_recovery = false;
                     let mut dropped_frames: u64 = 0;
+                    let mut packet_buf = BytesMut::with_capacity(256 * 1024);
 
                     while !cancel_v.is_cancelled() {
                         let Some(mut frame) = video_rx.blocking_recv() else {
@@ -602,12 +624,30 @@ impl LocalBroadcastSession {
                             pending_external_kf = false;
                         }
 
-                        match encoder.encode_frame(&frame) {
-                            Ok(annex_b) if !annex_b.is_empty() => {
+                        if packet_buf.capacity() < 128 * 1024 {
+                            packet_buf = BytesMut::with_capacity(256 * 1024);
+                        } else {
+                            packet_buf.clear();
+                        }
+                        packet_buf.resize(VIDEO_HEADER_LEN, 0);
+
+                        match encoder.encode_frame_into(&frame, &mut packet_buf) {
+                            Ok(is_kf) if packet_buf.len() > VIDEO_HEADER_LEN => {
+                                let payload_len = packet_buf.len() - VIDEO_HEADER_LEN;
+                                if payload_len > MAX_VIDEO_FRAME_BYTES {
+                                    warn!(
+                                        payload_len,
+                                        max = MAX_VIDEO_FRAME_BYTES,
+                                        "Dropping oversized encoded H.264 frame"
+                                    );
+                                    dropped_frames = dropped_frames.saturating_add(1);
+                                    pending_gop_recovery = true;
+                                    continue;
+                                }
+
                                 last_encoded_at = Some(Instant::now());
 
                                 let seq = seq_v.fetch_add(1, Ordering::Relaxed);
-                                let is_kf = is_h264_keyframe(&annex_b);
                                 let flags = VIDEO_FLAG_H264
                                     | if is_kf { VIDEO_FLAG_KEYFRAME } else { 0 };
                                 let hdr = VideoFrameHeader {
@@ -618,8 +658,15 @@ impl LocalBroadcastSession {
                                     height: frame.height as u16,
                                     flags,
                                 };
+                                if let Err(err) =
+                                    hdr.write_prefix(&mut packet_buf[..VIDEO_HEADER_LEN])
+                                {
+                                    warn!("Failed writing video frame header prefix: {err}");
+                                    continue;
+                                }
+                                let packet = packet_buf.split().freeze();
 
-                                let frame_sent = match sfu_v.send_video_frame(&hdr, &annex_b) {
+                                let frame_sent = match sfu_v.send_video_packet(packet, is_kf) {
                                     Ok(true) => {
                                         if pending_gop_recovery && is_kf {
                                             pending_gop_recovery = false;
@@ -665,9 +712,9 @@ impl LocalBroadcastSession {
                                 {
                                     last_preview_update = Instant::now();
                                     let preview_bgra = if frame.is_bgra {
-                                        frame.rgba
+                                        frame.rgba.into_vec_or_clone()
                                     } else {
-                                        let mut b = frame.rgba;
+                                        let mut b = frame.rgba.into_vec_or_clone();
                                         rgba_to_bgra_in_place(&mut b);
                                         b
                                     };

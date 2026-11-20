@@ -1,31 +1,45 @@
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_void};
+use std::ptr::{addr_of_mut, from_mut, null, null_mut};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::BytesMut;
 use fast_image_resize::{
     images::{Image, ImageRef},
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
 };
 use openh264::{
     decoder::{Decoder, DecoderConfig},
-    encoder::{Encoder, EncoderConfig, RateControlMode, SpsPpsStrategy, UsageType},
-    formats::{YUVBuffer, YUVSlices, YUVSource},
-    OpenH264API, Timestamp,
+    formats::{YUVBuffer, YUVSource},
+    OpenH264API,
 };
+#[cfg(test)]
+use openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT;
 use openh264_sys2::{
-    SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE,
-    SPATIAL_LAYER_ALL,
+    videoFormatI420, videoFrameTypeI, videoFrameTypeIDR, EUsageType, ISVCEncoder, ISVCEncoderVtbl,
+    SBitrateInfo, SEncParamExt, SFrameBSInfo, SSourcePicture, API as OpenH264SysApi,
+    CAMERA_VIDEO_REAL_TIME, CONSTANT_ID, ENCODER_OPTION, ENCODER_OPTION_BITRATE,
+    ENCODER_OPTION_DATAFORMAT, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE,
+    ENCODER_OPTION_TRACE_LEVEL, RC_QUALITY_MODE, SCREEN_CONTENT_REAL_TIME, SM_FIXEDSLCNUM_SLICE,
+    SM_SINGLE_SLICE, SPATIAL_LAYER_ALL, WELS_LOG_QUIET,
 };
 use shared_protocol::{CaptureTarget, TargetResolution};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use yuv::{
+    bgra_to_yuv420, bgra_to_yuv_nv12, rgba_to_yuv420, rgba_to_yuv_nv12, yuv420_to_bgra,
+    yuv420_to_rgba, BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvPlanarImage,
+    YuvPlanarImageMut, YuvRange, YuvStandardMatrix,
+};
 
 #[cfg(target_os = "windows")]
 use crate::media::capture_win::{
     list_windows_win32_with_dims, CapturePoll, DxgiMonitorDuplicator, Win32WindowCapturer,
 };
 use crate::media::traits::{
-    MediaError, RawVideoFrame, VideoCapturer, VideoDecoder, VideoEncoder,
+    FrameBufferPool, MediaError, RawVideoFrame, SharedFrameBuffer, VideoCapturer, VideoDecoder,
+    VideoEncoder,
 };
 
 /// Scales an arbitrary RGBA buffer to `resolution` using Bilinear filtering while keeping even dimensions.
@@ -36,53 +50,31 @@ pub fn scale_rgba_frame(
     resolution: TargetResolution,
 ) -> Result<(u32, u32, Vec<u8>), MediaError> {
     let mut resizer = Resizer::new();
-    scale_rgba_frame_with_resizer(&mut resizer, src_rgba, src_width, src_height, resolution, false)
-}
-
-pub fn scale_rgba_frame_with_resizer(
-    resizer: &mut Resizer,
-    src_rgba: &[u8],
-    src_width: u32,
-    src_height: u32,
-    resolution: TargetResolution,
-    clamp_1080p: bool,
-) -> Result<(u32, u32, Vec<u8>), MediaError> {
-    scale_pixel_buffer_with_resizer(
-        resizer,
+    let pool = FrameBufferPool::new();
+    let (w, h, buf) = scale_pixel_buffer_pooled(
+        &mut resizer,
+        &pool,
         src_rgba,
         src_width,
         src_height,
         resolution,
-        clamp_1080p,
-    )
+        false,
+    )?;
+    Ok((w, h, buf.into_vec_or_clone()))
 }
 
-pub fn scale_bgra_frame_with_resizer(
+/// Scales a borrowed 32bpp RGBA/BGRA buffer into a recycled pooled buffer using Bilinear filtering.
+///
+/// When `dst == src`, copies directly into a warm pooled buffer without resizing.
+pub fn scale_pixel_buffer_pooled(
     resizer: &mut Resizer,
-    src_bgra: &[u8],
-    src_width: u32,
-    src_height: u32,
-    resolution: TargetResolution,
-    clamp_1080p: bool,
-) -> Result<(u32, u32, Vec<u8>), MediaError> {
-    scale_pixel_buffer_with_resizer(
-        resizer,
-        src_bgra,
-        src_width,
-        src_height,
-        resolution,
-        clamp_1080p,
-    )
-}
-
-fn scale_pixel_buffer_with_resizer(
-    resizer: &mut Resizer,
+    pool: &Arc<FrameBufferPool>,
     src_bytes: &[u8],
     src_width: u32,
     src_height: u32,
     resolution: TargetResolution,
     clamp_1080p: bool,
-) -> Result<(u32, u32, Vec<u8>), MediaError> {
+) -> Result<(u32, u32, SharedFrameBuffer), MediaError> {
     let expected_len = (src_width as usize)
         .checked_mul(src_height as usize)
         .and_then(|px| px.checked_mul(4))
@@ -96,13 +88,18 @@ fn scale_pixel_buffer_with_resizer(
 
     let (dst_width, dst_height) = resolution.compute_dimensions(src_width, src_height, clamp_1080p);
     if dst_width == src_width && dst_height == src_height {
-        return Ok((dst_width, dst_height, src_bytes[..expected_len].to_vec()));
+        let mut dst = pool.take_with_len(expected_len);
+        dst.copy_from_slice(&src_bytes[..expected_len]);
+        return Ok((dst_width, dst_height, pool.wrap(dst)));
     }
 
     let src_view = ImageRef::new(src_width, src_height, &src_bytes[..expected_len], PixelType::U8x4)
         .map_err(|e| MediaError::VideoCapture(format!("fast_image_resize src error: {e}")))?;
 
-    let mut dst_image = Image::new(dst_width, dst_height, PixelType::U8x4);
+    let dst_len = (dst_width as usize) * (dst_height as usize) * 4;
+    let dst_buf = pool.take_with_len(dst_len);
+    let mut dst_image = Image::from_vec_u8(dst_width, dst_height, dst_buf, PixelType::U8x4)
+        .map_err(|e| MediaError::VideoCapture(format!("fast_image_resize dst error: {e}")))?;
     let options = ResizeOptions::new()
         .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
         .use_alpha(false);
@@ -111,7 +108,45 @@ fn scale_pixel_buffer_with_resizer(
         .resize(&src_view, &mut dst_image, &options)
         .map_err(|e| MediaError::VideoCapture(format!("fast_image_resize resize error: {e}")))?;
 
-    Ok((dst_width, dst_height, dst_image.into_vec()))
+    Ok((dst_width, dst_height, pool.wrap(dst_image.into_vec())))
+}
+
+/// Zero-copy pass-through when `dst == src` on an already-owned buffer; otherwise resizes into `pool`.
+pub fn scale_owned_pixel_buffer_pooled(
+    resizer: &mut Resizer,
+    pool: &Arc<FrameBufferPool>,
+    mut src_bytes: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    resolution: TargetResolution,
+    clamp_1080p: bool,
+) -> Result<(u32, u32, SharedFrameBuffer), MediaError> {
+    let expected_len = (src_width as usize)
+        .checked_mul(src_height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .unwrap_or(0);
+    if src_width == 0 || src_height == 0 || src_bytes.len() < expected_len {
+        return Err(MediaError::VideoCapture(format!(
+            "Invalid source 32bpp buffer for {src_width}x{src_height}: got {} bytes",
+            src_bytes.len()
+        )));
+    }
+
+    let (dst_width, dst_height) = resolution.compute_dimensions(src_width, src_height, clamp_1080p);
+    if dst_width == src_width && dst_height == src_height {
+        src_bytes.truncate(expected_len);
+        return Ok((dst_width, dst_height, pool.wrap(src_bytes)));
+    }
+
+    scale_pixel_buffer_pooled(
+        resizer,
+        pool,
+        &src_bytes[..expected_len],
+        src_width,
+        src_height,
+        resolution,
+        clamp_1080p,
+    )
 }
 
 #[inline(always)]
@@ -133,19 +168,6 @@ fn validate_even_yuv_dims(buf: &[u8], width: u32, height: u32) -> Result<(usize,
     Ok((w, h))
 }
 
-#[inline(always)]
-fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
-    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8
-}
-
-#[inline(always)]
-fn rgb_to_uv(r: i32, g: i32, b: i32) -> (u8, u8) {
-    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-    (u, v)
-}
-
-#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn convert_32bpp_to_yuv_420(
     src: &[u8],
     width: u32,
@@ -162,97 +184,71 @@ fn convert_32bpp_to_yuv_420(
         out_buf.resize(total, 0);
     }
 
+    let src_stride = (w * 4) as u32;
+    let src_slice = &src[..w * h * 4];
     let (y_plane, uv_planes) = out_buf.split_at_mut(y_len);
-    let half_w = w / 2;
-    let half_h = h / 2;
-    let row_stride = w * 4;
-    let r_idx = if is_bgra { 2 } else { 0 };
-    let b_idx = if is_bgra { 0 } else { 2 };
-
-    for (px_row, y_row) in src.chunks_exact(row_stride).zip(y_plane.chunks_exact_mut(w)) {
-        for (px, y_out) in px_row.chunks_exact(4).zip(y_row.iter_mut()) {
-            let r = i32::from(px[r_idx]);
-            let g = i32::from(px[1]);
-            let b = i32::from(px[b_idx]);
-            *y_out = rgb_to_y(r, g, b);
-        }
-    }
 
     if semi_planar_nv12 {
-        for by in 0..half_h {
-            let py = by * 2;
-            let row0 = &src[py * row_stride..(py + 1) * row_stride];
-            let row1 = &src[(py + 1) * row_stride..(py + 2) * row_stride];
-            let uv_row = &mut uv_planes[by * w..(by + 1) * w];
-
-            for ((c0, c1), uv_pair) in row0
-                .chunks_exact(8)
-                .zip(row1.chunks_exact(8))
-                .zip(uv_row.chunks_exact_mut(2))
-            {
-                let r_avg = (i32::from(c0[r_idx])
-                    + i32::from(c0[4 + r_idx])
-                    + i32::from(c1[r_idx])
-                    + i32::from(c1[4 + r_idx])
-                    + 2)
-                    >> 2;
-                let g_avg = (i32::from(c0[1])
-                    + i32::from(c0[5])
-                    + i32::from(c1[1])
-                    + i32::from(c1[5])
-                    + 2)
-                    >> 2;
-                let b_avg = (i32::from(c0[b_idx])
-                    + i32::from(c0[4 + b_idx])
-                    + i32::from(c1[b_idx])
-                    + i32::from(c1[4 + b_idx])
-                    + 2)
-                    >> 2;
-
-                let (u, v) = rgb_to_uv(r_avg, g_avg, b_avg);
-                uv_pair[0] = u;
-                uv_pair[1] = v;
-            }
-        }
+        let mut bi_planar = YuvBiPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: width,
+            uv_plane: BufferStoreMut::Borrowed(uv_planes),
+            uv_stride: width,
+            width,
+            height,
+        };
+        let res = if is_bgra {
+            bgra_to_yuv_nv12(
+                &mut bi_planar,
+                src_slice,
+                src_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+                YuvConversionMode::Balanced,
+            )
+        } else {
+            rgba_to_yuv_nv12(
+                &mut bi_planar,
+                src_slice,
+                src_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+                YuvConversionMode::Balanced,
+            )
+        };
+        res.map_err(|e| MediaError::Codec(format!("SIMD NV12 conversion error: {e}")))?;
     } else {
         let (u_plane, v_plane) = uv_planes.split_at_mut(uv_len);
-        for by in 0..half_h {
-            let py = by * 2;
-            let row0 = &src[py * row_stride..(py + 1) * row_stride];
-            let row1 = &src[(py + 1) * row_stride..(py + 2) * row_stride];
-            let u_row = &mut u_plane[by * half_w..(by + 1) * half_w];
-            let v_row = &mut v_plane[by * half_w..(by + 1) * half_w];
-
-            for (((c0, c1), u_out), v_out) in row0
-                .chunks_exact(8)
-                .zip(row1.chunks_exact(8))
-                .zip(u_row.iter_mut())
-                .zip(v_row.iter_mut())
-            {
-                let r_avg = (i32::from(c0[r_idx])
-                    + i32::from(c0[4 + r_idx])
-                    + i32::from(c1[r_idx])
-                    + i32::from(c1[4 + r_idx])
-                    + 2)
-                    >> 2;
-                let g_avg = (i32::from(c0[1])
-                    + i32::from(c0[5])
-                    + i32::from(c1[1])
-                    + i32::from(c1[5])
-                    + 2)
-                    >> 2;
-                let b_avg = (i32::from(c0[b_idx])
-                    + i32::from(c0[4 + b_idx])
-                    + i32::from(c1[b_idx])
-                    + i32::from(c1[4 + b_idx])
-                    + 2)
-                    >> 2;
-
-                let (u, v) = rgb_to_uv(r_avg, g_avg, b_avg);
-                *u_out = u;
-                *v_out = v;
-            }
-        }
+        let mut planar = YuvPlanarImageMut {
+            y_plane: BufferStoreMut::Borrowed(y_plane),
+            y_stride: width,
+            u_plane: BufferStoreMut::Borrowed(u_plane),
+            u_stride: width / 2,
+            v_plane: BufferStoreMut::Borrowed(v_plane),
+            v_stride: width / 2,
+            width,
+            height,
+        };
+        let res = if is_bgra {
+            bgra_to_yuv420(
+                &mut planar,
+                src_slice,
+                src_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+                YuvConversionMode::Balanced,
+            )
+        } else {
+            rgba_to_yuv420(
+                &mut planar,
+                src_slice,
+                src_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+                YuvConversionMode::Balanced,
+            )
+        };
+        res.map_err(|e| MediaError::Codec(format!("SIMD I420 conversion error: {e}")))?;
     }
 
     Ok(())
@@ -354,7 +350,7 @@ fn yuv420p_planar_to_32bpp(
     Ok(out)
 }
 
-#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn yuv420p_to_32bpp(
     y_plane: &[u8],
     u_plane: &[u8],
@@ -365,56 +361,36 @@ fn yuv420p_to_32bpp(
     out: &mut [u8],
     bgra: bool,
 ) {
-    #[inline(always)]
-    fn write_px(dst: &mut [u8], y_val: u8, c_r: i32, c_g: i32, c_b: i32, bgra: bool) {
-        let y = i32::from(y_val);
-        let r = (y + c_r).clamp(0, 255) as u8;
-        let g = (y - c_g).clamp(0, 255) as u8;
-        let b = (y + c_b).clamp(0, 255) as u8;
-        if bgra {
-            dst[0] = b;
-            dst[1] = g;
-            dst[2] = r;
-        } else {
-            dst[0] = r;
-            dst[1] = g;
-            dst[2] = b;
-        }
-        dst[3] = 255;
-    }
-
-    let half_w = width / 2;
-    let half_h = height / 2;
-    let out_stride = width * 4;
-
-    for by in 0..half_h {
-        let py = by * 2;
-        let y_row0 = &y_plane[py * strides.0..py * strides.0 + width];
-        let y_row1 = &y_plane[(py + 1) * strides.0..(py + 1) * strides.0 + width];
-        let u_row = &u_plane[by * strides.1..by * strides.1 + half_w];
-        let v_row = &v_plane[by * strides.2..by * strides.2 + half_w];
-        let (out_top, out_rest) =
-            out[py * out_stride..(py + 2) * out_stride].split_at_mut(out_stride);
-
-        for (((((y0, y1), &u_b), &v_b), top_px), bot_px) in y_row0
-            .chunks_exact(2)
-            .zip(y_row1.chunks_exact(2))
-            .zip(u_row.iter())
-            .zip(v_row.iter())
-            .zip(out_top.chunks_exact_mut(8))
-            .zip(out_rest.chunks_exact_mut(8))
-        {
-            let u = i32::from(u_b) - 128;
-            let v = i32::from(v_b) - 128;
-            let c_r = (359 * v + 128) >> 8;
-            let c_g = (88 * u + 183 * v + 128) >> 8;
-            let c_b = (454 * u + 128) >> 8;
-
-            write_px(&mut top_px[0..4], y0[0], c_r, c_g, c_b, bgra);
-            write_px(&mut top_px[4..8], y0[1], c_r, c_g, c_b, bgra);
-            write_px(&mut bot_px[0..4], y1[0], c_r, c_g, c_b, bgra);
-            write_px(&mut bot_px[4..8], y1[1], c_r, c_g, c_b, bgra);
-        }
+    let planar = YuvPlanarImage {
+        y_plane,
+        y_stride: strides.0 as u32,
+        u_plane,
+        u_stride: strides.1 as u32,
+        v_plane,
+        v_stride: strides.2 as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+    let out_stride = (width * 4) as u32;
+    let res = if bgra {
+        yuv420_to_bgra(
+            &planar,
+            out,
+            out_stride,
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+        )
+    } else {
+        yuv420_to_rgba(
+            &planar,
+            out,
+            out_stride,
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt601,
+        )
+    };
+    if let Err(err) = res {
+        warn!("SIMD YUV420->32bpp conversion error: {err}");
     }
 }
 
@@ -452,17 +428,281 @@ fn compute_keyframe_interval(fps: u8) -> u64 {
     }
 }
 
-fn usage_type_for_fps(fps: u8) -> UsageType {
+fn usage_type_for_fps(fps: u8) -> EUsageType {
     if fps <= 5 {
-        UsageType::ScreenContentRealTime
+        SCREEN_CONTENT_REAL_TIME
     } else {
-        UsageType::CameraVideoRealTime
+        CAMERA_VIDEO_REAL_TIME
     }
 }
 
-/// Tuned low-latency `OpenH264` VBR encoder with frame skipping disabled to prevent stutters.
+/// Direct low-level OpenH264 wrapper that initializes `SEncParamExt` with real multi-slice
+/// threading (`SM_FIXEDSLCNUM_SLICE`), disables unused webcam background detection, and writes
+/// contiguous Annex-B layers directly into the caller's `BytesMut`.
+#[allow(non_snake_case)]
+struct RawOpenH264Encoder {
+    api: OpenH264API,
+    encoder_ptr: *mut *const ISVCEncoderVtbl,
+    initialized: bool,
+    initialize_ext: unsafe extern "C" fn(*mut ISVCEncoder, *const SEncParamExt) -> c_int,
+    get_default_params: unsafe extern "C" fn(*mut ISVCEncoder, *mut SEncParamExt) -> c_int,
+    uninitialize: unsafe extern "C" fn(*mut ISVCEncoder) -> c_int,
+    encode_frame:
+        unsafe extern "C" fn(*mut ISVCEncoder, *const SSourcePicture, *mut SFrameBSInfo) -> c_int,
+    force_intra_frame: unsafe extern "C" fn(*mut ISVCEncoder, bool) -> c_int,
+    set_option: unsafe extern "C" fn(*mut ISVCEncoder, ENCODER_OPTION, *mut c_void) -> c_int,
+    #[cfg_attr(not(test), allow(dead_code))]
+    get_option: unsafe extern "C" fn(*mut ISVCEncoder, ENCODER_OPTION, *mut c_void) -> c_int,
+    bit_stream_info: SFrameBSInfo,
+}
+
+unsafe impl Send for RawOpenH264Encoder {}
+
+impl RawOpenH264Encoder {
+    fn new() -> Result<Self, MediaError> {
+        let api = OpenH264API::from_source();
+        let mut encoder_ptr = null::<ISVCEncoderVtbl>() as *mut *const ISVCEncoderVtbl;
+        let rc = unsafe { api.WelsCreateSVCEncoder(from_mut(&mut encoder_ptr)) };
+        if rc != 0 || encoder_ptr.is_null() {
+            return Err(MediaError::Codec(format!(
+                "OpenH264 WelsCreateSVCEncoder failed (rc={rc})"
+            )));
+        }
+
+        let vtbl = unsafe { &**encoder_ptr };
+        let missing = || MediaError::Codec("OpenH264 ISVCEncoder vtable missing fn".to_string());
+        let set_option = vtbl.SetOption.ok_or_else(missing)?;
+        let mut trace_level = WELS_LOG_QUIET;
+        unsafe {
+            let _ = set_option(
+                encoder_ptr,
+                ENCODER_OPTION_TRACE_LEVEL,
+                addr_of_mut!(trace_level).cast::<c_void>(),
+            );
+        }
+        Ok(Self {
+            api,
+            encoder_ptr,
+            initialized: false,
+            initialize_ext: vtbl.InitializeExt.ok_or_else(missing)?,
+            get_default_params: vtbl.GetDefaultParams.ok_or_else(missing)?,
+            uninitialize: vtbl.Uninitialize.ok_or_else(missing)?,
+            encode_frame: vtbl.EncodeFrame.ok_or_else(missing)?,
+            force_intra_frame: vtbl.ForceIntraFrame.ok_or_else(missing)?,
+            set_option,
+            get_option: vtbl.GetOption.ok_or_else(missing)?,
+            bit_stream_info: SFrameBSInfo::default(),
+        })
+    }
+
+    fn init_for_dimensions(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: u8,
+        target_bps: u32,
+        max_bps: u32,
+    ) -> Result<(), MediaError> {
+        let greater_dim = width.max(height);
+        let smaller_dim = width.min(height);
+        if greater_dim > 3840 || smaller_dim > 2160 {
+            return Err(MediaError::Codec(
+                "OpenH264 max resolution is 3840x2160 horizontal or 2160x3840 vertical".to_string(),
+            ));
+        }
+
+        unsafe {
+            if self.initialized {
+                let _ = (self.uninitialize)(self.encoder_ptr);
+                self.initialized = false;
+            }
+
+            let mut params = SEncParamExt::default();
+            let rc = (self.get_default_params)(self.encoder_ptr, &mut params);
+            if rc != 0 {
+                return Err(MediaError::Codec(format!(
+                    "OpenH264 GetDefaultParams failed (rc={rc})"
+                )));
+            }
+
+            let clamped_fps = fps.clamp(1, 60);
+            let wanted_threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 4) as u16)
+                .unwrap_or(2);
+            // OpenH264 requires enough macroblock rows per slice for SM_FIXEDSLCNUM_SLICE.
+            let effective_threads = if height >= u32::from(wanted_threads) * 32 {
+                wanted_threads
+            } else {
+                1
+            };
+
+            params.iUsageType = usage_type_for_fps(clamped_fps);
+            params.iPicWidth = width as c_int;
+            params.iPicHeight = height as c_int;
+            params.iTargetBitrate = target_bps as c_int;
+            params.iMaxBitrate = max_bps.max(target_bps) as c_int;
+            params.iRCMode = RC_QUALITY_MODE;
+            params.fMaxFrameRate = f32::from(clamped_fps);
+            params.bEnableFrameSkip = false;
+            params.bEnableDenoise = false;
+            params.bEnableBackgroundDetection = false;
+            if params.iUsageType == SCREEN_CONTENT_REAL_TIME {
+                params.bEnableAdaptiveQuant = false;
+            }
+            params.eSpsPpsIdStrategy = CONSTANT_ID;
+            params.iMultipleThreadIdc = effective_threads;
+            if effective_threads > 1 {
+                params.iLoopFilterDisableIdc = 2;
+            }
+
+            let layer = &mut params.sSpatialLayers[0];
+            layer.iVideoWidth = width as c_int;
+            layer.iVideoHeight = height as c_int;
+            layer.fFrameRate = f32::from(clamped_fps);
+            layer.iSpatialBitrate = target_bps as c_int;
+            layer.iMaxSpatialBitrate = max_bps.max(target_bps) as c_int;
+            if effective_threads > 1 {
+                layer.sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+                layer.sSliceArgument.uiSliceNum = u32::from(effective_threads);
+            } else {
+                layer.sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+                layer.sSliceArgument.uiSliceNum = 1;
+            }
+
+            let rc = (self.initialize_ext)(self.encoder_ptr, &params);
+            if rc != 0 {
+                return Err(MediaError::Codec(format!(
+                    "OpenH264 InitializeExt failed for {width}x{height} (rc={rc})"
+                )));
+            }
+            self.initialized = true;
+
+            let mut trace_level = WELS_LOG_QUIET;
+            let _ = (self.set_option)(
+                self.encoder_ptr,
+                ENCODER_OPTION_TRACE_LEVEL,
+                addr_of_mut!(trace_level).cast::<c_void>(),
+            );
+            let mut data_format = videoFormatI420;
+            let rc = (self.set_option)(
+                self.encoder_ptr,
+                ENCODER_OPTION_DATAFORMAT,
+                addr_of_mut!(data_format).cast::<c_void>(),
+            );
+            if rc != 0 {
+                return Err(MediaError::Codec(format!(
+                    "OpenH264 SetOption(DATAFORMAT) failed (rc={rc})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn force_intra_frame(&mut self) {
+        if self.initialized {
+            unsafe {
+                let _ = (self.force_intra_frame)(self.encoder_ptr, true);
+            }
+        }
+    }
+
+    unsafe fn set_option(&mut self, opt: ENCODER_OPTION, val: *mut c_void) -> c_int {
+        (self.set_option)(self.encoder_ptr, opt, val)
+    }
+
+    #[cfg(test)]
+    fn current_params(&self) -> Option<SEncParamExt> {
+        if !self.initialized {
+            return None;
+        }
+        let mut params = SEncParamExt::default();
+        let rc = unsafe {
+            (self.get_option)(
+                self.encoder_ptr,
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                addr_of_mut!(params).cast::<c_void>(),
+            )
+        };
+        (rc == 0).then_some(params)
+    }
+
+    fn encode_i420_into(
+        &mut self,
+        (y, u, v): (&[u8], &[u8], &[u8]),
+        width: u32,
+        height: u32,
+        ts_ms: i64,
+        out_annex_b: &mut BytesMut,
+    ) -> Result<bool, MediaError> {
+        let w = width as c_int;
+        let h = height as c_int;
+        let source = SSourcePicture {
+            iColorFormat: videoFormatI420,
+            iStride: [w, w / 2, w / 2, 0],
+            pData: [
+                y.as_ptr().cast_mut(),
+                u.as_ptr().cast_mut(),
+                v.as_ptr().cast_mut(),
+                null_mut(),
+            ],
+            iPicWidth: w,
+            iPicHeight: h,
+            uiTimeStamp: ts_ms,
+        };
+
+        let rc = unsafe { (self.encode_frame)(self.encoder_ptr, &source, &mut self.bit_stream_info) };
+        if rc != 0 {
+            return Err(MediaError::Codec(format!(
+                "OpenH264 EncodeFrame failed (rc={rc})"
+            )));
+        }
+
+        let layer_count = (self.bit_stream_info.iLayerNum.max(0) as usize)
+            .min(self.bit_stream_info.sLayerInfo.len());
+        let mut total_bytes = 0usize;
+        let mut layer_sizes = [0usize; 128];
+        for (idx, layer_size) in layer_sizes.iter_mut().enumerate().take(layer_count) {
+            let layer = &self.bit_stream_info.sLayerInfo[idx];
+            let nal_count = layer.iNalCount.max(0) as usize;
+            if nal_count == 0 || layer.pNalLengthInByte.is_null() || layer.pBsBuf.is_null() {
+                continue;
+            }
+            let nal_lens = unsafe { std::slice::from_raw_parts(layer.pNalLengthInByte, nal_count) };
+            let bytes: usize = nal_lens.iter().map(|&n| n.max(0) as usize).sum();
+            *layer_size = bytes;
+            total_bytes += bytes;
+        }
+
+        out_annex_b.reserve(total_bytes);
+        for (idx, &bytes) in layer_sizes.iter().enumerate().take(layer_count) {
+            if bytes == 0 {
+                continue;
+            }
+            let layer = &self.bit_stream_info.sLayerInfo[idx];
+            let slice = unsafe { std::slice::from_raw_parts(layer.pBsBuf, bytes) };
+            out_annex_b.extend_from_slice(slice);
+        }
+
+        let is_keyframe = self.bit_stream_info.eFrameType == videoFrameTypeIDR
+            || self.bit_stream_info.eFrameType == videoFrameTypeI;
+        Ok(is_keyframe)
+    }
+}
+
+impl Drop for RawOpenH264Encoder {
+    fn drop(&mut self) {
+        unsafe {
+            if self.initialized {
+                let _ = (self.uninitialize)(self.encoder_ptr);
+            }
+            self.api.WelsDestroySVCEncoder(self.encoder_ptr);
+        }
+    }
+}
+
+/// Tuned low-latency `OpenH264` VBR encoder with real multi-slice threading and frame skipping disabled.
 pub struct H264VideoEncoder {
-    encoder: Encoder,
+    encoder: RawOpenH264Encoder,
     fps: u8,
     bitrate_bps: u32,
     max_bitrate_bps: u32,
@@ -475,29 +715,11 @@ pub struct H264VideoEncoder {
 }
 
 impl H264VideoEncoder {
-    fn build_encoder(fps: u8, bitrate_bps: u32) -> Result<Encoder, MediaError> {
-        let clamped_fps = fps.clamp(1, 60);
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(2, 4) as u16)
-            .unwrap_or(2);
-        let config = EncoderConfig::new()
-            .set_bitrate_bps(bitrate_bps.clamp(200_000, 30_000_000))
-            .max_frame_rate(clamped_fps as f32)
-            .enable_skip_frame(false)
-            .rate_control_mode(RateControlMode::Quality)
-            .sps_pps_strategy(SpsPpsStrategy::ConstantId)
-            .usage_type(usage_type_for_fps(clamped_fps))
-            .set_multiple_thread_idc(threads);
-
-        Encoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(|e| MediaError::Codec(format!("OpenH264 encoder init error: {e}")))
-    }
-
     pub fn new(fps: u8, bitrate_bps: u32, max_bitrate_bps: u32) -> Result<Self, MediaError> {
         let clamped_fps = fps.clamp(1, 60);
         let clamped_bps = bitrate_bps.clamp(200_000, 30_000_000);
         let clamped_max = max_bitrate_bps.max(clamped_bps).clamp(200_000, 35_000_000);
-        let encoder = Self::build_encoder(clamped_fps, clamped_bps)?;
+        let encoder = RawOpenH264Encoder::new()?;
 
         Ok(Self {
             encoder,
@@ -523,25 +745,24 @@ impl H264VideoEncoder {
             iBitrate: self.max_bitrate_bps as i32,
         };
         let (rc1, rc2) = unsafe {
-            let raw = self.encoder.raw_api();
             if self.bitrate_bps >= prev_target {
-                let r1 = raw.set_option(
+                let r1 = self.encoder.set_option(
                     ENCODER_OPTION_MAX_BITRATE,
-                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
+                    addr_of_mut!(max_info).cast::<c_void>(),
                 );
-                let r2 = raw.set_option(
+                let r2 = self.encoder.set_option(
                     ENCODER_OPTION_BITRATE,
-                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
+                    addr_of_mut!(target_info).cast::<c_void>(),
                 );
                 (r1, r2)
             } else {
-                let r1 = raw.set_option(
+                let r1 = self.encoder.set_option(
                     ENCODER_OPTION_BITRATE,
-                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
+                    addr_of_mut!(target_info).cast::<c_void>(),
                 );
-                let r2 = raw.set_option(
+                let r2 = self.encoder.set_option(
                     ENCODER_OPTION_MAX_BITRATE,
-                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
+                    addr_of_mut!(max_info).cast::<c_void>(),
                 );
                 (r1, r2)
             }
@@ -565,23 +786,30 @@ impl H264VideoEncoder {
         &self.yuv_scratch
     }
 
-    fn encode_yuv_scratch(
+    #[cfg(test)]
+    fn current_enc_params(&self) -> Option<SEncParamExt> {
+        self.encoder.current_params()
+    }
+
+    fn encode_yuv_scratch_into(
         &mut self,
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
-    ) -> Result<Vec<u8>, MediaError> {
-        if self.last_dimensions.is_some_and(|dim| dim != (width, height)) {
-            self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
-            self.last_dimensions = None;
+        out_annex_b: &mut BytesMut,
+    ) -> Result<bool, MediaError> {
+        if self.last_dimensions != Some((width, height)) {
+            self.encoder.init_for_dimensions(
+                width,
+                height,
+                self.fps,
+                self.bitrate_bps,
+                self.max_bitrate_bps,
+            )?;
+            self.last_dimensions = Some((width, height));
             self.last_ts_ms = None;
-            self.force_next_idr = true;
-        }
-        let was_uninitialized = self.last_dimensions.is_none();
-
-        if self.last_dimensions.is_some()
-            && (self.force_next_idr || self.frame_count.is_multiple_of(self.keyframe_interval))
-        {
+            self.force_next_idr = false;
+        } else if self.force_next_idr || self.frame_count.is_multiple_of(self.keyframe_interval) {
             self.encoder.force_intra_frame();
             self.force_next_idr = false;
         }
@@ -592,7 +820,6 @@ impl H264VideoEncoder {
         let uv_len = y_len / 4;
         let (y_plane, uv_planes) = self.yuv_scratch.split_at(y_len);
         let (u_plane, v_plane) = uv_planes.split_at(uv_len);
-        let yuv_slices = YUVSlices::new((y_plane, u_plane, v_plane), (w, h), (w, w / 2, w / 2));
 
         let ts_ms = match timestamp_us {
             Some(us) => {
@@ -604,20 +831,18 @@ impl H264VideoEncoder {
             }
             None => (self.frame_count * 1000) / u64::from(self.fps.max(1)),
         };
-        let bitstream = self
-            .encoder
-            .encode_at(&yuv_slices, Timestamp::from_millis(ts_ms))
-            .map_err(|e| MediaError::Codec(format!("OpenH264 encode error: {e}")))?;
-        let encoded_bytes = bitstream.to_vec();
 
-        self.last_dimensions = Some((width, height));
-        if was_uninitialized {
-            self.apply_bitrate_options(self.bitrate_bps);
-        }
+        let is_keyframe = self.encoder.encode_i420_into(
+            (y_plane, u_plane, v_plane),
+            width,
+            height,
+            ts_ms as i64,
+            out_annex_b,
+        )?;
+
         self.last_ts_ms = Some(ts_ms);
-        self.force_next_idr = false;
         self.frame_count = self.frame_count.wrapping_add(1);
-        Ok(encoded_bytes)
+        Ok(is_keyframe)
     }
 
     pub fn encode_rgba(
@@ -627,7 +852,9 @@ impl H264VideoEncoder {
         height: u32,
     ) -> Result<Vec<u8>, MediaError> {
         rgba_to_yuv420p_into(rgba, width, height, &mut self.yuv_scratch)?;
-        self.encode_yuv_scratch(width, height, None)
+        let mut out = BytesMut::new();
+        let _ = self.encode_yuv_scratch_into(width, height, None, &mut out)?;
+        Ok(out.to_vec())
     }
 
     pub fn encode_bgra(
@@ -637,18 +864,24 @@ impl H264VideoEncoder {
         height: u32,
     ) -> Result<Vec<u8>, MediaError> {
         bgra_to_yuv420p_into(bgra, width, height, &mut self.yuv_scratch)?;
-        self.encode_yuv_scratch(width, height, None)
+        let mut out = BytesMut::new();
+        let _ = self.encode_yuv_scratch_into(width, height, None, &mut out)?;
+        Ok(out.to_vec())
     }
 }
 
 impl VideoEncoder for H264VideoEncoder {
-    fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError> {
+    fn encode_frame_into(
+        &mut self,
+        frame: &RawVideoFrame,
+        out_annex_b: &mut BytesMut,
+    ) -> Result<bool, MediaError> {
         if frame.is_bgra {
             bgra_to_yuv420p_into(&frame.rgba, frame.width, frame.height, &mut self.yuv_scratch)?;
         } else {
             rgba_to_yuv420p_into(&frame.rgba, frame.width, frame.height, &mut self.yuv_scratch)?;
         }
-        self.encode_yuv_scratch(frame.width, frame.height, Some(frame.timestamp_us))
+        self.encode_yuv_scratch_into(frame.width, frame.height, Some(frame.timestamp_us), out_annex_b)
     }
 
     fn request_keyframe(&mut self) {
@@ -670,7 +903,6 @@ impl VideoEncoder for H264VideoEncoder {
         self.bitrate_bps = clamped_target;
         self.max_bitrate_bps = clamped_max;
         if self.last_dimensions.is_none() {
-            self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
             return Ok(());
         }
 
@@ -686,14 +918,13 @@ impl VideoEncoder for H264VideoEncoder {
         self.fps = clamped;
         self.keyframe_interval = compute_keyframe_interval(clamped);
         if self.last_dimensions.is_none() {
-            self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
             return Ok(());
         }
         let mut fps_f32 = f32::from(clamped);
         let rc = unsafe {
-            self.encoder.raw_api().set_option(
+            self.encoder.set_option(
                 ENCODER_OPTION_FRAME_RATE,
-                std::ptr::addr_of_mut!(fps_f32).cast::<c_void>(),
+                addr_of_mut!(fps_f32).cast::<c_void>(),
             )
         };
         if rc != 0 {
@@ -1142,7 +1373,7 @@ enum FrameSample {
         height: u32,
         source_width: u32,
         source_height: u32,
-        bytes: Vec<u8>,
+        bytes: SharedFrameBuffer,
         is_bgra: bool,
     },
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1233,6 +1464,7 @@ impl ResolvedCaptureTarget {
     fn poll_scaled(
         &mut self,
         resizer: &mut Resizer,
+        pool: &Arc<FrameBufferPool>,
         resolution: TargetResolution,
         clamp_1080p: bool,
     ) -> Result<FrameSample, MediaError> {
@@ -1240,7 +1472,7 @@ impl ResolvedCaptureTarget {
             #[cfg(target_os = "windows")]
             Self::Monitor { xcap_monitor, dxgi } => {
                 if let Some(dupl) = dxgi.as_mut() {
-                    match dupl.poll_scaled_frame(resizer, resolution, clamp_1080p) {
+                    match dupl.poll_scaled_frame(resizer, pool, resolution, clamp_1080p) {
                         Ok(CapturePoll::Frame(width, height, bytes)) => {
                             let (source_width, source_height) =
                                 dupl.source_dims().unwrap_or((width, height));
@@ -1265,9 +1497,10 @@ impl ResolvedCaptureTarget {
                 .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
                 let (source_width, source_height) = (img.width(), img.height());
-                let (w, h, rgba) = scale_rgba_frame_with_resizer(
+                let (w, h, rgba) = scale_owned_pixel_buffer_pooled(
                     resizer,
-                    img.as_raw(),
+                    pool,
+                    img.into_raw(),
                     source_width,
                     source_height,
                     resolution,
@@ -1290,9 +1523,10 @@ impl ResolvedCaptureTarget {
                 .map_err(|_| MediaError::VideoCapture("Monitor::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Monitor capture failed: {e}")))?;
                 let (source_width, source_height) = (img.width(), img.height());
-                let (w, h, rgba) = scale_rgba_frame_with_resizer(
+                let (w, h, rgba) = scale_owned_pixel_buffer_pooled(
                     resizer,
-                    img.as_raw(),
+                    pool,
+                    img.into_raw(),
                     source_width,
                     source_height,
                     resolution,
@@ -1309,7 +1543,7 @@ impl ResolvedCaptureTarget {
             }
             #[cfg(target_os = "windows")]
             Self::Win32Window(capturer) => {
-                match capturer.poll_scaled_frame(resizer, resolution, clamp_1080p)? {
+                match capturer.poll_scaled_frame(resizer, pool, resolution, clamp_1080p)? {
                     CapturePoll::Frame(width, height, bytes) => {
                         let (source_width, source_height) =
                             capturer.last_source_dims().unwrap_or((width, height));
@@ -1333,9 +1567,10 @@ impl ResolvedCaptureTarget {
                 .map_err(|_| MediaError::VideoCapture("Window::capture_image panicked".to_string()))?
                 .map_err(|e| MediaError::VideoCapture(format!("Window capture failed: {e}")))?;
                 let (source_width, source_height) = (img.width(), img.height());
-                let (w, h, rgba) = scale_rgba_frame_with_resizer(
+                let (w, h, rgba) = scale_owned_pixel_buffer_pooled(
                     resizer,
-                    img.as_raw(),
+                    pool,
+                    img.into_raw(),
                     source_width,
                     source_height,
                     resolution,
@@ -1363,23 +1598,25 @@ pub fn capture_preview_with_source(target: &CaptureTarget) -> Result<PreviewCapt
     }
     let mut resolved = ResolvedCaptureTarget::resolve(target)?;
     let mut resizer = Resizer::new();
-    match resolved.poll_scaled(&mut resizer, TargetResolution::R720p, true)? {
+    let pool = FrameBufferPool::new();
+    match resolved.poll_scaled(&mut resizer, &pool, TargetResolution::R720p, true)? {
         FrameSample::New {
             width,
             height,
             source_width,
             source_height,
-            mut bytes,
+            bytes,
             is_bgra,
         } => {
+            let mut bgra = bytes.into_vec_or_clone();
             if !is_bgra {
-                rgba_to_bgra_in_place(&mut bytes);
+                rgba_to_bgra_in_place(&mut bgra);
             }
             Ok(PreviewCapture {
                 preview_width: width,
                 preview_height: height,
                 source_dims: (source_width, source_height),
-                bgra: bytes,
+                bgra,
             })
         }
         FrameSample::Unchanged => Err(MediaError::VideoCapture(
@@ -1439,9 +1676,10 @@ impl VideoCapturer for NativeVideoCapturer {
                 info!(?target, fps = clamped_fps, ?resolution, "Started native video capture");
 
                 let mut resizer = Resizer::new();
+                let pool = FrameBufferPool::new();
                 let start = Instant::now();
                 let mut next_tick = Instant::now() + frame_interval;
-                let mut last_frame: Option<(u32, u32, Vec<u8>, bool)> = None;
+                let mut last_frame: Option<(u32, u32, SharedFrameBuffer, bool)> = None;
                 let mut last_sent_at = Instant::now() - Duration::from_secs(1);
                 let mut consecutive_window_errors: u32 = 0;
                 let mut first_window_error_at: Option<Instant> = None;
@@ -1477,13 +1715,13 @@ impl VideoCapturer for NativeVideoCapturer {
                     }
 
                     let poll_res = resolved
-                        .poll_scaled(&mut resizer, resolution, false)
+                        .poll_scaled(&mut resizer, &pool, resolution, false)
                         .or_else(|err| {
                             if matches!(err, MediaError::SourceNotFound(_)) {
                                 return Err(err);
                             }
                             resolved = ResolvedCaptureTarget::resolve(&target)?;
-                            resolved.poll_scaled(&mut resizer, resolution, false)
+                            resolved.poll_scaled(&mut resizer, &pool, resolution, false)
                         });
 
                     match poll_res {
@@ -1684,15 +1922,272 @@ mod tests {
         assert!(decoder.decode_annex_b_bgra(&f2).expect("dec f2").is_some());
 
         // Verify 5 FPS reading mode uses ScreenContentRealTime + 12-frame GOP while 15/30/60 stay fast
-        assert!(matches!(usage_type_for_fps(5), UsageType::ScreenContentRealTime));
-        assert!(matches!(usage_type_for_fps(15), UsageType::CameraVideoRealTime));
-        assert!(matches!(usage_type_for_fps(30), UsageType::CameraVideoRealTime));
-        assert!(matches!(usage_type_for_fps(60), UsageType::CameraVideoRealTime));
+        assert_eq!(usage_type_for_fps(5), SCREEN_CONTENT_REAL_TIME);
+        assert_eq!(usage_type_for_fps(15), CAMERA_VIDEO_REAL_TIME);
+        assert_eq!(usage_type_for_fps(30), CAMERA_VIDEO_REAL_TIME);
+        assert_eq!(usage_type_for_fps(60), CAMERA_VIDEO_REAL_TIME);
         let mut reader_enc = H264VideoEncoder::new(5, 800_000, 900_000).expect("init 5fps encoder");
         assert_eq!(reader_enc.keyframe_interval, 12);
         let rf0 = reader_enc.encode_bgra(&bgra, width, height).expect("encode 5fps f0");
         assert!(is_h264_keyframe(&rf0));
         assert!(decoder.decode_annex_b_bgra(&rf0).expect("dec 5fps f0").is_some());
+    }
+
+    #[test]
+    fn test_openh264_multislice_and_bgd_config() {
+        let width = 1280u32;
+        let height = 720u32;
+        let bgra = vec![128u8; (width * height * 4) as usize];
+        let expected_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4) as u16)
+            .unwrap_or(2);
+
+        let mut enc60 = H264VideoEncoder::new(60, 3_500_000, 4_000_000).expect("init 60fps");
+        let mut out = BytesMut::new();
+        let frame = RawVideoFrame {
+            width,
+            height,
+            rgba: bgra.clone().into(),
+            is_bgra: true,
+            timestamp_us: 0,
+        };
+        let is_kf0 = enc60.encode_frame_into(&frame, &mut out).expect("encode f0");
+        assert!(is_kf0);
+        assert!(is_h264_keyframe(&out));
+
+        let params = enc60.current_enc_params().expect("read active SEncParamExt");
+        assert_eq!(params.iUsageType, CAMERA_VIDEO_REAL_TIME);
+        assert!(!params.bEnableBackgroundDetection);
+        assert_eq!(params.iMultipleThreadIdc, expected_threads);
+        assert_eq!(
+            params.sSpatialLayers[0].sSliceArgument.uiSliceMode,
+            SM_FIXEDSLCNUM_SLICE
+        );
+        assert_eq!(
+            params.sSpatialLayers[0].sSliceArgument.uiSliceNum,
+            u32::from(expected_threads)
+        );
+
+        // Next frame should be a P-frame (O(1) keyframe flag agrees with Annex-B scan)
+        out.clear();
+        let is_kf1 = enc60.encode_frame_into(&frame, &mut out).expect("encode f1");
+        assert!(!is_kf1);
+        assert!(!is_h264_keyframe(&out));
+
+        // 5 FPS reading mode keeps ScreenContentRealTime with multi-slice enabled too
+        let mut enc5 = H264VideoEncoder::new(5, 800_000, 900_000).expect("init 5fps");
+        out.clear();
+        let _ = enc5.encode_frame_into(&frame, &mut out).expect("encode 5fps");
+        let params5 = enc5.current_enc_params().expect("read 5fps SEncParamExt");
+        assert_eq!(params5.iUsageType, SCREEN_CONTENT_REAL_TIME);
+        assert!(!params5.bEnableBackgroundDetection);
+        assert_eq!(params5.iMultipleThreadIdc, expected_threads);
+    }
+
+    #[test]
+    fn test_simd_yuv_roundtrip_and_parity() {
+        let w = 640u32;
+        let h = 360u32;
+        let rgba = MockVideoCapturer::generate_smpte_bars(w, h, 3);
+        let mut bgra = rgba.clone();
+        rgba_to_bgra_in_place(&mut bgra);
+
+        let mut i420_from_rgba = Vec::new();
+        let mut i420_from_bgra = Vec::new();
+        rgba_to_yuv420p_into(&rgba, w, h, &mut i420_from_rgba).expect("rgba->i420");
+        bgra_to_yuv420p_into(&bgra, w, h, &mut i420_from_bgra).expect("bgra->i420");
+        assert_eq!(i420_from_rgba, i420_from_bgra);
+
+        let mut nv12_from_rgba = Vec::new();
+        let mut nv12_from_bgra = Vec::new();
+        rgba_to_nv12_into(&rgba, w, h, &mut nv12_from_rgba).expect("rgba->nv12");
+        bgra_to_nv12_into(&bgra, w, h, &mut nv12_from_bgra).expect("bgra->nv12");
+        assert_eq!(nv12_from_rgba, nv12_from_bgra);
+
+        // Round-trip BGRA -> I420 -> BGRA stays close on SMPTE bar interiors
+        let restored = yuv420p_planar_to_bgra(&i420_from_bgra, w, h).expect("i420->bgra");
+        assert_eq!(restored.len(), bgra.len());
+        let sample_px = ((h / 2) * w + (w / 14)) as usize * 4;
+        for ch in 0..3 {
+            let diff = (i32::from(restored[sample_px + ch]) - i32::from(bgra[sample_px + ch])).abs();
+            assert!(diff <= 6, "channel {ch} diff too high: {diff}");
+        }
+        assert_eq!(restored[sample_px + 3], 255);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_frame_generation_1080p() {
+        use shared_protocol::{VideoFrameHeader, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN};
+
+        let w = 1920u32;
+        let h = 1080u32;
+        let iters = 120usize;
+
+        // Pre-generate 2 moving 1080p BGRA frames + 1440p source for scale bench
+        let mut frames_1080p: Vec<Vec<u8>> = (0..4u64)
+            .map(|i| {
+                let mut f = MockVideoCapturer::generate_smpte_bars(w, h, i * 17);
+                rgba_to_bgra_in_place(&mut f);
+                f
+            })
+            .collect();
+        let mut src_1440p = MockVideoCapturer::generate_smpte_bars(2560, 1440, 5);
+        rgba_to_bgra_in_place(&mut src_1440p);
+
+        // 1. BGRA -> I420
+        let mut i420 = Vec::new();
+        bgra_to_yuv420p_into(&frames_1080p[0], w, h, &mut i420).unwrap();
+        let t0 = Instant::now();
+        for i in 0..iters {
+            bgra_to_yuv420p_into(&frames_1080p[i % frames_1080p.len()], w, h, &mut i420).unwrap();
+        }
+        let yuv_i420_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 2. BGRA -> NV12
+        let mut nv12 = Vec::new();
+        bgra_to_nv12_into(&frames_1080p[0], w, h, &mut nv12).unwrap();
+        let t0 = Instant::now();
+        for i in 0..iters {
+            bgra_to_nv12_into(&frames_1080p[i % frames_1080p.len()], w, h, &mut nv12).unwrap();
+        }
+        let yuv_nv12_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 3. I420 -> BGRA (viewer side)
+        let mut bgra_out = vec![0u8; (w * h * 4) as usize];
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            yuv420p_to_32bpp(
+                &i420[..y_len],
+                &i420[y_len..y_len + uv_len],
+                &i420[y_len + uv_len..y_len + uv_len * 2],
+                w as usize,
+                h as usize,
+                (w as usize, (w / 2) as usize, (w / 2) as usize),
+                &mut bgra_out,
+                true,
+            );
+        }
+        let i420_to_bgra_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 4. Pooled passthrough & 1440p -> 1080p resize
+        let mut resizer = Resizer::new();
+        let pool = FrameBufferPool::new();
+        let t0 = Instant::now();
+        for i in 0..iters {
+            let (_, _, buf) = scale_pixel_buffer_pooled(
+                &mut resizer,
+                &pool,
+                &frames_1080p[i % frames_1080p.len()],
+                w,
+                h,
+                TargetResolution::R1080p,
+                false,
+            )
+            .unwrap();
+            drop(buf);
+        }
+        let passthrough_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let (_, _, buf) = scale_pixel_buffer_pooled(
+                &mut resizer,
+                &pool,
+                &src_1440p,
+                2560,
+                1440,
+                TargetResolution::R1080p,
+                false,
+            )
+            .unwrap();
+            drop(buf);
+        }
+        let scale_1440_to_1080_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 5. Full pipeline: BGRA -> I420 -> OpenH264 1080p60 (moving) -> QUIC packet
+        let mut enc60 = H264VideoEncoder::new(60, 6_166_000, 7_000_000).unwrap();
+        let mut pkt_buf = BytesMut::with_capacity(256 * 1024);
+        let shared_frames: Vec<RawVideoFrame> = frames_1080p
+            .drain(..)
+            .enumerate()
+            .map(|(idx, data)| RawVideoFrame {
+                width: w,
+                height: h,
+                rgba: data.into(),
+                is_bgra: true,
+                timestamp_us: idx as u64 * 16_666,
+            })
+            .collect();
+        // Warmup
+        pkt_buf.resize(VIDEO_HEADER_LEN, 0);
+        let _ = enc60.encode_frame_into(&shared_frames[0], &mut pkt_buf).unwrap();
+        pkt_buf.clear();
+
+        let sender_id = uuid::Uuid::new_v4();
+        let t0 = Instant::now();
+        for i in 0..iters {
+            let f = &shared_frames[i % shared_frames.len()];
+            pkt_buf.resize(VIDEO_HEADER_LEN, 0);
+            let is_kf = enc60.encode_frame_into(f, &mut pkt_buf).unwrap();
+            let hdr = VideoFrameHeader {
+                sender_id,
+                frame_seq: i as u32,
+                timestamp_us: i as u64 * 16_666,
+                width: w as u16,
+                height: h as u16,
+                flags: VIDEO_FLAG_H264 | if is_kf { VIDEO_FLAG_KEYFRAME } else { 0 },
+            };
+            hdr.write_prefix(&mut pkt_buf[..VIDEO_HEADER_LEN]).unwrap();
+            let _pkt = pkt_buf.split().freeze();
+        }
+        let full_60_moving_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 6. Full pipeline 1080p60 static
+        let t0 = Instant::now();
+        for i in 0..iters {
+            pkt_buf.resize(VIDEO_HEADER_LEN, 0);
+            let is_kf = enc60.encode_frame_into(&shared_frames[0], &mut pkt_buf).unwrap();
+            let hdr = VideoFrameHeader {
+                sender_id,
+                frame_seq: (iters + i) as u32,
+                timestamp_us: (iters + i) as u64 * 16_666,
+                width: w as u16,
+                height: h as u16,
+                flags: VIDEO_FLAG_H264 | if is_kf { VIDEO_FLAG_KEYFRAME } else { 0 },
+            };
+            hdr.write_prefix(&mut pkt_buf[..VIDEO_HEADER_LEN]).unwrap();
+            let _pkt = pkt_buf.split().freeze();
+        }
+        let full_60_static_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // 7. Full pipeline 1080p5 (Texto Nitido)
+        let mut enc5 = H264VideoEncoder::new(5, 1_533_000, 1_800_000).unwrap();
+        let iters_5 = 30usize;
+        let t0 = Instant::now();
+        for i in 0..iters_5 {
+            let f = &shared_frames[i % shared_frames.len()];
+            pkt_buf.resize(VIDEO_HEADER_LEN, 0);
+            let _ = enc5.encode_frame_into(f, &mut pkt_buf).unwrap();
+            pkt_buf.clear();
+        }
+        let full_5_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters_5 as f64;
+
+        let active_threads = enc60
+            .current_enc_params()
+            .map_or(0, |p| p.iMultipleThreadIdc);
+
+        println!("=== 1080p Frame Generation Benchmark ({iters} frames, OpenH264 threads={active_threads}) ===");
+        println!("  BGRA -> I420 (SIMD)           : {yuv_i420_ms:.2} ms/frame");
+        println!("  BGRA -> NV12 (SIMD)           : {yuv_nv12_ms:.2} ms/frame");
+        println!("  I420 -> BGRA (SIMD viewer)    : {i420_to_bgra_ms:.2} ms/frame");
+        println!("  1080p pooled passthrough      : {passthrough_ms:.2} ms/frame");
+        println!("  1440p -> 1080p Bilinear pool  : {scale_1440_to_1080_ms:.2} ms/frame");
+        println!("  Full 1080p60 moving -> packet : {full_60_moving_ms:.2} ms/frame ({:.1} FPS max)", 1000.0 / full_60_moving_ms);
+        println!("  Full 1080p60 static -> packet : {full_60_static_ms:.2} ms/frame ({:.1} FPS max)", 1000.0 / full_60_static_ms);
+        println!("  Full 1080p5 Texto Nitido      : {full_5_ms:.2} ms/frame ({:.1} FPS max)", 1000.0 / full_5_ms);
     }
 
     #[tokio::test]

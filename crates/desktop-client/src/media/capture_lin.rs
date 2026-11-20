@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions};
@@ -17,8 +18,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::media::traits::{MediaError, RawVideoFrame};
-use crate::media::video::{scale_bgra_frame_with_resizer, scale_rgba_frame_with_resizer};
+use crate::media::traits::{FrameBufferPool, MediaError, RawVideoFrame};
+use crate::media::video::scale_pixel_buffer_pooled;
 
 /// Opens an XDG Desktop Portal ScreenCast session and streams PipeWire video frames into `tx`.
 pub fn start_wayland_portal_capture(
@@ -89,6 +90,8 @@ async fn open_portal_screencast() -> Result<(OwnedFd, u32), MediaError> {
 struct PwVideoState {
     format: Option<VideoInfoRaw>,
     resizer: Resizer,
+    pool: Arc<FrameBufferPool>,
+    stride_scratch: Vec<u8>,
     resolution: TargetResolution,
     min_interval: Duration,
     last_sent: Instant,
@@ -129,6 +132,8 @@ fn run_pipewire_video_loop(
     let state = Rc::new(RefCell::new(PwVideoState {
         format: None,
         resizer: Resizer::new(),
+        pool: FrameBufferPool::new(),
+        stride_scratch: Vec::new(),
         resolution,
         min_interval: Duration::from_micros(1_000_000 / u64::from(fps.clamp(1, 60))),
         last_sent: Instant::now() - Duration::from_secs(1),
@@ -209,33 +214,47 @@ fn run_pipewire_video_loop(
             let w = info.size().width;
             let h = info.size().height;
             let row_bytes = (w as usize) * 4;
-            if w < 2 || h < 2 || size < row_bytes * (h as usize) {
+            let expected_len = row_bytes * (h as usize);
+            if w < 2 || h < 2 || size < expected_len {
                 return;
-            }
-
-            let mut packed = Vec::with_capacity(row_bytes * (h as usize));
-            if stride == 0 || stride == row_bytes {
-                packed.extend_from_slice(&slice[..row_bytes * (h as usize)]);
-            } else {
-                for row in 0..(h as usize) {
-                    let off = row * stride;
-                    if off + row_bytes <= slice.len() {
-                        packed.extend_from_slice(&slice[off..off + row_bytes]);
-                    }
-                }
             }
 
             let res_choice = st.resolution;
             let is_bgra = matches!(info.format(), VideoFormat::BGRA | VideoFormat::BGRx);
-            let scaled = if is_bgra {
-                scale_bgra_frame_with_resizer(&mut st.resizer, &packed, w, h, res_choice, false)
-                    .map(|(dw, dh, b)| (dw, dh, b, true))
+            let st_ref = &mut *st;
+            let scaled = if stride == 0 || stride == row_bytes {
+                scale_pixel_buffer_pooled(
+                    &mut st_ref.resizer,
+                    &st_ref.pool,
+                    &slice[..expected_len],
+                    w,
+                    h,
+                    res_choice,
+                    false,
+                )
             } else {
-                scale_rgba_frame_with_resizer(&mut st.resizer, &packed, w, h, res_choice, false)
-                    .map(|(dw, dh, r)| (dw, dh, r, false))
+                st_ref.stride_scratch.clear();
+                st_ref.stride_scratch.reserve(expected_len);
+                for row in 0..(h as usize) {
+                    let off = row * stride;
+                    if off + row_bytes <= slice.len() {
+                        st_ref
+                            .stride_scratch
+                            .extend_from_slice(&slice[off..off + row_bytes]);
+                    }
+                }
+                scale_pixel_buffer_pooled(
+                    &mut st_ref.resizer,
+                    &st_ref.pool,
+                    &st_ref.stride_scratch,
+                    w,
+                    h,
+                    res_choice,
+                    false,
+                )
             };
 
-            if let Ok((width, height, bytes, is_bgra)) = scaled {
+            if let Ok((width, height, bytes)) = scaled {
                 st.last_sent = now;
                 let frame = RawVideoFrame {
                     width,

@@ -53,19 +53,7 @@ pub fn is_significant_throttle(
     fps_reduced || bitrate_reduced
 }
 
-/// Converts a tightly-packed BGRA8 buffer into a cached GPUI `RenderImage`.
-pub fn bgra_to_render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
-    if bgra.len() != expected {
-        return None;
-    }
-    let buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(width, height, bgra)?;
-    let frame = image::Frame::new(buf);
-    Some(Arc::new(RenderImage::new(smallvec::smallvec![frame])))
-}
+pub use crate::media::pipeline::bgra_to_render_image;
 
 /// Holds the current GPU-uploaded `RenderImage` for a video feed and drops stale textures.
 #[derive(Default)]
@@ -79,8 +67,7 @@ impl VideoSlot {
         if frame.generation == self.last_generation && self.image.is_some() {
             return;
         }
-        if let Some(next_img) = bgra_to_render_image(frame.width, frame.height, frame.bgra.clone())
-        {
+        if let Some(next_img) = frame.image.clone() {
             if let Some(prev) = self.image.replace(next_img) {
                 let _ = window.drop_image(prev);
             }

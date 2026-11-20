@@ -405,6 +405,16 @@ impl SfuClient {
         }
 
         let packet = encode_video_packet(header, payload)?;
+        self.send_video_packet(packet, is_keyframe)
+    }
+
+    /// Enqueues a pre-framed binary video packet (`VIDEO_HEADER_LEN + annex_b`) directly over QUIC with zero extra copies.
+    pub fn send_video_packet(&self, packet: Bytes, is_keyframe: bool) -> Result<bool> {
+        let current = self.in_flight_video.load(Ordering::Acquire);
+        if current >= MAX_IN_FLIGHT_VIDEO_STREAMS && !is_keyframe {
+            return Ok(false);
+        }
+
         let len = packet.len() as u64;
         let conn = self.conn.clone();
         let in_flight = Arc::clone(&self.in_flight_video);

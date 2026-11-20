@@ -3,6 +3,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::Arc;
 
 use fast_image_resize::Resizer;
 use shared_protocol::{CaptureTarget, TargetResolution};
@@ -50,13 +51,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
-use crate::media::traits::MediaError;
-use crate::media::video::scale_bgra_frame_with_resizer;
+use crate::media::traits::{FrameBufferPool, MediaError, SharedFrameBuffer};
+use crate::media::video::scale_pixel_buffer_pooled;
 
 /// Outcome of polling a Windows GPU/GDI capture source.
 pub enum CapturePoll {
     /// New scaled BGRA frame produced.
-    Frame(u32, u32, Vec<u8>),
+    Frame(u32, u32, SharedFrameBuffer),
     /// Source screen/window had no compositor damage since the previous frame.
     Unchanged,
 }
@@ -189,6 +190,7 @@ impl DxgiMonitorDuplicator {
     pub fn poll_scaled_frame(
         &mut self,
         resizer: &mut Resizer,
+        pool: &Arc<FrameBufferPool>,
         resolution: TargetResolution,
         clamp_1080p: bool,
     ) -> Result<CapturePoll, MediaError> {
@@ -226,8 +228,9 @@ impl DxgiMonitorDuplicator {
                     let _ = self.dupl.ReleaseFrame();
                     copy_res?;
 
-                    let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+                    let (dst_w, dst_h, scaled) = scale_pixel_buffer_pooled(
                         resizer,
+                        pool,
                         &self.last_bgra,
                         self.width,
                         self.height,
@@ -488,6 +491,7 @@ impl Win32WindowCapturer {
     pub fn poll_scaled_frame(
         &mut self,
         resizer: &mut Resizer,
+        pool: &Arc<FrameBufferPool>,
         resolution: TargetResolution,
         clamp_1080p: bool,
     ) -> Result<CapturePoll, MediaError> {
@@ -520,8 +524,9 @@ impl Win32WindowCapturer {
             match wgc.poll_bgra() {
                 Ok(Some((w, h, bgra))) => {
                     self.last_source_dims = Some((w, h));
-                    let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+                    let (dst_w, dst_h, scaled) = scale_pixel_buffer_pooled(
                         resizer,
+                        pool,
                         bgra,
                         w,
                         h,
@@ -540,13 +545,14 @@ impl Win32WindowCapturer {
         }
 
         let hwnd = resolve_hwnd(self.id, &self.title, self.pid)?;
-        self.capture_gdi_fallback(hwnd, resizer, resolution, clamp_1080p)
+        self.capture_gdi_fallback(hwnd, resizer, pool, resolution, clamp_1080p)
     }
 
     fn capture_gdi_fallback(
         &mut self,
         hwnd: HWND,
         resizer: &mut Resizer,
+        pool: &Arc<FrameBufferPool>,
         resolution: TargetResolution,
         clamp_1080p: bool,
     ) -> Result<CapturePoll, MediaError> {
@@ -602,8 +608,9 @@ impl Win32WindowCapturer {
             }
 
             let raw_after = std::slice::from_raw_parts(self.gdi_fallback.dib_ptr, total_bytes);
-            let (dst_w, dst_h, scaled) = scale_bgra_frame_with_resizer(
+            let (dst_w, dst_h, scaled) = scale_pixel_buffer_pooled(
                 resizer,
+                pool,
                 raw_after,
                 w,
                 h,

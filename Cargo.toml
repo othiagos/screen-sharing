@@ -44,7 +44,7 @@ directories = "5.0"
 
 xcap = "0.9"
 fast_image_resize = "4.2"
-yuv = "0.1.6"
+yuv = "0.8"
 openh264 = "0.6"
 
 cpal = "0.15"
