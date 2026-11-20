@@ -2,7 +2,11 @@
 name = "desktop-client"
 version = "0.2.0"
 edition = "2021"
+build = "build.rs"
 description = "Native GPUI Kit desktop client for Screen Share with GPU-accelerated game capture"
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
 
 [dependencies]
 shared-protocol = { workspace = true }

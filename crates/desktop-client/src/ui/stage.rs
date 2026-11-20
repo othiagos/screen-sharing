@@ -1,6 +1,6 @@
 use crate::ui::app_view::{AppView, StageLayout};
 use crate::ui::video_surface::{
-    VideoTileKey, VideoTileStats, format_bitrate_compact, is_significant_throttle,
+    VideoTileKey, VideoTileOptions, VideoTileStats, format_bitrate_compact, is_significant_throttle,
     render_video_tile,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -143,21 +143,24 @@ fn build_clickable_tile(
         VideoTileKey::LocalPreview => (tile_id_prefix, 0usize),
         VideoTileKey::Remote(id) => (tile_id_prefix, id.as_u128() as usize),
     };
+    let show_overlays = !app.is_fullscreen || app.fullscreen_overlay_visible;
     render_video_tile(
         el_id,
         label,
         img_arc,
         stats.as_ref(),
-        app.show_stats,
-        focused,
+        VideoTileOptions {
+            show_label: show_overlays,
+            show_stats: app.show_stats && show_overlays,
+            is_focused: focused,
+        },
         cx,
     )
     .cursor_pointer()
-    .on_click(cx.listener(move |this, ev: &gpui_kit::ClickEvent, _, cx| {
+    .on_click(cx.listener(move |this, ev: &gpui_kit::ClickEvent, window, cx| {
         if ev.click_count() >= 2 {
             this.stage_layout = StageLayout::Focus(key);
-            this.is_fullscreen = !this.is_fullscreen;
-            cx.notify();
+            this.toggle_fullscreen(window, cx);
         } else if multi_tile {
             this.stage_layout = StageLayout::Focus(key);
             cx.notify();
@@ -204,6 +207,7 @@ pub fn render_stage(
             _ => fs_keys.first().copied(),
         };
         if let Some(target_key) = target_key {
+            let show_overlays = app.fullscreen_overlay_visible;
             let tile = build_clickable_tile(app, target_key, "fs-tile", false, false, cx);
 
             return div()
@@ -211,20 +215,25 @@ pub fn render_stage(
                 .relative()
                 .bg(black())
                 .child(tile)
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(14.))
-                        .bottom(px(14.))
-                        .px_3()
-                        .py_1p5()
-                        .rounded(cx.theme().radius)
-                        .bg(hsla(0., 0., 0., 0.72))
-                        .text_xs()
-                        .text_color(gpui_kit::white())
-                        .child("ESC ou duplo clique para sair da tela cheia"),
-                )
+                .when(show_overlays, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .right(px(14.))
+                            .bottom(px(14.))
+                            .px_3()
+                            .py_1p5()
+                            .rounded(cx.theme().radius)
+                            .bg(hsla(0., 0., 0., 0.72))
+                            .text_xs()
+                            .text_color(gpui_kit::white())
+                            .child("ESC, F11 ou duplo clique para sair da tela cheia"),
+                    )
+                })
                 .into_any_element();
+        } else {
+            app.apply_os_fullscreen(false, window);
+            app.is_fullscreen = false;
         }
     }
 
@@ -328,9 +337,8 @@ pub fn render_stage(
                         .outline()
                         .label("Tela Cheia")
                         .disabled(first_available_key.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.is_fullscreen = true;
-                            cx.notify();
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.set_fullscreen(true, window, cx);
                         })),
                 )
                 .child(

@@ -104,17 +104,23 @@ impl VideoSlot {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VideoTileOptions {
+    pub show_label: bool,
+    pub show_stats: bool,
+    pub is_focused: bool,
+}
+
 /// Renders a dark video tile with optional stats overlay and clean corner labels.
 pub fn render_video_tile(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     image_src: Option<Arc<RenderImage>>,
     stats: Option<&VideoTileStats>,
-    show_stats: bool,
-    is_focused: bool,
+    options: VideoTileOptions,
     cx: &gpui_kit::App,
 ) -> Stateful<Div> {
-    let border_color = if is_focused {
+    let border_color = if options.is_focused {
         cx.theme().accent
     } else {
         cx.theme().border
@@ -151,21 +157,23 @@ pub fn render_video_tile(
         );
     }
 
-    tile = tile.child(
-        div()
-            .absolute()
-            .left(px(10.))
-            .bottom(px(10.))
-            .px_2p5()
-            .py_1()
-            .rounded(cx.theme().radius)
-            .bg(hsla(0., 0., 0., 0.72))
-            .text_xs()
-            .text_color(gpui_kit::white())
-            .child(label),
-    );
+    if options.show_label {
+        tile = tile.child(
+            div()
+                .absolute()
+                .left(px(10.))
+                .bottom(px(10.))
+                .px_2p5()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .bg(hsla(0., 0., 0., 0.72))
+                .text_xs()
+                .text_color(gpui_kit::white())
+                .child(label),
+        );
+    }
 
-    if show_stats {
+    if options.show_stats {
         if let Some(st) = stats {
             let mut lines: Vec<String> = Vec::new();
             let eff_fps = st.effective_fps.unwrap_or(st.fps);

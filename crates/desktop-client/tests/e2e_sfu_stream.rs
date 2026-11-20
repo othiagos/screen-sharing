@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use desktop_client::media::mock::{MockAudioCapturer, MockVideoCapturer};
 use desktop_client::media::{
-    LocalBroadcastSession, PeerAudioMixer, PeerMediaReceiver, PeerVideoStore,
+    AudioCapturer, LocalBroadcastSession, MediaError, PeerAudioMixer, PeerMediaReceiver,
+    PeerVideoStore, RawAudioFrame, RawVideoFrame, VideoCapturer,
 };
 use desktop_client::net::{
     connect_sfu, ConnectOutcome, ConnectRequest, MediaSink, SfuClient, SfuEvent,
@@ -311,6 +312,158 @@ async fn test_headless_three_peer_quic_sfu_stream_and_auth() -> anyhow::Result<(
     broadcaster.cancel.cancel();
     viewer_a.cancel.cancel();
     viewer_b.cancel.cancel();
+    server_task.abort();
+
+    Ok(())
+}
+
+struct EndingVideoCapturer;
+
+impl VideoCapturer for EndingVideoCapturer {
+    fn start_capture(
+        &self,
+        _target: CaptureTarget,
+        _resolution: TargetResolution,
+        _fps: u8,
+        tx: mpsc::Sender<RawVideoFrame>,
+        _cancel: CancellationToken,
+    ) -> Result<(), MediaError> {
+        tokio::spawn(async move {
+            for idx in 0..2u64 {
+                let frame = RawVideoFrame {
+                    width: 320,
+                    height: 180,
+                    rgba: MockVideoCapturer::generate_smpte_bars(320, 180, idx),
+                    is_bgra: false,
+                    timestamp_us: idx * 33_333,
+                };
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            // Drop `tx` to simulate captured process/window termination.
+        });
+        Ok(())
+    }
+}
+
+struct ObservingAudioCapturer {
+    observed_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>>,
+}
+
+impl AudioCapturer for ObservingAudioCapturer {
+    fn start_capture(
+        &self,
+        _mode: AudioCaptureMode,
+        _tx: mpsc::Sender<RawAudioFrame>,
+        cancel: CancellationToken,
+    ) -> Result<(), MediaError> {
+        *self.observed_cancel.lock() = Some(cancel);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_unexpected_capture_end_stops_broadcast_and_notifies_peers() -> anyhow::Result<()> {
+    let (bound_addr, fingerprint, _state, server_task) = spawn_sfu_server(SfuServerConfig {
+        bind_addr: "127.0.0.1:0".parse()?,
+        auth_token: None,
+        tls: TlsSource::SelfSigned {
+            cert_dir: None,
+            extra_sans: vec![],
+        },
+    })
+    .await?;
+    let addr_str = bound_addr.to_string();
+
+    let mut broadcaster = connect_peer(&addr_str, "Broadcaster", None, &fingerprint).await?;
+    let broadcaster_id = broadcaster.client.local_peer_id();
+    broadcaster.client.create_room(None);
+    let room_id = wait_for_event(&mut broadcaster.events, Duration::from_secs(3), |ev| {
+        if let SfuEvent::RoomJoined { room_id, .. } = ev {
+            Some(room_id)
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    let mut viewer = connect_peer(&addr_str, "Viewer", None, &fingerprint).await?;
+    viewer.client.join_room(room_id, None);
+    wait_for_event(&mut viewer.events, Duration::from_secs(3), |ev| {
+        if let SfuEvent::RoomJoined { .. } = ev {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    let observed_audio_cancel = Arc::new(parking_lot::Mutex::new(None));
+    let stream_cfg = StreamConfig {
+        target: CaptureTarget::Window {
+            id: 777,
+            title: "ClosedGame".to_string(),
+            pid: 99_999,
+        },
+        resolution: TargetResolution::R720p,
+        fps: 30,
+        bitrate: BitratePreset::Mbps6,
+        audio_mode: AudioCaptureMode::SystemGlobal,
+    };
+
+    let broadcast = LocalBroadcastSession::start_with_capturers(
+        broadcaster.client.clone(),
+        stream_cfg,
+        Arc::new(EndingVideoCapturer),
+        Arc::new(ObservingAudioCapturer {
+            observed_cancel: Arc::clone(&observed_audio_cancel),
+        }),
+        Arc::clone(&broadcaster.video_store),
+        None,
+    )?;
+
+    wait_for_event(&mut viewer.events, Duration::from_secs(3), |ev| match ev {
+        SfuEvent::PeerBroadcastUpdated {
+            peer_id,
+            metadata: Some(_),
+        } if peer_id == broadcaster_id => Some(()),
+        _ => None,
+    })
+    .await?;
+
+    // Without calling broadcast.stop(), viewer should automatically receive metadata: None.
+    wait_for_event(&mut viewer.events, Duration::from_secs(4), |ev| match ev {
+        SfuEvent::PeerBroadcastUpdated {
+            peer_id,
+            metadata: None,
+        } if peer_id == broadcaster_id => Some(()),
+        _ => None,
+    })
+    .await?;
+
+    let reason = broadcast
+        .unexpected_stop_reason()
+        .expect("unexpected stop reason should be populated");
+    assert!(reason.contains("fechado"));
+
+    let audio_cancel = observed_audio_cancel
+        .lock()
+        .clone()
+        .expect("audio capturer should have received cancellation token");
+    assert!(
+        audio_cancel.is_cancelled(),
+        "audio capture should be cancelled automatically when video capture ends"
+    );
+    assert!(broadcaster.video_store.latest_local_preview().is_none());
+
+    broadcaster.receiver.stop_all();
+    viewer.receiver.stop_all();
+    broadcaster.client.disconnect();
+    viewer.client.disconnect();
+    broadcaster.cancel.cancel();
+    viewer.cancel.cancel();
     server_task.abort();
 
     Ok(())

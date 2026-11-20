@@ -7,14 +7,16 @@ use std::ptr::null_mut;
 use fast_image_resize::Resizer;
 use shared_protocol::{CaptureTarget, TargetResolution};
 use tracing::{debug, warn};
-use windows::core::{Interface, IInspectable};
+use windows::core::{Interface, IInspectable, HRESULT};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, ERROR_ACCESS_DENIED, HWND, LPARAM, RECT, WAIT_TIMEOUT,
+};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
@@ -33,6 +35,10 @@ use windows::Win32::Graphics::Gdi::{
     SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE,
+};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -255,11 +261,36 @@ impl DxgiMonitorDuplicator {
     }
 }
 
+/// Returns `true` if `pid == 0` (unknown) or the Win32 process is still running.
+pub fn is_win32_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    unsafe {
+        match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        ) {
+            Ok(handle) => {
+                let mut exit_code: u32 = 0;
+                let still_running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+                    && GetExitCodeProcess(handle, &mut exit_code).is_ok()
+                    && exit_code == 259; // STILL_ACTIVE
+                let _ = CloseHandle(handle);
+                still_running
+            }
+            Err(err) => err.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
+        }
+    }
+}
+
 /// GPU window capturer backed by `Windows.Graphics.Capture` (WGC) for tear-free game capture
 /// without Alt-Tab desktop leaks, with automatic GDI DIB fallback on older Windows 10 builds.
 pub struct Win32WindowCapturer {
     id: u32,
     title: String,
+    pid: u32,
     wgc: Option<WgcSession>,
     wgc_attempted: bool,
     gdi_fallback: GdiDibSurface,
@@ -438,10 +469,11 @@ impl Drop for WgcSession {
 }
 
 impl Win32WindowCapturer {
-    pub fn new(id: u32, title: String) -> Self {
+    pub fn new(id: u32, title: String, pid: u32) -> Self {
         Self {
             id,
             title,
+            pid,
             wgc: None,
             wgc_attempted: false,
             gdi_fallback: GdiDibSurface::default(),
@@ -459,7 +491,13 @@ impl Win32WindowCapturer {
         resolution: TargetResolution,
         clamp_1080p: bool,
     ) -> Result<CapturePoll, MediaError> {
-        let hwnd = resolve_hwnd(self.id, &self.title)?;
+        let hwnd = resolve_hwnd(self.id, &self.title, self.pid)?;
+        let resolved_id = hwnd.0 as usize as u32;
+        if resolved_id != self.id {
+            self.id = resolved_id;
+            self.wgc = None;
+            self.wgc_attempted = false;
+        }
         if unsafe { IsIconic(hwnd).as_bool() } {
             // Minimized windows don't produce compositor surfaces until restored.
             return Ok(CapturePoll::Unchanged);
@@ -501,6 +539,7 @@ impl Win32WindowCapturer {
             }
         }
 
+        let hwnd = resolve_hwnd(self.id, &self.title, self.pid)?;
         self.capture_gdi_fallback(hwnd, resizer, resolution, clamp_1080p)
     }
 
@@ -874,24 +913,46 @@ pub fn list_windows_win32() -> Vec<CaptureTarget> {
         .collect()
 }
 
-pub fn resolve_hwnd(id: u32, title_hint: &str) -> Result<HWND, MediaError> {
+pub fn resolve_hwnd(id: u32, title_hint: &str, pid_hint: u32) -> Result<HWND, MediaError> {
+    if pid_hint > 0 && !is_win32_process_alive(pid_hint) {
+        return Err(MediaError::SourceNotFound(format!(
+            "Process pid={pid_hint} for window id={id} ({title_hint}) terminated"
+        )));
+    }
+
     let candidate = HWND(id as usize as *mut c_void);
     if unsafe { IsWindow(candidate).as_bool() } {
-        return Ok(candidate);
+        if pid_hint == 0 {
+            return Ok(candidate);
+        }
+        let mut actual_pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(candidate, Some(&mut actual_pid)) };
+        if actual_pid == 0 || actual_pid == pid_hint {
+            return Ok(candidate);
+        }
     }
 
     for target in list_windows_win32() {
         if let CaptureTarget::Window {
-            id: win_id, title, ..
+            id: win_id,
+            title,
+            pid: win_pid,
         } = target
         {
-            if win_id == id || (!title_hint.is_empty() && title == title_hint) {
+            if crate::media::video::matches_window_candidate(
+                id,
+                title_hint,
+                pid_hint,
+                win_id,
+                &title,
+                win_pid,
+            ) {
                 return Ok(HWND(win_id as usize as *mut c_void));
             }
         }
     }
 
     Err(MediaError::SourceNotFound(format!(
-        "Window id={id} ({title_hint}) closed or not found"
+        "Window id={id} pid={pid_hint} ({title_hint}) closed or not found"
     )))
 }

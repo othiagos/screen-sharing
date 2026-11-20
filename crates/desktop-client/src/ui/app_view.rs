@@ -11,7 +11,8 @@ use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement, Render, RenderImage, Styled, Subscription, Window, div,
+    KeyDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RenderImage, Styled,
+    Subscription, Window, div,
 };
 use shared_protocol::{PeerId, PeerInfo, StreamConfig};
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+const FULLSCREEN_OVERLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn should_show_fullscreen_overlays(
+    is_fullscreen: bool,
+    last_activity: Instant,
+    now: Instant,
+) -> bool {
+    !is_fullscreen
+        || now.saturating_duration_since(last_activity) < FULLSCREEN_OVERLAY_IDLE_TIMEOUT
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppScreen {
@@ -80,6 +92,11 @@ pub struct AppView {
 
     pub stage_layout: StageLayout,
     pub is_fullscreen: bool,
+    pub fullscreen_overlay_visible: bool,
+    fullscreen_last_activity: Instant,
+    fullscreen_last_mouse_pos: Option<Point<Pixels>>,
+    pending_os_fullscreen: Option<(bool, Instant)>,
+    force_exit_os_fullscreen: bool,
     pub show_stats: bool,
     pub rtt_ms: Option<u32>,
     pub broadcast_stats: Option<BroadcastStats>,
@@ -143,6 +160,11 @@ impl AppView {
             stale_images: Vec::new(),
             stage_layout: StageLayout::Grid,
             is_fullscreen: false,
+            fullscreen_overlay_visible: true,
+            fullscreen_last_activity: Instant::now(),
+            fullscreen_last_mouse_pos: None,
+            pending_os_fullscreen: None,
+            force_exit_os_fullscreen: false,
             show_stats: false,
             rtt_ms: None,
             broadcast_stats: None,
@@ -379,6 +401,134 @@ impl AppView {
         cx.notify();
     }
 
+    pub fn has_fullscreen_target(&self) -> bool {
+        !self.subscribed_peers.is_empty()
+            || (self.local_broadcast.is_some() && self.show_local_preview)
+    }
+
+    pub(crate) fn apply_os_fullscreen(&mut self, fullscreen: bool, window: &mut Window) {
+        let current_target = self
+            .pending_os_fullscreen
+            .filter(|(_, ts)| ts.elapsed() < Duration::from_millis(800))
+            .map(|(target, _)| target)
+            .unwrap_or_else(|| window.is_fullscreen());
+        if current_target != fullscreen {
+            window.toggle_fullscreen();
+            self.pending_os_fullscreen = Some((fullscreen, Instant::now()));
+        }
+        self.force_exit_os_fullscreen = false;
+    }
+
+    fn reveal_fullscreen_overlays(&mut self, reset_mouse_pos: bool) {
+        self.fullscreen_last_activity = Instant::now();
+        self.fullscreen_overlay_visible = true;
+        if reset_mouse_pos {
+            self.fullscreen_last_mouse_pos = None;
+        }
+    }
+
+    pub fn handle_fullscreen_mouse_move(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_fullscreen || self.fullscreen_last_mouse_pos == Some(pos) {
+            return;
+        }
+        self.fullscreen_last_mouse_pos = Some(pos);
+        let was_visible = self.fullscreen_overlay_visible;
+        self.reveal_fullscreen_overlays(false);
+        if !was_visible {
+            cx.notify();
+        }
+    }
+
+    pub fn set_fullscreen(
+        &mut self,
+        fullscreen: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_fullscreen = self.is_fullscreen;
+        self.apply_os_fullscreen(fullscreen, window);
+        self.is_fullscreen = fullscreen;
+        if fullscreen && !was_fullscreen {
+            self.reveal_fullscreen_overlays(true);
+        } else if !fullscreen {
+            self.fullscreen_overlay_visible = true;
+            self.fullscreen_last_mouse_pos = None;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = !self.is_fullscreen;
+        self.set_fullscreen(next, window, cx);
+    }
+
+    fn sync_os_fullscreen(&mut self, window: &mut Window) {
+        let os_fullscreen = window.is_fullscreen();
+        if let Some((target, started_at)) = self.pending_os_fullscreen {
+            if os_fullscreen == target || started_at.elapsed() >= Duration::from_millis(800) {
+                self.pending_os_fullscreen = None;
+            } else {
+                return;
+            }
+        }
+        if self.screen != AppScreen::Stage
+            || (!self.is_fullscreen && self.force_exit_os_fullscreen)
+        {
+            self.force_exit_os_fullscreen = false;
+            if os_fullscreen {
+                window.toggle_fullscreen();
+                self.pending_os_fullscreen = Some((false, Instant::now()));
+            }
+            self.is_fullscreen = false;
+            self.fullscreen_overlay_visible = true;
+            self.fullscreen_last_mouse_pos = None;
+            return;
+        }
+        if os_fullscreen != self.is_fullscreen {
+            self.is_fullscreen = os_fullscreen;
+            if os_fullscreen {
+                self.reveal_fullscreen_overlays(true);
+            } else {
+                self.fullscreen_overlay_visible = true;
+                self.fullscreen_last_mouse_pos = None;
+            }
+        }
+    }
+
+    fn clear_local_broadcast_state(&mut self, window: Option<&mut Window>) {
+        self.show_local_preview = false;
+        self.local_broadcast_label = None;
+        self.broadcast_stats = None;
+        self.video_store.clear_local_preview();
+        if let Some(win) = window {
+            self.local_preview_slot.clear(win);
+        } else if let Some(img) = self.local_preview_slot.take_image() {
+            self.stale_images.push(img);
+        }
+        if matches!(self.stage_layout, StageLayout::Focus(VideoTileKey::LocalPreview)) {
+            self.stage_layout = StageLayout::Grid;
+        }
+    }
+
+    fn handle_unexpected_broadcast_stop(&mut self, reason: String, cx: &mut Context<Self>) {
+        if let Some(session) = self.local_broadcast.take() {
+            if let Some(sfu) = self.sfu_client.as_ref() {
+                session.stop(sfu);
+            }
+        }
+        self.clear_local_broadcast_state(None);
+        if self.is_fullscreen && self.subscribed_peers.is_empty() {
+            self.is_fullscreen = false;
+            self.force_exit_os_fullscreen = true;
+        }
+        self.warning_banner = Some(reason);
+        cx.notify();
+    }
+
     pub fn toggle_local_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.local_broadcast.is_none() {
             return;
@@ -394,7 +544,8 @@ impl AppView {
                 self.stage_layout = StageLayout::Grid;
             }
             if self.is_fullscreen && self.subscribed_peers.is_empty() {
-                self.is_fullscreen = false;
+                self.set_fullscreen(false, window, cx);
+                return;
             }
         }
         cx.notify();
@@ -404,13 +555,10 @@ impl AppView {
         if let (Some(session), Some(sfu)) = (self.local_broadcast.take(), self.sfu_client.as_ref()) {
             session.stop(sfu);
         }
-        self.show_local_preview = false;
-        self.local_broadcast_label = None;
-        self.broadcast_stats = None;
-        self.video_store.clear_local_preview();
-        self.local_preview_slot.clear(window);
-        if matches!(self.stage_layout, StageLayout::Focus(VideoTileKey::LocalPreview)) {
-            self.stage_layout = StageLayout::Grid;
+        self.clear_local_broadcast_state(Some(window));
+        if self.is_fullscreen && self.subscribed_peers.is_empty() {
+            self.set_fullscreen(false, window, cx);
+            return;
         }
         cx.notify();
     }
@@ -537,11 +685,13 @@ impl AppView {
         }));
 
         if let Some(win) = window {
+            self.apply_os_fullscreen(false, win);
             for (_, mut slot) in self.video_slots.drain() {
                 slot.clear(win);
             }
             self.local_preview_slot.clear(win);
         } else {
+            self.force_exit_os_fullscreen = self.is_fullscreen;
             for (_, mut slot) in self.video_slots.drain() {
                 if let Some(img) = slot.take_image() {
                     self.stale_images.push(img);
@@ -582,6 +732,27 @@ impl AppView {
 
                 let keep_going = this.update(cx, |app, cx| {
                     let has_events = app.drain_sfu_events(cx);
+                    let mut unexpected_stopped = false;
+                    if let Some(reason) = app
+                        .local_broadcast
+                        .as_ref()
+                        .and_then(|bc| bc.unexpected_stop_reason())
+                    {
+                        app.handle_unexpected_broadcast_stop(reason, cx);
+                        unexpected_stopped = true;
+                    }
+                    let mut overlay_changed = false;
+                    if app.is_fullscreen {
+                        let visible_now = should_show_fullscreen_overlays(
+                            app.is_fullscreen,
+                            app.fullscreen_last_activity,
+                            Instant::now(),
+                        );
+                        if visible_now != app.fullscreen_overlay_visible {
+                            app.fullscreen_overlay_visible = visible_now;
+                            overlay_changed = true;
+                        }
+                    }
                     let has_frames = app.frame_notify_flag.swap(false, Ordering::AcqRel);
                     let stats_interval = if app.local_broadcast.is_some() {
                         Duration::from_millis(250)
@@ -599,7 +770,12 @@ impl AppView {
                         }
                     }
 
-                    if has_events || has_frames || (periodic && app.screen == AppScreen::Stage) {
+                    if has_events
+                        || unexpected_stopped
+                        || overlay_changed
+                        || has_frames
+                        || (periodic && app.screen == AppScreen::Stage)
+                    {
                         cx.notify();
                     }
 
@@ -740,6 +916,7 @@ impl Render for AppView {
         for stale in self.stale_images.drain(..) {
             let _ = window.drop_image(stale);
         }
+        self.sync_os_fullscreen(window);
         let body = match self.screen {
             AppScreen::Lobby => render_lobby(self, window, cx).into_any_element(),
             AppScreen::Stage => render_stage(self, window, cx).into_any_element(),
@@ -748,18 +925,79 @@ impl Render for AppView {
         div()
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.handle_fullscreen_mouse_move(event.position, cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && this.is_fullscreen {
-                    this.is_fullscreen = false;
-                    cx.notify();
+                    this.set_fullscreen(false, window, cx);
+                } else if event.keystroke.key.eq_ignore_ascii_case("f11")
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform
+                {
+                    if this.is_fullscreen {
+                        this.set_fullscreen(false, window, cx);
+                    } else if this.screen == AppScreen::Stage && this.has_fullscreen_target() {
+                        this.set_fullscreen(true, window, cx);
+                    }
                 } else if event.keystroke.modifiers.control
                     && event.keystroke.modifiers.shift
                     && event.keystroke.key.eq_ignore_ascii_case("s")
                 {
                     this.show_stats = !this.show_stats;
+                    if this.is_fullscreen {
+                        this.reveal_fullscreen_overlays(false);
+                    }
                     cx.notify();
                 }
             }))
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fullscreen_overlay_visibility_timeout() {
+        let t0 = Instant::now();
+        // Outside fullscreen, overlays always stay visible regardless of elapsed idle time.
+        assert!(should_show_fullscreen_overlays(
+            false,
+            t0,
+            t0 + Duration::from_secs(30)
+        ));
+
+        // Inside fullscreen, overlays remain visible until 5s of inactivity.
+        assert!(should_show_fullscreen_overlays(
+            true,
+            t0,
+            t0 + Duration::from_millis(4_999)
+        ));
+        assert!(!should_show_fullscreen_overlays(
+            true,
+            t0,
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(!should_show_fullscreen_overlays(
+            true,
+            t0,
+            t0 + Duration::from_secs(12)
+        ));
+
+        // New mouse activity resets the 5s window.
+        let t_move = t0 + Duration::from_secs(12);
+        assert!(should_show_fullscreen_overlays(
+            true,
+            t_move,
+            t_move + Duration::from_secs(2)
+        ));
+        assert!(!should_show_fullscreen_overlays(
+            true,
+            t_move,
+            t_move + Duration::from_secs(5)
+        ));
     }
 }

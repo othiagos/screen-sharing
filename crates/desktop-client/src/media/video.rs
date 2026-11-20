@@ -1003,6 +1003,55 @@ pub fn list_capture_targets() -> Result<Vec<CaptureTarget>, MediaError> {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn parse_linux_proc_stat_alive(stat: &str) -> bool {
+    let Some(close_paren) = stat.rfind(')') else {
+        return false;
+    };
+    let rest = stat[close_paren + 1..].trim_start();
+    let Some(state_char) = rest.chars().next() else {
+        return false;
+    };
+    !matches!(state_char, 'Z' | 'X' | 'x')
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn is_captured_process_alive(pid: u32) -> bool {
+    crate::media::capture_win::is_win32_process_alive(pid)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn is_captured_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let stat_path = format!("/proc/{pid}/stat");
+    match std::fs::read_to_string(stat_path) {
+        Ok(stat) => parse_linux_proc_stat_alive(&stat),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn matches_window_candidate(
+    target_id: u32,
+    target_title: &str,
+    target_pid: u32,
+    cand_id: u32,
+    cand_title: &str,
+    cand_pid: u32,
+) -> bool {
+    if target_pid > 0 {
+        if cand_pid > 0 && cand_pid != target_pid {
+            return false;
+        }
+        if cand_id == target_id {
+            return true;
+        }
+        return cand_pid == target_pid && !target_title.is_empty() && cand_title == target_title;
+    }
+    cand_id == target_id
+}
+
+#[cfg(not(target_os = "windows"))]
 fn extract_window_pid_linux(window: &xcap::Window) -> u32 {
     if let Some(pid) = window.pid().ok().filter(|&pid| pid != 0) {
         return pid;
@@ -1095,11 +1144,20 @@ impl ResolvedCaptureTarget {
                 #[cfg(not(target_os = "windows"))]
                 Ok(Self::Monitor(monitor))
             }
-            CaptureTarget::Window { id, title, .. } => {
+            CaptureTarget::Window { id, title, pid } => {
+                if *pid > 0 && !is_captured_process_alive(*pid) {
+                    return Err(MediaError::SourceNotFound(format!(
+                        "Process pid={pid} for window id={id} ({title}) terminated"
+                    )));
+                }
                 #[cfg(target_os = "windows")]
                 {
-                    let _ = crate::media::capture_win::resolve_hwnd(*id, title)?;
-                    Ok(Self::Win32Window(Win32WindowCapturer::new(*id, title.clone())))
+                    let _ = crate::media::capture_win::resolve_hwnd(*id, title, *pid)?;
+                    Ok(Self::Win32Window(Win32WindowCapturer::new(
+                        *id,
+                        title.clone(),
+                        *pid,
+                    )))
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -1110,15 +1168,16 @@ impl ResolvedCaptureTarget {
                     let window = windows
                         .into_iter()
                         .find(|w| {
-                            w.id().is_ok_and(|wid| wid == *id)
-                                || (!title.is_empty()
-                                    && w.title()
-                                        .as_deref()
-                                        .is_ok_and(|wtitle| wtitle == title.as_str()))
+                            let Ok(wid) = w.id() else {
+                                return false;
+                            };
+                            let wtitle = w.title().unwrap_or_default();
+                            let wpid = extract_window_pid_linux(w);
+                            matches_window_candidate(*id, title, *pid, wid, &wtitle, wpid)
                         })
                         .ok_or_else(|| {
                             MediaError::SourceNotFound(format!(
-                                "Window id={id} ({title}) not found or closed"
+                                "Window id={id} pid={pid} ({title}) not found or closed"
                             ))
                         })?;
                     Ok(Self::Window(window))
@@ -1340,6 +1399,8 @@ impl VideoCapturer for NativeVideoCapturer {
                 let mut next_tick = Instant::now() + frame_interval;
                 let mut last_frame: Option<(u32, u32, Vec<u8>, bool)> = None;
                 let mut last_sent_at = Instant::now() - Duration::from_secs(1);
+                let mut consecutive_window_errors: u32 = 0;
+                let mut first_window_error_at: Option<Instant> = None;
 
                 while !cancel.is_cancelled() {
                     let now = Instant::now();
@@ -1355,13 +1416,28 @@ impl VideoCapturer for NativeVideoCapturer {
                         next_tick = now_after + frame_interval;
                     }
 
+                    if let CaptureTarget::Window { pid, id, title } = &target {
+                        if *pid > 0 && !is_captured_process_alive(*pid) {
+                            warn!(
+                                pid,
+                                id,
+                                title = %title,
+                                "Captured process exited, stopping video capture"
+                            );
+                            break;
+                        }
+                    }
+
                     if tx.capacity() == 0 {
                         continue;
                     }
 
                     let poll_res = resolved
                         .poll_scaled(&mut resizer, resolution, false)
-                        .or_else(|_| {
+                        .or_else(|err| {
+                            if matches!(err, MediaError::SourceNotFound(_)) {
+                                return Err(err);
+                            }
                             resolved = ResolvedCaptureTarget::resolve(&target)?;
                             resolved.poll_scaled(&mut resizer, resolution, false)
                         });
@@ -1374,6 +1450,8 @@ impl VideoCapturer for NativeVideoCapturer {
                             is_bgra,
                             ..
                         }) => {
+                            consecutive_window_errors = 0;
+                            first_window_error_at = None;
                             last_sent_at = Instant::now();
                             last_frame = Some((width, height, bytes.clone(), is_bgra));
                             let frame = RawVideoFrame {
@@ -1391,6 +1469,8 @@ impl VideoCapturer for NativeVideoCapturer {
                             }
                         }
                         Ok(FrameSample::Unchanged) => {
+                            consecutive_window_errors = 0;
+                            first_window_error_at = None;
                             // Avoid cloning/re-encoding identical frames 60x/s; emit 2Hz keepalive max.
                             if last_sent_at.elapsed() >= Duration::from_millis(500) {
                                 if let Some((w, h, ref bytes, is_bgra)) = last_frame {
@@ -1416,6 +1496,18 @@ impl VideoCapturer for NativeVideoCapturer {
                             break;
                         }
                         Err(err) => {
+                            if matches!(target, CaptureTarget::Window { .. }) {
+                                consecutive_window_errors = consecutive_window_errors.saturating_add(1);
+                                let started = *first_window_error_at.get_or_insert_with(Instant::now);
+                                if consecutive_window_errors >= 5
+                                    && started.elapsed() >= Duration::from_millis(400)
+                                {
+                                    warn!(
+                                        "Captured window failed repeatedly ({consecutive_window_errors} errors), stopping video capture: {err}"
+                                    );
+                                    break;
+                                }
+                            }
                             warn!("Transient video capture error: {err}");
                         }
                     }
@@ -1598,5 +1690,64 @@ mod tests {
             format_monitor_display_label(2, "", None),
             "Monitor 2"
         );
+    }
+
+    #[test]
+    fn test_window_candidate_strict_pid_and_id_matching() {
+        // Exact ID + matching PID passes even if title changed
+        assert!(matches_window_candidate(
+            100,
+            "Game - Lobby",
+            4242,
+            100,
+            "Game - In Match",
+            4242
+        ));
+        // Recreated window within the SAME PID matches exact title
+        assert!(matches_window_candidate(
+            100,
+            "Game",
+            4242,
+            200,
+            "Game",
+            4242
+        ));
+        // Never hijack another process's window just because title matches
+        assert!(!matches_window_candidate(
+            100,
+            "Game",
+            4242,
+            200,
+            "Game",
+            9999
+        ));
+        // Even if OS recycled ID, reject when PID differs
+        assert!(!matches_window_candidate(
+            100,
+            "Game",
+            4242,
+            100,
+            "Game",
+            9999
+        ));
+        // Unknown PID only matches exact window ID, never arbitrary title fallback
+        assert!(matches_window_candidate(100, "Docs", 0, 100, "Docs", 0));
+        assert!(!matches_window_candidate(100, "Docs", 0, 200, "Docs", 0));
+    }
+
+    #[test]
+    fn test_process_liveness_checks() {
+        assert!(is_captured_process_alive(0));
+        assert!(is_captured_process_alive(std::process::id()));
+        assert!(!is_captured_process_alive(u32::MAX - 1));
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(parse_linux_proc_stat_alive("1234 (my (app) name) S 1 1 1 0 -1 0"));
+            assert!(parse_linux_proc_stat_alive("1234 (game) R 1 1 1 0 -1 0"));
+            assert!(!parse_linux_proc_stat_alive("1234 (my (app) name) Z 1 1 1 0 -1 0"));
+            assert!(!parse_linux_proc_stat_alive("1234 (game) X 1 1 1 0 -1 0"));
+            assert!(!parse_linux_proc_stat_alive("malformed"));
+        }
     }
 }

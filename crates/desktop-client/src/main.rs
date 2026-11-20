@@ -6,6 +6,13 @@ use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
+fn load_window_icon() -> Option<Arc<image::RgbaImage>> {
+    let bytes = include_bytes!("../icons/icon.png");
+    image::load_from_memory(bytes)
+        .ok()
+        .map(|img| Arc::new(img.into_rgba8()))
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -36,6 +43,8 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            app_id: Some("com.screenshare.client".to_string()),
+            icon: load_window_icon(),
             ..Default::default()
         };
 
@@ -48,4 +57,16 @@ fn main() {
             tracing::error!("Failed to open main window: {err}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_window_icon;
+
+    #[test]
+    fn test_load_window_icon_decodes_png() {
+        let icon = load_window_icon().expect("embedded icon.png should decode");
+        assert_eq!(icon.dimensions(), (256, 256));
+        assert!(!icon.as_raw().is_empty());
+    }
 }

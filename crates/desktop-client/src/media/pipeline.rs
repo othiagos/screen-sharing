@@ -7,8 +7,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use shared_protocol::{
-    AudioCaptureMode, AudioPacketHeader, PeerId, StreamConfig, StreamMetadata, ThrottleReason,
-    VideoFrameHeader, AUDIO_FLAG_OPUS, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
+    AudioCaptureMode, AudioPacketHeader, CaptureTarget, PeerId, StreamConfig, StreamMetadata,
+    ThrottleReason, VideoFrameHeader, AUDIO_FLAG_OPUS, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -358,6 +358,8 @@ pub struct LocalBroadcastSession {
     cancel: CancellationToken,
     stats: Arc<Mutex<BroadcastStats>>,
     preview_enabled: Arc<AtomicBool>,
+    stopped_manually: Arc<AtomicBool>,
+    unexpected_stop_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalBroadcastSession {
@@ -387,6 +389,8 @@ impl LocalBroadcastSession {
     ) -> anyhow::Result<Self> {
         let cancel = CancellationToken::new();
         let preview_enabled = Arc::new(AtomicBool::new(false));
+        let stopped_manually = Arc::new(AtomicBool::new(false));
+        let unexpected_stop_reason = Arc::new(Mutex::new(None));
         let clamped_fps = config.fps.clamp(1, 60);
         let initial_bitrate = config.bitrate.initial_bps(config.resolution, clamped_fps);
         let initial_max_bitrate = config.bitrate.max_bps(config.resolution, clamped_fps);
@@ -467,6 +471,16 @@ impl LocalBroadcastSession {
             let stats_v = Arc::clone(&stats);
             let store_v = Arc::clone(&video_store);
             let preview_enabled_v = Arc::clone(&preview_enabled);
+            let stopped_manually_v = Arc::clone(&stopped_manually);
+            let unexpected_stop_v = Arc::clone(&unexpected_stop_reason);
+            let stop_notice = match config.target {
+                CaptureTarget::Window { .. } => {
+                    "Transmissão encerrada: a janela ou processo capturado foi fechado."
+                }
+                CaptureTarget::Monitor { .. } | CaptureTarget::PortalWayland => {
+                    "Transmissão encerrada: a captura de tela foi finalizada."
+                }
+            };
             let config_resolution = config.resolution;
             let config_bitrate = config.bitrate;
             let announce_fps = clamped_fps;
@@ -493,6 +507,18 @@ impl LocalBroadcastSession {
 
                     while !cancel_v.is_cancelled() {
                         let Some(mut frame) = video_rx.blocking_recv() else {
+                            if !stopped_manually_v.load(Ordering::Acquire)
+                                && !cancel_v.is_cancelled()
+                            {
+                                let mut slot = unexpected_stop_v.lock();
+                                if slot.is_none() {
+                                    *slot = Some(stop_notice.to_string());
+                                }
+                                drop(slot);
+                                cancel_v.cancel();
+                                sfu_v.stop_broadcast();
+                                info!("Broadcast terminated automatically after capture stream ended");
+                            }
                             break;
                         };
                         while let Ok(newer) = video_rx.try_recv() {
@@ -740,6 +766,8 @@ impl LocalBroadcastSession {
             cancel,
             stats,
             preview_enabled,
+            stopped_manually,
+            unexpected_stop_reason,
         })
     }
 
@@ -751,7 +779,12 @@ impl LocalBroadcastSession {
         self.stats.lock().clone()
     }
 
+    pub fn unexpected_stop_reason(&self) -> Option<String> {
+        self.unexpected_stop_reason.lock().clone()
+    }
+
     pub fn stop(&self, sfu: &SfuClient) {
+        self.stopped_manually.store(true, Ordering::Release);
         self.cancel.cancel();
         sfu.stop_broadcast();
     }
@@ -759,6 +792,7 @@ impl LocalBroadcastSession {
 
 impl Drop for LocalBroadcastSession {
     fn drop(&mut self) {
+        self.stopped_manually.store(true, Ordering::Release);
         self.cancel.cancel();
     }
 }

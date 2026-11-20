@@ -96,6 +96,7 @@ struct PwVideoState {
     tx: mpsc::Sender<RawVideoFrame>,
     cancel: CancellationToken,
     mainloop: pw::main_loop::MainLoopRc,
+    ever_streamed: bool,
 }
 
 fn run_pipewire_video_loop(
@@ -135,12 +136,31 @@ fn run_pipewire_video_loop(
         tx,
         cancel: cancel.clone(),
         mainloop: mainloop.clone(),
+        ever_streamed: false,
     }));
 
+    let state_changed = Rc::clone(&state);
     let state_param = Rc::clone(&state);
     let state_proc = Rc::clone(&state);
     let _listener = stream
         .add_local_listener_with_user_data(())
+        .state_changed(move |_, _, _, new| {
+            let mut st = state_changed.borrow_mut();
+            match new {
+                pw::stream::StreamState::Streaming => {
+                    st.ever_streamed = true;
+                }
+                pw::stream::StreamState::Error(ref err) => {
+                    warn!("PipeWire video stream entered error state: {err}");
+                    st.mainloop.quit();
+                }
+                pw::stream::StreamState::Unconnected if st.ever_streamed => {
+                    warn!("PipeWire video stream disconnected by portal/compositor");
+                    st.mainloop.quit();
+                }
+                _ => {}
+            }
+        })
         .param_changed(move |_, _, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
