@@ -443,11 +443,29 @@ pub fn is_h264_keyframe(annex_b: &[u8]) -> bool {
     false
 }
 
-/// Tuned low-latency `OpenH264` software encoder with frame skipping disabled to prevent stutters.
+fn compute_keyframe_interval(fps: u8) -> u64 {
+    let clamped = fps.clamp(1, 60);
+    if clamped <= 5 {
+        12
+    } else {
+        (u64::from(clamped) * 3).max(45)
+    }
+}
+
+fn usage_type_for_fps(fps: u8) -> UsageType {
+    if fps <= 5 {
+        UsageType::ScreenContentRealTime
+    } else {
+        UsageType::CameraVideoRealTime
+    }
+}
+
+/// Tuned low-latency `OpenH264` VBR encoder with frame skipping disabled to prevent stutters.
 pub struct H264VideoEncoder {
     encoder: Encoder,
     fps: u8,
     bitrate_bps: u32,
+    max_bitrate_bps: u32,
     frame_count: u64,
     last_ts_ms: Option<u64>,
     keyframe_interval: u64,
@@ -463,34 +481,80 @@ impl H264VideoEncoder {
             .map(|n| n.get().clamp(2, 4) as u16)
             .unwrap_or(2);
         let config = EncoderConfig::new()
-            .set_bitrate_bps(bitrate_bps.clamp(300_000, 30_000_000))
+            .set_bitrate_bps(bitrate_bps.clamp(200_000, 30_000_000))
             .max_frame_rate(clamped_fps as f32)
             .enable_skip_frame(false)
-            .rate_control_mode(RateControlMode::Bitrate)
+            .rate_control_mode(RateControlMode::Quality)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
-            .usage_type(UsageType::CameraVideoRealTime)
+            .usage_type(usage_type_for_fps(clamped_fps))
             .set_multiple_thread_idc(threads);
 
         Encoder::with_api_config(OpenH264API::from_source(), config)
             .map_err(|e| MediaError::Codec(format!("OpenH264 encoder init error: {e}")))
     }
 
-    pub fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
+    pub fn new(fps: u8, bitrate_bps: u32, max_bitrate_bps: u32) -> Result<Self, MediaError> {
         let clamped_fps = fps.clamp(1, 60);
-        let clamped_bps = bitrate_bps.clamp(300_000, 30_000_000);
+        let clamped_bps = bitrate_bps.clamp(200_000, 30_000_000);
+        let clamped_max = max_bitrate_bps.max(clamped_bps).clamp(200_000, 35_000_000);
         let encoder = Self::build_encoder(clamped_fps, clamped_bps)?;
 
         Ok(Self {
             encoder,
             fps: clamped_fps,
             bitrate_bps: clamped_bps,
+            max_bitrate_bps: clamped_max,
             frame_count: 0,
             last_ts_ms: None,
-            keyframe_interval: ((clamped_fps as u64) * 3).max(45),
+            keyframe_interval: compute_keyframe_interval(clamped_fps),
             force_next_idr: true,
             last_dimensions: None,
             yuv_scratch: Vec::new(),
         })
+    }
+
+    fn apply_bitrate_options(&mut self, prev_target: u32) {
+        let mut target_info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: self.bitrate_bps as i32,
+        };
+        let mut max_info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: self.max_bitrate_bps as i32,
+        };
+        let (rc1, rc2) = unsafe {
+            let raw = self.encoder.raw_api();
+            if self.bitrate_bps >= prev_target {
+                let r1 = raw.set_option(
+                    ENCODER_OPTION_MAX_BITRATE,
+                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
+                );
+                let r2 = raw.set_option(
+                    ENCODER_OPTION_BITRATE,
+                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
+                );
+                (r1, r2)
+            } else {
+                let r1 = raw.set_option(
+                    ENCODER_OPTION_BITRATE,
+                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
+                );
+                let r2 = raw.set_option(
+                    ENCODER_OPTION_MAX_BITRATE,
+                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
+                );
+                (r1, r2)
+            }
+        };
+        if rc1 != 0 || rc2 != 0 {
+            warn!(
+                rc1,
+                rc2,
+                target = self.bitrate_bps,
+                max = self.max_bitrate_bps,
+                "OpenH264 dynamic bitrate SetOption failed"
+            );
+        }
     }
 
     pub fn request_keyframe(&mut self) {
@@ -513,6 +577,7 @@ impl H264VideoEncoder {
             self.last_ts_ms = None;
             self.force_next_idr = true;
         }
+        let was_uninitialized = self.last_dimensions.is_none();
 
         if self.last_dimensions.is_some()
             && (self.force_next_idr || self.frame_count.is_multiple_of(self.keyframe_interval))
@@ -543,12 +608,16 @@ impl H264VideoEncoder {
             .encoder
             .encode_at(&yuv_slices, Timestamp::from_millis(ts_ms))
             .map_err(|e| MediaError::Codec(format!("OpenH264 encode error: {e}")))?;
+        let encoded_bytes = bitstream.to_vec();
 
         self.last_dimensions = Some((width, height));
+        if was_uninitialized {
+            self.apply_bitrate_options(self.bitrate_bps);
+        }
         self.last_ts_ms = Some(ts_ms);
         self.force_next_idr = false;
         self.frame_count = self.frame_count.wrapping_add(1);
-        Ok(bitstream.to_vec())
+        Ok(encoded_bytes)
     }
 
     pub fn encode_rgba(
@@ -586,56 +655,26 @@ impl VideoEncoder for H264VideoEncoder {
         self.force_next_idr = true;
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
-        let clamped = bitrate_bps.clamp(300_000, 30_000_000);
-        let diff = (clamped as i64 - self.bitrate_bps as i64).unsigned_abs();
-        if diff * 20 <= u64::from(self.bitrate_bps.max(1)) {
+    fn set_bitrate(&mut self, target_bps: u32, max_bps: u32) -> Result<(), MediaError> {
+        let clamped_target = target_bps.clamp(200_000, 30_000_000);
+        let clamped_max = max_bps.max(clamped_target).clamp(200_000, 35_000_000);
+        let target_diff = (clamped_target as i64 - self.bitrate_bps as i64).unsigned_abs();
+        let max_diff = (clamped_max as i64 - self.max_bitrate_bps as i64).unsigned_abs();
+        if target_diff * 20 <= u64::from(self.bitrate_bps.max(1))
+            && max_diff * 20 <= u64::from(self.max_bitrate_bps.max(1))
+        {
             return Ok(());
         }
 
         let prev = self.bitrate_bps;
-        self.bitrate_bps = clamped;
+        self.bitrate_bps = clamped_target;
+        self.max_bitrate_bps = clamped_max;
         if self.last_dimensions.is_none() {
             self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
             return Ok(());
         }
 
-        let max_bps = (clamped.saturating_mul(5) / 4).clamp(clamped, 35_000_000);
-        let mut target_info = SBitrateInfo {
-            iLayer: SPATIAL_LAYER_ALL,
-            iBitrate: clamped as i32,
-        };
-        let mut max_info = SBitrateInfo {
-            iLayer: SPATIAL_LAYER_ALL,
-            iBitrate: max_bps as i32,
-        };
-        let (rc1, rc2) = unsafe {
-            let raw = self.encoder.raw_api();
-            if clamped >= prev {
-                let r1 = raw.set_option(
-                    ENCODER_OPTION_MAX_BITRATE,
-                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
-                );
-                let r2 = raw.set_option(
-                    ENCODER_OPTION_BITRATE,
-                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
-                );
-                (r1, r2)
-            } else {
-                let r1 = raw.set_option(
-                    ENCODER_OPTION_BITRATE,
-                    std::ptr::addr_of_mut!(target_info).cast::<c_void>(),
-                );
-                let r2 = raw.set_option(
-                    ENCODER_OPTION_MAX_BITRATE,
-                    std::ptr::addr_of_mut!(max_info).cast::<c_void>(),
-                );
-                (r1, r2)
-            }
-        };
-        if rc1 != 0 || rc2 != 0 {
-            warn!(rc1, rc2, bitrate = clamped, "OpenH264 dynamic bitrate SetOption failed");
-        }
+        self.apply_bitrate_options(prev);
         Ok(())
     }
 
@@ -645,7 +684,7 @@ impl VideoEncoder for H264VideoEncoder {
             return Ok(());
         }
         self.fps = clamped;
-        self.keyframe_interval = ((u64::from(clamped)) * 3).max(45);
+        self.keyframe_interval = compute_keyframe_interval(clamped);
         if self.last_dimensions.is_none() {
             self.encoder = Self::build_encoder(self.fps, self.bitrate_bps)?;
             return Ok(());
@@ -672,10 +711,11 @@ impl VideoEncoder for H264VideoEncoder {
 pub fn create_best_video_encoder(
     fps: u8,
     bitrate_bps: u32,
+    max_bitrate_bps: u32,
 ) -> Result<Box<dyn VideoEncoder>, MediaError> {
     #[cfg(target_os = "windows")]
     {
-        match crate::media::codec_win::MfH264Encoder::new(fps, bitrate_bps) {
+        match crate::media::codec_win::MfH264Encoder::new(fps, bitrate_bps, max_bitrate_bps) {
             Ok(hw) => return Ok(Box::new(hw)),
             Err(err) => {
                 warn!("Windows HW H.264 MFT unavailable ({err}); falling back to OpenH264");
@@ -683,7 +723,11 @@ pub fn create_best_video_encoder(
         }
     }
 
-    Ok(Box::new(H264VideoEncoder::new(fps, bitrate_bps)?))
+    Ok(Box::new(H264VideoEncoder::new(
+        fps,
+        bitrate_bps,
+        max_bitrate_bps,
+    )?))
 }
 
 /// Low-latency H.264 Annex-B decoder outputting tightly-packed RGBA or BGRA buffers.
@@ -1570,7 +1614,7 @@ mod tests {
         let mut bgra = MockVideoCapturer::generate_smpte_bars(width, height, 0);
         rgba_to_bgra_in_place(&mut bgra);
 
-        let mut encoder = H264VideoEncoder::new(60, 6_000_000).expect("init H264 encoder");
+        let mut encoder = H264VideoEncoder::new(60, 6_000_000, 7_000_000).expect("init H264 encoder");
         let mut decoder = H264VideoDecoder::new().expect("init H264 decoder");
 
         let annex_b = encoder
@@ -1613,7 +1657,7 @@ mod tests {
         let mut bgra = MockVideoCapturer::generate_smpte_bars(width, height, 1);
         rgba_to_bgra_in_place(&mut bgra);
 
-        let mut encoder = H264VideoEncoder::new(60, 8_000_000).expect("init H264 encoder");
+        let mut encoder = H264VideoEncoder::new(60, 6_166_000, 7_000_000).expect("init H264 encoder");
         let mut decoder = H264VideoDecoder::new().expect("init H264 decoder");
 
         // Frame 0: initial IDR
@@ -1621,8 +1665,8 @@ mod tests {
         assert!(is_h264_keyframe(&f0));
         assert!(decoder.decode_annex_b_bgra(&f0).expect("dec f0").is_some());
 
-        // Adjust bitrate down and target FPS down in-place without recreating or forcing IDR
-        encoder.set_bitrate(900_000).expect("set lower bitrate");
+        // Adjust VBR range and target FPS down in-place without recreating or forcing IDR
+        encoder.set_bitrate(2_800_000, 4_500_000).expect("set lower bitrate");
         encoder.set_target_fps(30).expect("set lower fps");
 
         let f1 = encoder.encode_bgra(&bgra, width, height).expect("encode f1");
@@ -1634,10 +1678,21 @@ mod tests {
         assert!(decoder.decode_annex_b_bgra(&f1).expect("dec f1").is_some());
 
         // Raise bitrate back up
-        encoder.set_bitrate(10_000_000).expect("raise bitrate");
+        encoder.set_bitrate(7_000_000, 7_000_000).expect("raise bitrate");
         let f2 = encoder.encode_bgra(&bgra, width, height).expect("encode f2");
         assert!(!is_h264_keyframe(&f2));
         assert!(decoder.decode_annex_b_bgra(&f2).expect("dec f2").is_some());
+
+        // Verify 5 FPS reading mode uses ScreenContentRealTime + 12-frame GOP while 15/30/60 stay fast
+        assert!(matches!(usage_type_for_fps(5), UsageType::ScreenContentRealTime));
+        assert!(matches!(usage_type_for_fps(15), UsageType::CameraVideoRealTime));
+        assert!(matches!(usage_type_for_fps(30), UsageType::CameraVideoRealTime));
+        assert!(matches!(usage_type_for_fps(60), UsageType::CameraVideoRealTime));
+        let mut reader_enc = H264VideoEncoder::new(5, 800_000, 900_000).expect("init 5fps encoder");
+        assert_eq!(reader_enc.keyframe_interval, 12);
+        let rf0 = reader_enc.encode_bgra(&bgra, width, height).expect("encode 5fps f0");
+        assert!(is_h264_keyframe(&rf0));
+        assert!(decoder.decode_annex_b_bgra(&rf0).expect("dec 5fps f0").is_some());
     }
 
     #[tokio::test]

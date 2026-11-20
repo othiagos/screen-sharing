@@ -12,8 +12,8 @@ use desktop_client::net::{
 use sfu_server::tls::TlsSource;
 use sfu_server::{spawn_sfu_server, SfuServerConfig};
 use shared_protocol::{
-    AudioCaptureMode, BitratePreset, CaptureTarget, ControlErrorCode, PeerId, StreamConfig,
-    TargetResolution,
+    AudioCaptureMode, CaptureTarget, ControlErrorCode, PeerId, StreamConfig, TargetResolution,
+    TEXT_FOCUS_FPS,
 };
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -178,7 +178,6 @@ async fn test_headless_three_peer_quic_sfu_stream_and_auth() -> anyhow::Result<(
         },
         resolution: TargetResolution::R720p,
         fps: 30,
-        bitrate: BitratePreset::Mbps6,
         audio_mode: AudioCaptureMode::SystemGlobal,
     };
 
@@ -409,7 +408,6 @@ async fn test_unexpected_capture_end_stops_broadcast_and_notifies_peers() -> any
         },
         resolution: TargetResolution::R720p,
         fps: 30,
-        bitrate: BitratePreset::Mbps6,
         audio_mode: AudioCaptureMode::SystemGlobal,
     };
 
@@ -458,6 +456,111 @@ async fn test_unexpected_capture_end_stops_broadcast_and_notifies_peers() -> any
     );
     assert!(broadcaster.video_store.latest_local_preview().is_none());
 
+    broadcaster.receiver.stop_all();
+    viewer.receiver.stop_all();
+    broadcaster.client.disconnect();
+    viewer.client.disconnect();
+    broadcaster.cancel.cancel();
+    viewer.cancel.cancel();
+    server_task.abort();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reading_mode_5fps_vbr_stream_end_to_end() -> anyhow::Result<()> {
+    let (bound_addr, fingerprint, _state, server_task) = spawn_sfu_server(SfuServerConfig {
+        bind_addr: "127.0.0.1:0".parse()?,
+        auth_token: None,
+        tls: TlsSource::SelfSigned {
+            cert_dir: None,
+            extra_sans: vec![],
+        },
+    })
+    .await?;
+    let addr_str = bound_addr.to_string();
+
+    let mut broadcaster = connect_peer(&addr_str, "ReaderHost", None, &fingerprint).await?;
+    let broadcaster_id = broadcaster.client.local_peer_id();
+    broadcaster.client.create_room(None);
+    let room_id = wait_for_event(&mut broadcaster.events, Duration::from_secs(3), |ev| {
+        if let SfuEvent::RoomJoined { room_id, .. } = ev {
+            Some(room_id)
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    let mut viewer = connect_peer(&addr_str, "ReaderViewer", None, &fingerprint).await?;
+    viewer.client.join_room(room_id, None);
+    wait_for_event(&mut viewer.events, Duration::from_secs(3), |ev| {
+        if let SfuEvent::RoomJoined { .. } = ev {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    let stream_cfg = StreamConfig {
+        target: CaptureTarget::Monitor {
+            id: 0,
+            name: "ReadingMonitor".to_string(),
+        },
+        resolution: TargetResolution::R720p,
+        fps: TEXT_FOCUS_FPS,
+        audio_mode: AudioCaptureMode::None,
+    };
+
+    let broadcast = LocalBroadcastSession::start_with_capturers(
+        broadcaster.client.clone(),
+        stream_cfg,
+        Arc::new(MockVideoCapturer::new(640, 360)),
+        Arc::new(MockAudioCapturer::new()),
+        Arc::clone(&broadcaster.video_store),
+        None,
+    )?;
+
+    let announced_meta = wait_for_event(&mut viewer.events, Duration::from_secs(3), |ev| match ev {
+        SfuEvent::PeerBroadcastUpdated {
+            peer_id,
+            metadata: Some(meta),
+        } if peer_id == broadcaster_id => Some(meta),
+        _ => None,
+    })
+    .await?;
+    assert_eq!(announced_meta.fps, TEXT_FOCUS_FPS);
+    assert!(!announced_meta.has_audio);
+
+    viewer.client.set_subscription(broadcaster_id, true, false);
+    viewer.client.request_keyframe(broadcaster_id);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut frames = 0u64;
+    while Instant::now() < deadline {
+        frames = viewer.video_store.latest_peer_generation(broadcaster_id);
+        if frames >= 4 {
+            break;
+        }
+        sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        frames >= 4,
+        "Expected >= 4 decoded 5fps reading-mode frames, got {frames}"
+    );
+
+    let stats = broadcast.stats_snapshot();
+    assert_eq!(stats.configured_fps, u32::from(TEXT_FOCUS_FPS));
+    assert_eq!(stats.effective_fps, u32::from(TEXT_FOCUS_FPS));
+    assert_eq!(stats.max_bitrate_kbps, 900);
+    assert!(
+        stats.target_bitrate_kbps >= 600 && stats.target_bitrate_kbps <= 900,
+        "Expected 720p 5fps VBR target inside [600, 900] kbps, got {}",
+        stats.target_bitrate_kbps
+    );
+
+    broadcast.stop(&broadcaster.client);
     broadcaster.receiver.stop_all();
     viewer.receiver.stop_all();
     broadcaster.client.disconnect();

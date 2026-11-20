@@ -369,7 +369,6 @@ impl AppView {
 
         self.config.resolution = stream_cfg.resolution;
         self.config.fps = stream_cfg.sanitized_fps();
-        self.config.bitrate = stream_cfg.bitrate;
         let _ = self.config.save();
 
         self.show_local_preview = false;

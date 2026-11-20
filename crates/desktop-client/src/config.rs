@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use shared_protocol::{normalize_fingerprint, BitratePreset, TargetResolution};
+use shared_protocol::{normalize_fingerprint, TargetResolution};
 
 fn default_server_addr() -> String {
     "127.0.0.1:4433".to_string()
@@ -38,8 +38,6 @@ pub struct AppConfig {
     pub resolution: TargetResolution,
     #[serde(default = "default_fps")]
     pub fps: u8,
-    #[serde(default)]
-    pub bitrate: BitratePreset,
     #[serde(default = "default_true")]
     pub dark_mode: bool,
 }
@@ -53,7 +51,6 @@ impl Default for AppConfig {
             trusted_fingerprints: HashMap::new(),
             resolution: TargetResolution::R1080p,
             fps: default_fps(),
-            bitrate: BitratePreset::Auto,
             dark_mode: true,
         }
     }
@@ -103,7 +100,7 @@ impl AppConfig {
             .with_context(|| format!("Failed reading config {}", path.display()))?;
         let mut cfg: Self = serde_json::from_str(&raw)
             .with_context(|| format!("Failed parsing config {}", path.display()))?;
-        if ![15, 30, 60].contains(&cfg.fps) {
+        if ![5, 15, 30, 60].contains(&cfg.fps) {
             cfg.fps = 60;
         }
         Ok(cfg)
@@ -159,8 +156,7 @@ mod tests {
             server_addr: "play.example.com:4433".to_string(),
             nickname: "Tester".to_string(),
             resolution: TargetResolution::R1440p,
-            fps: 60,
-            bitrate: BitratePreset::Mbps20,
+            fps: 5,
             ..Default::default()
         };
         cfg.trust_fingerprint("PLAY.Example.com:4433", "aa:bb:cc:dd");
@@ -172,6 +168,13 @@ mod tests {
             loaded.pinned_fingerprint("play.example.com:4433"),
             Some("AABBCCDD")
         );
+
+        // Legacy JSON containing obsolete `bitrate` key loads cleanly and preserves `fps: 5`
+        let legacy_json = r#"{"server_addr":"play.example.com:4433","nickname":"Tester","resolution":"R1080p","fps":5,"bitrate":"Mbps20","dark_mode":true}"#;
+        fs::write(&path, legacy_json).expect("write legacy json");
+        let legacy_loaded = AppConfig::load_from(&path).expect("load legacy json");
+        assert_eq!(legacy_loaded.fps, 5);
+        assert_eq!(legacy_loaded.resolution, TargetResolution::R1080p);
 
         let _ = fs::remove_dir_all(&dir);
     }

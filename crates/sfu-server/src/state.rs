@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 use shared_protocol::{
     ControlErrorCode, PeerId, PeerInfo, RoomId, ServerControl, StreamMetadata, ThrottleReason,
-    MIN_ADAPTIVE_BITRATE_BPS, SFU_MINORITY_FLOOR_BPS,
+    MAX_ADAPTIVE_BITRATE_BPS, MIN_ADAPTIVE_BITRATE_BPS, SFU_MINORITY_FLOOR_BPS,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -73,7 +73,7 @@ impl ViewerCongestionState {
         }
         let anchor = if self.suggested_bps == UNCONSTRAINED_BPS {
             let measured = if stream_bps > 0 { stream_bps } else { 8_000_000 };
-            measured.clamp(MIN_ADAPTIVE_BITRATE_BPS, 22_000_000)
+            measured.clamp(MIN_ADAPTIVE_BITRATE_BPS, MAX_ADAPTIVE_BITRATE_BPS)
         } else {
             self.suggested_bps
         };

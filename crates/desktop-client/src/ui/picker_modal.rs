@@ -14,10 +14,12 @@ use gpui_kit::{
     hsla, img, px,
 };
 use shared_protocol::{
-    AudioCaptureMode, BitratePreset, CaptureTarget, StreamConfig, TargetResolution,
+    sanitize_video_fps, AudioCaptureMode, CaptureTarget, StreamConfig, TargetResolution,
+    TEXT_FOCUS_FPS,
 };
 use std::sync::Arc;
 
+const TEXT_MODE_LABEL: &str = "Texto Nítido (Leitura)";
 const AUDIO_NONE: &str = "Sem Áudio";
 const AUDIO_SYSTEM: &str = "Áudio Global do Sistema";
 const AUDIO_APP: &str = "Somente Áudio do Aplicativo";
@@ -85,7 +87,6 @@ pub struct PickerModalState {
     preview_seq: u64,
     resolution_select: Entity<SelectState<Vec<String>>>,
     fps_select: Entity<SelectState<Vec<String>>>,
-    bitrate_select: Entity<SelectState<Vec<String>>>,
     audio_select: Entity<SelectState<Vec<String>>>,
     _subs: Vec<Subscription>,
 }
@@ -112,40 +113,21 @@ impl PickerModalState {
         });
 
         let fps_items = vec![
+            TEXT_MODE_LABEL.to_string(),
             "15 FPS".to_string(),
             "30 FPS".to_string(),
             "60 FPS".to_string(),
         ];
-        let fps_idx = match config.fps {
-            0..=22 => 0,
-            23..=45 => 1,
-            _ => 2,
+        let fps_idx = match sanitize_video_fps(config.fps) {
+            5 => 0,
+            15 => 1,
+            30 => 2,
+            _ => 3,
         };
         let fps_select = cx.new(|cx| {
             SelectState::new(
                 fps_items,
                 Some(IndexPath::default().row(fps_idx)),
-                window,
-                cx,
-            )
-        });
-
-        let bitrate_items = vec![
-            BitratePreset::Auto.label().to_string(),
-            BitratePreset::Mbps6.label().to_string(),
-            BitratePreset::Mbps12.label().to_string(),
-            BitratePreset::Mbps20.label().to_string(),
-        ];
-        let br_idx = match config.bitrate {
-            BitratePreset::Auto => 0,
-            BitratePreset::Mbps6 => 1,
-            BitratePreset::Mbps12 => 2,
-            BitratePreset::Mbps20 => 3,
-        };
-        let bitrate_select = cx.new(|cx| {
-            SelectState::new(
-                bitrate_items,
-                Some(IndexPath::default().row(br_idx)),
                 window,
                 cx,
             )
@@ -205,7 +187,6 @@ impl PickerModalState {
             preview_seq: 0,
             resolution_select,
             fps_select,
-            bitrate_select,
             audio_select,
             _subs: vec![sub_res, sub_audio],
         };
@@ -461,28 +442,14 @@ impl PickerModalState {
             .selected_value()
             .map(String::as_str)
             .unwrap_or("60 FPS");
-        let fps = if fps_str.starts_with("15") {
+        let fps = if fps_str == TEXT_MODE_LABEL || fps_str.starts_with("Texto") {
+            TEXT_FOCUS_FPS
+        } else if fps_str.starts_with("15") {
             15
         } else if fps_str.starts_with("30") {
             30
         } else {
             60
-        };
-
-        let br_str = self
-            .bitrate_select
-            .read(cx)
-            .selected_value()
-            .map(String::as_str)
-            .unwrap_or("Auto (Adaptativo)");
-        let bitrate = if br_str.contains("6 Mbps") {
-            BitratePreset::Mbps6
-        } else if br_str.contains("12 Mbps") {
-            BitratePreset::Mbps12
-        } else if br_str.contains("20 Mbps") {
-            BitratePreset::Mbps20
-        } else {
-            BitratePreset::Auto
         };
 
         let audio_str = self
@@ -506,7 +473,6 @@ impl PickerModalState {
             target,
             resolution,
             fps,
-            bitrate,
             audio_mode,
         })
     }
@@ -812,33 +778,18 @@ impl Render for PickerModalState {
                                                     .min_w_0()
                                                     .overflow_hidden()
                                                     .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Taxa (FPS)"))
+                                                    .child(div().text_xs().text_color(muted).child("Modo / FPS"))
                                                     .child(Select::new(&self.fps_select)),
                                             ),
                                     )
                                     .child(
-                                        h_flex()
+                                        v_flex()
                                             .w_full()
                                             .min_w_0()
-                                            .gap_2p5()
-                                            .child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Bitrate"))
-                                                    .child(Select::new(&self.bitrate_select)),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Captura de Áudio"))
-                                                    .child(Select::new(&self.audio_select)),
-                                            ),
+                                            .overflow_hidden()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(muted).child("Captura de Áudio"))
+                                            .child(Select::new(&self.audio_select)),
                                     ),
                             ),
                     ),

@@ -7,8 +7,9 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use shared_protocol::{
-    AudioCaptureMode, AudioPacketHeader, CaptureTarget, PeerId, StreamConfig, StreamMetadata,
-    ThrottleReason, VideoFrameHeader, AUDIO_FLAG_OPUS, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
+    sanitize_video_fps, vbr_bitrate_range, AudioCaptureMode, AudioPacketHeader, CaptureTarget,
+    PeerId, StreamConfig, StreamMetadata, ThrottleReason, VideoFrameHeader, AUDIO_FLAG_OPUS,
+    VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -391,9 +392,10 @@ impl LocalBroadcastSession {
         let preview_enabled = Arc::new(AtomicBool::new(false));
         let stopped_manually = Arc::new(AtomicBool::new(false));
         let unexpected_stop_reason = Arc::new(Mutex::new(None));
-        let clamped_fps = config.fps.clamp(1, 60);
-        let initial_bitrate = config.bitrate.initial_bps(config.resolution, clamped_fps);
-        let initial_max_bitrate = config.bitrate.max_bps(config.resolution, clamped_fps);
+        let clamped_fps = sanitize_video_fps(config.fps);
+        let initial_range = vbr_bitrate_range(config.resolution, clamped_fps);
+        let initial_bitrate = initial_range.initial_bps();
+        let initial_max_bitrate = initial_range.max_bps;
         let stats = Arc::new(Mutex::new(BroadcastStats {
             backend: "initializing".to_string(),
             width: 0,
@@ -412,7 +414,7 @@ impl LocalBroadcastSession {
         let (audio_tx, mut audio_rx) = mpsc::channel::<RawAudioFrame>(16);
         let (warning_tx, mut warning_rx) = mpsc::unbounded_channel::<String>();
 
-        let encoder = create_best_video_encoder(clamped_fps, initial_bitrate)?;
+        let encoder = create_best_video_encoder(clamped_fps, initial_bitrate, initial_max_bitrate)?;
         let backend_name = encoder.backend_name().to_string();
         stats.lock().backend = backend_name.clone();
 
@@ -482,7 +484,6 @@ impl LocalBroadcastSession {
                 }
             };
             let config_resolution = config.resolution;
-            let config_bitrate = config.bitrate;
             let announce_fps = clamped_fps;
 
             std::thread::Builder::new()
@@ -490,7 +491,6 @@ impl LocalBroadcastSession {
                 .spawn(move || {
                     let mut encoder = encoder;
                     let mut controller = AdaptiveBitrateController::new(
-                        config_bitrate,
                         config_resolution,
                         announce_fps,
                         Instant::now(),
@@ -550,7 +550,8 @@ impl LocalBroadcastSession {
                                     frame.width,
                                     frame.height,
                                 ) {
-                                    let _ = encoder.set_bitrate(controller.current_bps());
+                                    let _ = encoder
+                                        .set_bitrate(controller.current_bps(), controller.vbr_max_bps());
                                 }
                                 let mut st = stats_v.lock();
                                 st.width = frame.width;
@@ -585,7 +586,8 @@ impl LocalBroadcastSession {
                                     Instant::now(),
                                 );
                                 if decision.bitrate_changed {
-                                    let _ = encoder.set_bitrate(decision.target_bps);
+                                    let _ = encoder
+                                        .set_bitrate(decision.target_bps, decision.vbr_max_bps);
                                 }
                                 if decision.fps_changed {
                                     let _ = encoder.set_target_fps(decision.effective_fps);
@@ -650,7 +652,8 @@ impl LocalBroadcastSession {
                                 );
 
                                 if decision.bitrate_changed {
-                                    let _ = encoder.set_bitrate(decision.target_bps);
+                                    let _ = encoder
+                                        .set_bitrate(decision.target_bps, decision.vbr_max_bps);
                                 }
                                 if decision.fps_changed {
                                     let _ = encoder.set_target_fps(decision.effective_fps);

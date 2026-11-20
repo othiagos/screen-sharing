@@ -11,7 +11,7 @@ use gpui_kit::{
     ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, RenderImage,
     SharedString, StatefulInteractiveElement as _, Styled, Window, black, div, hsla, px,
 };
-use shared_protocol::{PeerId, ThrottleReason};
+use shared_protocol::{video_mode_display_label, PeerId, ThrottleReason, TEXT_FOCUS_FPS};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -408,10 +408,15 @@ pub fn render_stage(
             let is_local = app.local_peer_id == Some(peer_id);
             let is_live = peer.active_stream.is_some();
             let is_sub = app.subscribed_peers.contains(&peer_id);
-            let stream_desc = peer
-                .active_stream
-                .as_ref()
-                .map(|m| format!("{}x{} @ {}fps • {}", m.width, m.height, m.fps, m.codec_name));
+            let stream_desc = peer.active_stream.as_ref().map(|m| {
+                format!(
+                    "{}x{} • {} • {}",
+                    m.width,
+                    m.height,
+                    video_mode_display_label(m.fps),
+                    m.codec_name
+                )
+            });
             let audio_state = app.peer_sliders.get(&peer_id).cloned();
 
             v_flex()
@@ -544,7 +549,9 @@ pub fn render_stage(
                 } else {
                     bs.effective_fps
                 };
-                let fps_txt = if bs.effective_fps > 0
+                let fps_txt = if bs.configured_fps <= u32::from(TEXT_FOCUS_FPS) {
+                    "Texto Nítido".to_string()
+                } else if bs.effective_fps > 0
                     && bs.effective_fps < bs.configured_fps
                     && bs.throttle_reason != ThrottleReason::None
                 {

@@ -11,11 +11,13 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, ICodecAPI, IMFActivate,
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown,
-    MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12, CODECAPI_AVEncCommonLowLatency,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Base, ICodecAPI,
+    IMFActivate, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFShutdown, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
+    CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, METransformHaveOutput, METransformNeedInput,
     MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT,
@@ -56,7 +58,12 @@ enum MfCommand {
         reply: std_mpsc::SyncSender<EncodeReply>,
     },
     SetBitrate {
-        bitrate_bps: u32,
+        target_bps: u32,
+        max_bps: u32,
+        reply: std_mpsc::SyncSender<Result<(), MediaError>>,
+    },
+    SetTargetFps {
+        fps: u8,
         reply: std_mpsc::SyncSender<Result<(), MediaError>>,
     },
 }
@@ -94,13 +101,13 @@ impl Drop for ComMfGuard {
 }
 
 impl MfH264Encoder {
-    pub fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
+    pub fn new(fps: u8, target_bps: u32, max_bps: u32) -> Result<Self, MediaError> {
         let (init_tx, init_rx) = std_mpsc::sync_channel::<Result<(), MediaError>>(1);
         let (cmd_tx, cmd_rx) = std_mpsc::sync_channel::<MfCommand>(1);
 
         let worker = std::thread::Builder::new()
             .name("mf-h264-worker".to_string())
-            .spawn(move || run_mf_worker(fps, bitrate_bps, init_tx, cmd_rx))
+            .spawn(move || run_mf_worker(fps, target_bps, max_bps, init_tx, cmd_rx))
             .map_err(|e| MediaError::Codec(format!("Failed to spawn MF H.264 worker thread: {e}")))?;
 
         match init_rx.recv() {
@@ -143,7 +150,8 @@ impl MfH264Encoder {
 
 fn run_mf_worker(
     fps: u8,
-    bitrate_bps: u32,
+    target_bps: u32,
+    max_bps: u32,
     init_tx: std_mpsc::SyncSender<Result<(), MediaError>>,
     cmd_rx: std_mpsc::Receiver<MfCommand>,
 ) {
@@ -155,7 +163,7 @@ fn run_mf_worker(
         }
     };
 
-    let mut inner = match MfWorkerInner::new(fps, bitrate_bps) {
+    let mut inner = match MfWorkerInner::new(fps, target_bps, max_bps) {
         Ok(inner) => inner,
         Err(err) => {
             let _ = init_tx.send(Err(err));
@@ -180,8 +188,16 @@ fn run_mf_worker(
                 let res = inner.encode_nv12(width, height, &nv12_buf);
                 let _ = reply.send((res, nv12_buf));
             }
-            MfCommand::SetBitrate { bitrate_bps, reply } => {
-                let res = inner.set_bitrate(bitrate_bps);
+            MfCommand::SetBitrate {
+                target_bps,
+                max_bps,
+                reply,
+            } => {
+                let res = inner.set_bitrate(target_bps, max_bps);
+                let _ = reply.send(res);
+            }
+            MfCommand::SetTargetFps { fps, reply } => {
+                let res = inner.set_target_fps(fps);
                 let _ = reply.send(res);
             }
         }
@@ -197,13 +213,14 @@ struct MfWorkerInner {
     _d3d_device: ID3D11Device,
     fps: u8,
     bitrate_bps: u32,
+    max_bitrate_bps: u32,
     configured_dims: Option<(u32, u32)>,
     force_next_idr: bool,
     frame_index: u64,
 }
 
 impl MfWorkerInner {
-    fn new(fps: u8, bitrate_bps: u32) -> Result<Self, MediaError> {
+    fn new(fps: u8, target_bps: u32, max_bps: u32) -> Result<Self, MediaError> {
         unsafe {
             let mut d3d_device: Option<ID3D11Device> = None;
             D3D11CreateDevice(
@@ -306,6 +323,9 @@ impl MfWorkerInner {
 
             info!(is_async, "Initialized Windows Media Foundation Hardware H.264 MFT");
 
+            let clamped_target = target_bps.clamp(200_000, 30_000_000);
+            let clamped_max = max_bps.max(clamped_target).clamp(200_000, 35_000_000);
+
             Ok(Self {
                 transform,
                 event_gen,
@@ -313,7 +333,8 @@ impl MfWorkerInner {
                 _dxgi_mgr: dxgi_mgr,
                 _d3d_device: d3d_device,
                 fps: fps.clamp(1, 60),
-                bitrate_bps: bitrate_bps.clamp(300_000, 35_000_000),
+                bitrate_bps: clamped_target,
+                max_bitrate_bps: clamped_max,
                 configured_dims: None,
                 force_next_idr: true,
                 frame_index: 0,
@@ -327,16 +348,28 @@ impl MfWorkerInner {
         if let Some(api) = &self.codec_api {
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonRateControlMode,
-                &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32),
+                &VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
             );
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonMeanBitRate,
                 &VARIANT::from(self.bitrate_bps),
             );
+            let _ = api.SetValue(
+                &CODECAPI_AVEncCommonMaxBitRate,
+                &VARIANT::from(self.max_bitrate_bps.max(self.bitrate_bps)),
+            );
+            if self.fps <= 5 {
+                let _ = api.SetValue(&CODECAPI_AVEncCommonQuality, &VARIANT::from(85u32));
+                let _ = api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(80u32));
+            }
             let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &VARIANT::from(true));
             let _ = api.SetValue(&CODECAPI_AVEncCommonRealTime, &VARIANT::from(true));
             let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
-            let gop = u32::from(self.fps) * 3;
+            let gop = if self.fps <= 5 {
+                12u32
+            } else {
+                u32::from(self.fps) * 3
+            };
             let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop));
         }
 
@@ -455,16 +488,59 @@ impl MfWorkerInner {
         }
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
-        let clamped = bitrate_bps.clamp(300_000, 35_000_000);
-        let diff = (clamped as i64 - self.bitrate_bps as i64).unsigned_abs();
-        if diff * 20 <= u64::from(self.bitrate_bps.max(1)) {
+    fn set_bitrate(&mut self, target_bps: u32, max_bps: u32) -> Result<(), MediaError> {
+        let clamped_target = target_bps.clamp(200_000, 30_000_000);
+        let clamped_max = max_bps.max(clamped_target).clamp(200_000, 35_000_000);
+        let target_diff = (clamped_target as i64 - self.bitrate_bps as i64).unsigned_abs();
+        let max_diff = (clamped_max as i64 - self.max_bitrate_bps as i64).unsigned_abs();
+        if target_diff * 20 <= u64::from(self.bitrate_bps.max(1))
+            && max_diff * 20 <= u64::from(self.max_bitrate_bps.max(1))
+        {
             return Ok(());
         }
-        self.bitrate_bps = clamped;
+        let prev_target = self.bitrate_bps;
+        self.bitrate_bps = clamped_target;
+        self.max_bitrate_bps = clamped_max;
         if let Some(api) = &self.codec_api {
             unsafe {
-                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(clamped));
+                if clamped_target >= prev_target {
+                    let _ = api.SetValue(
+                        &CODECAPI_AVEncCommonMaxBitRate,
+                        &VARIANT::from(clamped_max),
+                    );
+                    let _ = api.SetValue(
+                        &CODECAPI_AVEncCommonMeanBitRate,
+                        &VARIANT::from(clamped_target),
+                    );
+                } else {
+                    let _ = api.SetValue(
+                        &CODECAPI_AVEncCommonMeanBitRate,
+                        &VARIANT::from(clamped_target),
+                    );
+                    let _ = api.SetValue(
+                        &CODECAPI_AVEncCommonMaxBitRate,
+                        &VARIANT::from(clamped_max),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_target_fps(&mut self, fps: u8) -> Result<(), MediaError> {
+        let clamped = fps.clamp(1, 60);
+        if clamped == self.fps {
+            return Ok(());
+        }
+        self.fps = clamped;
+        if let Some(api) = &self.codec_api {
+            let gop = if clamped <= 5 {
+                12u32
+            } else {
+                u32::from(clamped) * 3
+            };
+            unsafe {
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop));
             }
         }
         Ok(())
@@ -502,8 +578,16 @@ impl VideoEncoder for MfH264Encoder {
         self.pending_keyframe = true;
     }
 
-    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError> {
-        self.send_command(|reply| MfCommand::SetBitrate { bitrate_bps, reply })?
+    fn set_bitrate(&mut self, target_bps: u32, max_bps: u32) -> Result<(), MediaError> {
+        self.send_command(|reply| MfCommand::SetBitrate {
+            target_bps,
+            max_bps,
+            reply,
+        })?
+    }
+
+    fn set_target_fps(&mut self, fps: u8) -> Result<(), MediaError> {
+        self.send_command(|reply| MfCommand::SetTargetFps { fps, reply })?
     }
 
     fn backend_name(&self) -> &'static str {

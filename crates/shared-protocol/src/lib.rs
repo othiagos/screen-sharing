@@ -12,7 +12,27 @@ pub const ALPN_SFU_QUIC: &[u8] = b"screenshare-sfu/1";
 
 pub const MIN_ADAPTIVE_BITRATE_BPS: u32 = 400_000;
 pub const SFU_MINORITY_FLOOR_BPS: u32 = 1_000_000;
-pub const MAX_ADAPTIVE_BITRATE_BPS: u32 = 22_000_000;
+pub const MAX_ADAPTIVE_BITRATE_BPS: u32 = 12_000_000;
+pub const TEXT_FOCUS_FPS: u8 = 5;
+
+/// Quantizes an arbitrary frame rate to one of the supported presets (`5`, `15`, `30`, `60`).
+pub fn sanitize_video_fps(fps: u8) -> u8 {
+    match fps {
+        0..=9 => TEXT_FOCUS_FPS,
+        10..=22 => 15,
+        23..=45 => 30,
+        _ => 60,
+    }
+}
+
+/// Human-friendly mode label hiding raw `5 FPS` behind `"Texto Nítido"`.
+pub fn video_mode_display_label(fps: u8) -> String {
+    if fps <= TEXT_FOCUS_FPS {
+        "Texto Nítido".to_string()
+    } else {
+        format!("{fps} FPS")
+    }
+}
 
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_VIDEO_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -119,15 +139,15 @@ impl TargetResolution {
         [Self::R720p, Self::R1080p, Self::R1440p, Self::Native]
     }
 
-    /// Returns true if `(src_width, src_height)` meets or exceeds this preset's bounding box
-    /// (orientation-agnostic) without requiring upscaling beyond the source resolution.
+    /// Returns true if `(src_width, src_height)` meets or sufficiently represents this preset
+    /// (allowing taskbar/titlebar chrome on maximized windows and avoiding heavy downscaling of >720p windows).
     pub fn is_supported_by_source(self, src_width: u32, src_height: u32) -> bool {
         let src_long = src_width.max(src_height);
         let src_short = src_width.min(src_height);
         match self {
-            Self::R720p => src_long >= 1280 && src_short >= 720,
-            Self::R1080p => src_long >= 1920 && src_short >= 1080,
-            Self::R1440p => src_long >= 2560 && src_short >= 1440,
+            Self::R720p => src_long >= 1200 && src_short >= 680,
+            Self::R1080p => src_long > 1366 && src_short > 768,
+            Self::R1440p => src_long >= 2240 && src_short >= 1260,
             Self::Native => true,
         }
     }
@@ -159,18 +179,20 @@ impl TargetResolution {
             .unwrap_or(Self::Native)
     }
 
-    /// Resolves `Native` to the matching tier for bitrate calculation when source dimensions are known.
+    /// Resolves `Native` (or any captured dimensions) to the matching table bucket (`720p` / `1080p` / `1440p`).
     pub fn effective_bitrate_tier(self, src_width: u32, src_height: u32) -> Self {
         let clamped = self.clamp_to_source(src_width, src_height);
         if !matches!(clamped, Self::Native) {
             return clamped;
         }
-        if Self::R1440p.is_supported_by_source(src_width, src_height) {
-            Self::R1440p
-        } else if Self::R1080p.is_supported_by_source(src_width, src_height) {
+        let src_long = src_width.max(src_height);
+        let src_short = src_width.min(src_height);
+        if src_long <= 1280 && src_short <= 720 {
+            Self::R720p
+        } else if src_long <= 1920 && src_short <= 1080 {
             Self::R1080p
         } else {
-            Self::R720p
+            Self::R1440p
         }
     }
 }
@@ -195,73 +217,46 @@ impl ThrottleReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum BitratePreset {
-    Mbps6,
-    #[default]
-    Mbps12,
-    Mbps20,
-    Auto,
+/// Target Variable Bitrate (VBR) envelope `[min_bps, max_bps]` for a `(resolution, fps)` cell.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VbrBitrateRange {
+    pub min_bps: u32,
+    pub max_bps: u32,
 }
 
-impl BitratePreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mbps6 => "Até 6 Mbps",
-            Self::Mbps12 => "Até 12 Mbps",
-            Self::Mbps20 => "Até 20 Mbps",
-            Self::Auto => "Auto (Adaptativo)",
-        }
+impl VbrBitrateRange {
+    pub const fn new(min_bps: u32, max_bps: u32) -> Self {
+        Self { min_bps, max_bps }
     }
 
-    /// Maximum bitrate ceiling (in bps) allowed for this preset, resolution tier, and FPS.
-    pub fn max_bps(self, resolution: TargetResolution, fps: u8) -> u32 {
-        let scale_fps = |base: u32| -> u32 {
-            if fps <= 20 {
-                (base * 6) / 10
-            } else if fps <= 35 {
-                (base * 8) / 10
-            } else {
-                base
-            }
-        };
-
-        match self {
-            Self::Mbps6 => 6_000_000,
-            Self::Mbps12 => 12_000_000,
-            Self::Mbps20 => 20_000_000,
-            Self::Auto => {
-                let base = match resolution {
-                    TargetResolution::R720p => 9_000_000,
-                    TargetResolution::R1080p => 16_000_000,
-                    TargetResolution::R1440p | TargetResolution::Native => MAX_ADAPTIVE_BITRATE_BPS,
-                };
-                scale_fps(base).clamp(MIN_ADAPTIVE_BITRATE_BPS, MAX_ADAPTIVE_BITRATE_BPS)
-            }
-        }
+    /// Initial bitrate positioned between cell midpoint and ceiling (~67% of `[min, max]`).
+    pub const fn initial_bps(self) -> u32 {
+        self.min_bps + ((self.max_bps - self.min_bps) * 2) / 3
     }
+}
 
-    /// Conservative starting bitrate (in bps) to avoid initial link saturation before probe-up.
-    pub fn initial_bps(self, resolution: TargetResolution, fps: u8) -> u32 {
-        let cap = self.max_bps(resolution, fps);
-        let tier_start = match resolution {
-            TargetResolution::R720p => 5_500_000,
-            TargetResolution::R1080p => 10_000_000,
-            TargetResolution::R1440p | TargetResolution::Native => 14_000_000,
-        };
-        let fps_scaled = if fps <= 20 {
-            (tier_start * 55) / 100
-        } else if fps <= 35 {
-            (tier_start * 75) / 100
-        } else {
-            tier_start
-        };
-        match self {
-            Self::Auto => fps_scaled.min(cap).max(MIN_ADAPTIVE_BITRATE_BPS),
-            Self::Mbps6 | Self::Mbps12 | Self::Mbps20 => {
-                ((cap * 8) / 10).min(cap).max(MIN_ADAPTIVE_BITRATE_BPS)
-            }
-        }
+/// Looks up the `[min, max]` VBR range for a resolution tier and FPS preset (`5`, `15`, `30`, `60`).
+pub fn vbr_bitrate_range(resolution: TargetResolution, fps: u8) -> VbrBitrateRange {
+    let tier = match resolution {
+        TargetResolution::R720p => TargetResolution::R720p,
+        TargetResolution::R1080p | TargetResolution::Native => TargetResolution::R1080p,
+        TargetResolution::R1440p => TargetResolution::R1440p,
+    };
+    match (tier, sanitize_video_fps(fps)) {
+        (TargetResolution::R720p, 5) => VbrBitrateRange::new(600_000, 900_000),
+        (TargetResolution::R720p, 15) => VbrBitrateRange::new(1_000_000, 1_500_000),
+        (TargetResolution::R720p, 30) => VbrBitrateRange::new(1_500_000, 2_500_000),
+        (TargetResolution::R720p, _) => VbrBitrateRange::new(2_500_000, 4_000_000),
+
+        (TargetResolution::R1080p, 5) => VbrBitrateRange::new(1_000_000, 1_800_000),
+        (TargetResolution::R1080p, 15) => VbrBitrateRange::new(1_800_000, 2_800_000),
+        (TargetResolution::R1080p, 30) => VbrBitrateRange::new(2_800_000, 4_500_000),
+        (TargetResolution::R1080p, _) => VbrBitrateRange::new(4_500_000, 7_000_000),
+
+        (TargetResolution::R1440p, 5) => VbrBitrateRange::new(1_800_000, 3_000_000),
+        (TargetResolution::R1440p, 15) => VbrBitrateRange::new(3_000_000, 4_800_000),
+        (TargetResolution::R1440p, 30) => VbrBitrateRange::new(4_800_000, 7_500_000),
+        _ => VbrBitrateRange::new(7_500_000, 12_000_000),
     }
 }
 
@@ -278,17 +273,12 @@ pub struct StreamConfig {
     pub target: CaptureTarget,
     pub resolution: TargetResolution,
     pub fps: u8,
-    pub bitrate: BitratePreset,
     pub audio_mode: AudioCaptureMode,
 }
 
 impl StreamConfig {
     pub fn sanitized_fps(&self) -> u8 {
-        match self.fps {
-            0..=22 => 15,
-            23..=45 => 30,
-            _ => 60,
-        }
+        sanitize_video_fps(self.fps)
     }
 }
 
@@ -668,25 +658,39 @@ mod tests {
     }
 
     #[test]
-    fn test_bitrate_preset_bounds_and_labels() {
-        assert_eq!(BitratePreset::Mbps6.label(), "Até 6 Mbps");
-        assert_eq!(BitratePreset::Mbps12.label(), "Até 12 Mbps");
-        assert_eq!(BitratePreset::Mbps20.label(), "Até 20 Mbps");
-        assert_eq!(BitratePreset::Auto.label(), "Auto (Adaptativo)");
+    fn test_vbr_bitrate_matrix_and_fps_sanitization() {
+        let cases = [
+            (TargetResolution::R720p, 5, 600_000, 900_000),
+            (TargetResolution::R720p, 15, 1_000_000, 1_500_000),
+            (TargetResolution::R720p, 30, 1_500_000, 2_500_000),
+            (TargetResolution::R720p, 60, 2_500_000, 4_000_000),
+            (TargetResolution::R1080p, 5, 1_000_000, 1_800_000),
+            (TargetResolution::R1080p, 15, 1_800_000, 2_800_000),
+            (TargetResolution::R1080p, 30, 2_800_000, 4_500_000),
+            (TargetResolution::R1080p, 60, 4_500_000, 7_000_000),
+            (TargetResolution::R1440p, 5, 1_800_000, 3_000_000),
+            (TargetResolution::R1440p, 15, 3_000_000, 4_800_000),
+            (TargetResolution::R1440p, 30, 4_800_000, 7_500_000),
+            (TargetResolution::R1440p, 60, 7_500_000, 12_000_000),
+        ];
 
-        assert_eq!(BitratePreset::Mbps12.max_bps(TargetResolution::R1080p, 60), 12_000_000);
-        assert!(
-            BitratePreset::Auto.initial_bps(TargetResolution::R1080p, 60)
-                <= BitratePreset::Auto.max_bps(TargetResolution::R1080p, 60)
-        );
-        assert!(
-            BitratePreset::Mbps6.initial_bps(TargetResolution::R720p, 30)
-                <= BitratePreset::Mbps6.max_bps(TargetResolution::R720p, 30)
-        );
-        assert!(
-            BitratePreset::Auto.max_bps(TargetResolution::R720p, 15)
-                < BitratePreset::Auto.max_bps(TargetResolution::R720p, 60)
-        );
+        for (res, fps, expected_min, expected_max) in cases {
+            let range = vbr_bitrate_range(res, fps);
+            assert_eq!(range.min_bps, expected_min, "min mismatch for {res:?}@{fps}");
+            assert_eq!(range.max_bps, expected_max, "max mismatch for {res:?}@{fps}");
+            let init = range.initial_bps();
+            assert!(
+                init > range.min_bps && init < range.max_bps,
+                "initial {init} must sit strictly inside [{expected_min}, {expected_max}]"
+            );
+        }
+
+        assert_eq!(sanitize_video_fps(5), TEXT_FOCUS_FPS);
+        assert_eq!(sanitize_video_fps(15), 15);
+        assert_eq!(sanitize_video_fps(30), 30);
+        assert_eq!(sanitize_video_fps(60), 60);
+        assert_eq!(video_mode_display_label(5), "Texto Nítido");
+        assert_eq!(video_mode_display_label(60), "60 FPS");
     }
 
     #[test]
@@ -749,8 +753,43 @@ mod tests {
                 TargetResolution::Native,
             ]
         );
+        // Maximized 1440p window minus taskbar still keeps 1440p available
+        assert_eq!(
+            TargetResolution::supported_for_source(2560, 1392),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::R1440p,
+                TargetResolution::Native,
+            ]
+        );
         assert_eq!(
             TargetResolution::supported_for_source(1920, 1080),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::Native,
+            ]
+        );
+        // Maximized 1080p window (minus taskbar/titlebar) and 900p+ windows keep 1080p available
+        assert_eq!(
+            TargetResolution::supported_for_source(1920, 1032),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::Native,
+            ]
+        );
+        assert_eq!(
+            TargetResolution::supported_for_source(1904, 1001),
+            vec![
+                TargetResolution::R720p,
+                TargetResolution::R1080p,
+                TargetResolution::Native,
+            ]
+        );
+        assert_eq!(
+            TargetResolution::supported_for_source(1600, 900),
             vec![
                 TargetResolution::R720p,
                 TargetResolution::R1080p,
@@ -786,6 +825,10 @@ mod tests {
         assert_eq!(
             TargetResolution::Native.effective_bitrate_tier(900, 600),
             TargetResolution::R720p
+        );
+        assert_eq!(
+            TargetResolution::Native.effective_bitrate_tier(1600, 900),
+            TargetResolution::R1080p
         );
         assert_eq!(
             TargetResolution::Native.effective_bitrate_tier(1920, 1080),

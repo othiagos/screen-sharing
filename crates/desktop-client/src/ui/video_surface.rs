@@ -5,7 +5,7 @@ use gpui_kit::{
     Div, ElementId, InteractiveElement, ObjectFit, ParentElement, RenderImage, SharedString,
     Stateful, Styled, StyledImage as _, Window, black, div, hsla, img, px,
 };
-use shared_protocol::{PeerId, ThrottleReason};
+use shared_protocol::{PeerId, ThrottleReason, TEXT_FOCUS_FPS};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,11 +184,20 @@ pub fn render_video_tile(
                 eff_fps,
                 st.target_fps.unwrap_or(eff_fps),
             );
-            let fps_text = match st.target_fps {
-                Some(target) if eff_fps < target && st.throttle_reason != ThrottleReason::None => {
-                    format!("{}/{} fps", st.fps, target)
+            let fps_text = if st
+                .target_fps
+                .is_some_and(|target| target <= u32::from(TEXT_FOCUS_FPS))
+            {
+                "Texto Nítido".to_string()
+            } else {
+                match st.target_fps {
+                    Some(target)
+                        if eff_fps < target && st.throttle_reason != ThrottleReason::None =>
+                    {
+                        format!("{}/{} fps", st.fps, target)
+                    }
+                    _ => format!("{} fps", st.fps),
                 }
-                _ => format!("{} fps", st.fps),
             };
             lines.push(format!("{}x{} • {fps_text}", st.width, st.height));
             if let Some(backend) = &st.backend {

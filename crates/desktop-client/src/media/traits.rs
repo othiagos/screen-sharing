@@ -82,7 +82,7 @@ pub trait AudioCapturer: Send + Sync + 'static {
 pub trait VideoEncoder: Send + 'static {
     fn encode_frame(&mut self, frame: &RawVideoFrame) -> Result<Vec<u8>, MediaError>;
     fn request_keyframe(&mut self);
-    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), MediaError>;
+    fn set_bitrate(&mut self, target_bps: u32, max_bps: u32) -> Result<(), MediaError>;
     fn set_target_fps(&mut self, _fps: u8) -> Result<(), MediaError> {
         Ok(())
     }

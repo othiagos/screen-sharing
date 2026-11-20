@@ -14,6 +14,13 @@ fn load_window_icon() -> Option<Arc<image::RgbaImage>> {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
