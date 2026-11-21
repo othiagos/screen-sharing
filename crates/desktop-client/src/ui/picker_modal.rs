@@ -19,7 +19,7 @@ use shared_protocol::{
 };
 use std::sync::Arc;
 
-const TEXT_MODE_LABEL: &str = "Texto Nítido (Leitura)";
+const TEXT_MODE_LABEL: &str = "Texto Nítido";
 const AUDIO_NONE: &str = "Sem Áudio";
 const AUDIO_SYSTEM: &str = "Áudio Global do Sistema";
 const AUDIO_APP: &str = "Somente Áudio do Aplicativo";

@@ -35,6 +35,10 @@ fast_image_resize = { workspace = true }
 yuv = { workspace = true }
 openh264 = { workspace = true }
 openh264-sys2 = "0.6"
+qoi = { workspace = true }
+jpeg-encoder = { workspace = true }
+zune-core = { workspace = true }
+zune-jpeg = { workspace = true }
 
 cpal = { workspace = true }
 audiopus = { workspace = true }

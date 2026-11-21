@@ -217,6 +217,10 @@ pub trait VideoEncoder: Send + 'static {
     fn set_target_fps(&mut self, _fps: u8) -> Result<(), MediaError> {
         Ok(())
     }
+    /// Wire codec flag written into `VideoFrameHeader.flags` (defaults to `VIDEO_FLAG_H264`).
+    fn codec_flag(&self) -> u8 {
+        shared_protocol::VIDEO_FLAG_H264
+    }
     fn backend_name(&self) -> &'static str;
 }
 

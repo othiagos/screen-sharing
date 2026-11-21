@@ -532,6 +532,7 @@ async fn test_reading_mode_5fps_vbr_stream_end_to_end() -> anyhow::Result<()> {
     })
     .await?;
     assert_eq!(announced_meta.fps, TEXT_FOCUS_FPS);
+    assert_eq!(announced_meta.codec_name, "Tiles-4:4:4");
     assert!(!announced_meta.has_audio);
 
     viewer.client.set_subscription(broadcaster_id, true, false);

@@ -938,12 +938,21 @@ impl VideoEncoder for H264VideoEncoder {
     }
 }
 
-/// Creates the best available H.264 encoder for the current platform (Hardware MFT on Windows, OpenH264 fallback).
+/// Creates the best available video encoder for the target mode:
+/// - `<= 5 FPS` ("Texto Nítido"): dedicated 4:4:4 dirty-tile lossless/near-lossless encoder.
+/// - `15/30/60 FPS`: Hardware H.264 MFT on Windows or multi-slice OpenH264 fallback.
 pub fn create_best_video_encoder(
     fps: u8,
     bitrate_bps: u32,
     max_bitrate_bps: u32,
 ) -> Result<Box<dyn VideoEncoder>, MediaError> {
+    if fps <= shared_protocol::TEXT_FOCUS_FPS {
+        return Ok(Box::new(crate::media::tile444::Tile444VideoEncoder::new(
+            bitrate_bps,
+            max_bitrate_bps,
+        )));
+    }
+
     #[cfg(target_os = "windows")]
     {
         match crate::media::codec_win::MfH264Encoder::new(fps, bitrate_bps, max_bitrate_bps) {

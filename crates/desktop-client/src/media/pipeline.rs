@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use shared_protocol::{
     sanitize_video_fps, vbr_bitrate_range, AudioCaptureMode, AudioPacketHeader, CaptureTarget,
     PeerId, StreamConfig, StreamMetadata, ThrottleReason, VideoFrameHeader, AUDIO_FLAG_OPUS,
-    MAX_VIDEO_FRAME_BYTES, VIDEO_FLAG_H264, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN,
+    MAX_VIDEO_FRAME_BYTES, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::media::adaptive::{AdaptiveBitrateController, AdaptiveInputs};
 use crate::media::audio_out::{OpusAudioEncoder, PeerAudioMixer};
 use crate::media::default_os_audio_capturer;
+use crate::media::tile444::Tile444VideoDecoder;
 use crate::media::traits::{AudioCapturer, RawAudioFrame, RawVideoFrame, VideoCapturer};
 use crate::media::video::{
     create_best_video_encoder, rgba_to_bgra_in_place, H264VideoDecoder, NativeVideoCapturer,
@@ -237,78 +238,114 @@ impl PeerMediaReceiver {
         let sfu_for_kf = self.sfu_handle.lock().clone();
 
         std::thread::Builder::new()
-            .name(format!("h264-dec-{}", &peer_id.to_string()[..8]))
+            .name(format!("video-dec-{}", &peer_id.to_string()[..8]))
             .spawn(move || {
-                let mut decoder = match H264VideoDecoder::new() {
-                    Ok(d) => d,
-                    Err(err) => {
-                        warn!(%peer_id, "Failed creating H264 decoder: {err}");
-                        return;
-                    }
-                };
+                let mut h264_decoder: Option<H264VideoDecoder> = None;
+                let mut tile444_decoder: Option<Tile444VideoDecoder> = None;
                 let mut fps_win_start = Instant::now();
                 let mut fps_frames = 0u32;
                 let mut current_fps = 0u32;
                 let mut needs_keyframe = false;
                 let mut last_decode_fb = Instant::now() - Duration::from_secs(1);
+                let mut pending_batch: Vec<(VideoFrameHeader, Bytes)> =
+                    Vec::with_capacity(DECODER_QUEUE_CAPACITY + 1);
 
                 while !worker_cancel.is_cancelled() {
-                    let Some((header, payload)) = rx.blocking_recv() else {
+                    let Some(first) = rx.blocking_recv() else {
                         break;
                     };
 
-                    // Drain backlog cleanly if behind, keeping only the newest keyframe if available.
-                    let mut latest = (header, payload);
-                    while let Ok((next_hdr, next_pay)) = rx.try_recv() {
-                        let is_kf = (next_hdr.flags & VIDEO_FLAG_KEYFRAME) != 0;
-                        if is_kf || !needs_keyframe {
-                            latest = (next_hdr, next_pay);
-                        }
+                    pending_batch.clear();
+                    pending_batch.push(first);
+                    while let Ok(next) = rx.try_recv() {
+                        pending_batch.push(next);
                     }
 
-                    let (hdr, pay) = latest;
-                    let is_kf = (hdr.flags & VIDEO_FLAG_KEYFRAME) != 0;
-                    if needs_keyframe && !is_kf {
-                        continue;
-                    }
+                    // If any newer keyframe arrived in the queue, jump straight to the latest keyframe.
+                    let start_idx = pending_batch
+                        .iter()
+                        .rposition(|(h, _)| h.is_keyframe())
+                        .unwrap_or(0);
 
-                    match decoder.decode_annex_b_bgra(&pay) {
-                        Ok(Some((w, h, bgra))) => {
-                            needs_keyframe = false;
-                            fps_frames += 1;
-                            let elapsed = fps_win_start.elapsed();
-                            if elapsed >= Duration::from_secs(1) {
-                                current_fps = ((f64::from(fps_frames) / elapsed.as_secs_f64()).round()
-                                    as u32)
-                                    .max(1);
-                                fps_frames = 0;
-                                fps_win_start = Instant::now();
-                            }
-                            store.update_peer(
-                                peer_id,
-                                w,
-                                h,
-                                bgra,
-                                hdr.frame_seq,
-                                current_fps,
-                            );
-                            if let Some(cb) = &notifier {
-                                cb();
-                            }
+                    let latest_is_tile444 = pending_batch
+                        .last()
+                        .is_some_and(|(h, _)| h.is_tile_444());
+
+                    // For H.264 keep lowest-latency behavior (decode latest frame); for Tile444 apply
+                    // sequential deltas after `start_idx` so no dirty tiles are skipped before keyframe.
+                    let slice_start = if !latest_is_tile444 && !needs_keyframe {
+                        pending_batch.len() - 1
+                    } else {
+                        start_idx
+                    };
+
+                    for (hdr, pay) in pending_batch.drain(slice_start..) {
+                        let is_kf = hdr.is_keyframe();
+                        if needs_keyframe && !is_kf {
+                            continue;
                         }
-                        Ok(None) => {}
-                        Err(err) => {
-                            debug!(%peer_id, "H.264 decode error (requesting IDR): {err}");
-                            if !needs_keyframe {
-                                needs_keyframe = true;
-                                if let Some(sfu) = &sfu_for_kf {
-                                    sfu.request_keyframe(peer_id);
+
+                        let decode_res = if hdr.is_tile_444() {
+                            tile444_decoder
+                                .get_or_insert_with(Tile444VideoDecoder::new)
+                                .decode_frame_bgra(&pay)
+                        } else {
+                            let dec = match h264_decoder.as_mut() {
+                                Some(d) => d,
+                                None => match H264VideoDecoder::new() {
+                                    Ok(d) => h264_decoder.insert(d),
+                                    Err(err) => {
+                                        warn!(%peer_id, "Failed creating H264 decoder: {err}");
+                                        return;
+                                    }
+                                },
+                            };
+                            dec.decode_annex_b_bgra(&pay)
+                        };
+
+                        match decode_res {
+                            Ok(Some((w, h, bgra))) => {
+                                needs_keyframe = false;
+                                fps_frames += 1;
+                                let elapsed = fps_win_start.elapsed();
+                                if elapsed >= Duration::from_secs(1) {
+                                    current_fps = ((f64::from(fps_frames) / elapsed.as_secs_f64())
+                                        .round()
+                                        as u32)
+                                        .max(1);
+                                    fps_frames = 0;
+                                    fps_win_start = Instant::now();
+                                }
+                                store.update_peer(
+                                    peer_id,
+                                    w,
+                                    h,
+                                    bgra,
+                                    hdr.frame_seq,
+                                    current_fps,
+                                );
+                                if let Some(cb) = &notifier {
+                                    cb();
                                 }
                             }
-                            if last_decode_fb.elapsed() >= Duration::from_millis(500) {
-                                last_decode_fb = Instant::now();
-                                if let Some(sfu) = &sfu_for_kf {
-                                    sfu.send_viewer_feedback(peer_id, 0, 1);
+                            Ok(None) => {
+                                if hdr.is_tile_444() {
+                                    needs_keyframe = false;
+                                }
+                            }
+                            Err(err) => {
+                                debug!(%peer_id, "Video decode error (requesting keyframe): {err}");
+                                if !needs_keyframe {
+                                    needs_keyframe = true;
+                                    if let Some(sfu) = &sfu_for_kf {
+                                        sfu.request_keyframe(peer_id);
+                                    }
+                                }
+                                if last_decode_fb.elapsed() >= Duration::from_millis(500) {
+                                    last_decode_fb = Instant::now();
+                                    if let Some(sfu) = &sfu_for_kf {
+                                        sfu.send_viewer_feedback(peer_id, 0, 1);
+                                    }
                                 }
                             }
                         }
@@ -648,7 +685,7 @@ impl LocalBroadcastSession {
                                 last_encoded_at = Some(Instant::now());
 
                                 let seq = seq_v.fetch_add(1, Ordering::Relaxed);
-                                let flags = VIDEO_FLAG_H264
+                                let flags = encoder.codec_flag()
                                     | if is_kf { VIDEO_FLAG_KEYFRAME } else { 0 };
                                 let hdr = VideoFrameHeader {
                                     sender_id: sfu_v.local_peer_id(),

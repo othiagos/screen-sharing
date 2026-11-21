@@ -7,7 +7,7 @@ use uuid::Uuid;
 pub type RoomId = String;
 pub type PeerId = Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const ALPN_SFU_QUIC: &[u8] = b"screenshare-sfu/1";
 
 pub const MIN_ADAPTIVE_BITRATE_BPS: u32 = 400_000;
@@ -43,6 +43,7 @@ pub const MEDIA_KIND_AUDIO: u8 = 2;
 
 pub const VIDEO_FLAG_KEYFRAME: u8 = 0x01;
 pub const VIDEO_FLAG_H264: u8 = 0x02;
+pub const VIDEO_FLAG_TILE_444: u8 = 0x04;
 pub const AUDIO_FLAG_OPUS: u8 = 0x01;
 
 /// Fixed 36-byte header for QUIC video frame UniStreams:
@@ -401,6 +402,10 @@ impl VideoFrameHeader {
         (self.flags & VIDEO_FLAG_KEYFRAME) != 0
     }
 
+    pub fn is_tile_444(&self) -> bool {
+        (self.flags & VIDEO_FLAG_TILE_444) != 0
+    }
+
     pub fn encode_into(&self, dst: &mut BytesMut) {
         dst.put_u8(MEDIA_KIND_VIDEO);
         dst.put_u8(self.flags);
@@ -739,6 +744,17 @@ mod tests {
             .write_prefix(&mut in_place[..VIDEO_HEADER_LEN])
             .expect("write_prefix");
         assert_eq!(in_place.freeze(), v_pkt);
+        assert!(!dec_hdr.is_tile_444());
+
+        let t444_hdr = VideoFrameHeader {
+            flags: VIDEO_FLAG_KEYFRAME | VIDEO_FLAG_TILE_444,
+            ..v_hdr
+        };
+        let t444_pkt = encode_video_packet(&t444_hdr, b"T444").expect("encode t444 packet");
+        let (dec_t444, dec_t444_pay) = VideoFrameHeader::decode(&t444_pkt).expect("decode t444");
+        assert!(dec_t444.is_keyframe());
+        assert!(dec_t444.is_tile_444());
+        assert_eq!(dec_t444_pay, b"T444");
 
         let a_hdr = AudioPacketHeader {
             sender_id,

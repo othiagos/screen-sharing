@@ -12,6 +12,7 @@ pub mod capture_win;
 pub mod codec_win;
 pub mod mock;
 pub mod pipeline;
+pub mod tile444;
 pub mod traits;
 pub mod video;
 

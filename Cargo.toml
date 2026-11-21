@@ -46,6 +46,10 @@ xcap = "0.9"
 fast_image_resize = "4.2"
 yuv = "0.8"
 openh264 = "0.6"
+qoi = "0.4"
+jpeg-encoder = { version = "0.7", features = ["simd"] }
+zune-core = "0.5"
+zune-jpeg = "0.5"
 
 cpal = "0.15"
 audiopus = "0.3.0-rc.0"
@@ -65,6 +69,18 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.yuv]
+opt-level = 3
+
+[profile.dev.package.qoi]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
+
+[profile.dev.package.zune-core]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
 opt-level = 3
 
 [profile.dev.package.xcap]
