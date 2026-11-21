@@ -13,16 +13,14 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled, StyledImage as _, Subscription, Window, black, div,
     hsla, img, px,
 };
+use rust_i18n::t;
 use shared_protocol::{
     sanitize_video_fps, AudioCaptureMode, CaptureTarget, StreamConfig, TargetResolution,
     TEXT_FOCUS_FPS,
 };
 use std::sync::Arc;
 
-const TEXT_MODE_LABEL: &str = "Texto Nítido";
-const AUDIO_NONE: &str = "Sem áudio";
-const AUDIO_SYSTEM: &str = "Áudio do computador";
-const AUDIO_APP: &str = "Somente este aplicativo";
+const FPS_PRESETS: [u8; 4] = [TEXT_FOCUS_FPS, 15, 30, 60];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioChoice {
@@ -31,42 +29,31 @@ enum AudioChoice {
     ApplicationOnly,
 }
 
-fn resolution_to_label(res: TargetResolution) -> &'static str {
+fn resolution_to_label(res: TargetResolution) -> String {
     match res {
-        TargetResolution::R720p => "720p",
-        TargetResolution::R1080p => "1080p",
-        TargetResolution::R1440p => "1440p",
-        TargetResolution::Native => "Original",
+        TargetResolution::R720p => "720p".to_string(),
+        TargetResolution::R1080p => "1080p".to_string(),
+        TargetResolution::R1440p => "1440p".to_string(),
+        TargetResolution::Native => t!("picker.resolution_original").into_owned(),
     }
 }
 
-fn label_to_resolution(label: &str) -> TargetResolution {
-    match label {
-        "720p" => TargetResolution::R720p,
-        "1440p" => TargetResolution::R1440p,
-        "Original" | "Nativa" => TargetResolution::Native,
-        _ => TargetResolution::R1080p,
+fn audio_choice_to_label(choice: AudioChoice) -> String {
+    match choice {
+        AudioChoice::None => t!("picker.audio_none").into_owned(),
+        AudioChoice::SystemGlobal => t!("picker.audio_system").into_owned(),
+        AudioChoice::ApplicationOnly => t!("picker.audio_app").into_owned(),
     }
 }
 
-fn label_to_audio_choice(label: &str) -> AudioChoice {
-    if label.starts_with("Sem") {
-        AudioChoice::None
-    } else if label.starts_with("Somente") {
-        AudioChoice::ApplicationOnly
-    } else {
-        AudioChoice::SystemGlobal
-    }
-}
-
-fn format_preview_error(raw: &str) -> &'static str {
+fn format_preview_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("seleção de tela abrirá") || lower.contains("wayland") {
-        "A seleção de tela abrirá ao iniciar o compartilhamento."
-    } else if lower.contains("minimizada") {
-        "Janela minimizada — restaure-a para ver a prévia."
+    if lower.contains("wayland") || lower.contains("screen picker") {
+        t!("picker.preview_wayland_note").into_owned()
+    } else if lower.contains("minimized") || lower.contains("minimizada") {
+        t!("picker.preview_minimized_note").into_owned()
     } else {
-        "Prévia indisponível no momento."
+        t!("picker.preview_unavailable_now").into_owned()
     }
 }
 
@@ -88,6 +75,8 @@ pub struct PickerModalState {
     active_tab: usize,
     pub selected_target: Option<CaptureTarget>,
     preferred_resolution: TargetResolution,
+    allowed_resolutions: Vec<TargetResolution>,
+    allowed_audio: Vec<AudioChoice>,
     audio_manual_override: Option<AudioChoice>,
     preview_image: Option<Arc<RenderImage>>,
     stale_images: Vec<Arc<RenderImage>>,
@@ -108,14 +97,14 @@ impl PickerModalState {
             .iter()
             .any(|s| matches!(s.target, CaptureTarget::PortalWayland));
 
+        let initial_resolutions = TargetResolution::ordered_presets().to_vec();
+        let initial_res_items: Vec<String> = initial_resolutions
+            .iter()
+            .map(|r| resolution_to_label(*r))
+            .collect();
         let resolution_select = cx.new(|cx| {
             SelectState::new(
-                vec![
-                    "720p".to_string(),
-                    "1080p".to_string(),
-                    "1440p".to_string(),
-                    "Original".to_string(),
-                ],
+                initial_res_items,
                 Some(IndexPath::default().row(1)),
                 window,
                 cx,
@@ -123,7 +112,7 @@ impl PickerModalState {
         });
 
         let fps_items = vec![
-            TEXT_MODE_LABEL.to_string(),
+            t!("modes.sharp_text").into_owned(),
             "15 FPS".to_string(),
             "30 FPS".to_string(),
             "60 FPS".to_string(),
@@ -143,9 +132,14 @@ impl PickerModalState {
             )
         });
 
+        let initial_audio = vec![AudioChoice::None, AudioChoice::SystemGlobal];
+        let initial_audio_items: Vec<String> = initial_audio
+            .iter()
+            .map(|c| audio_choice_to_label(*c))
+            .collect();
         let audio_select = cx.new(|cx| {
             SelectState::new(
-                vec![AUDIO_NONE.to_string(), AUDIO_SYSTEM.to_string()],
+                initial_audio_items,
                 Some(IndexPath::default().row(1)),
                 window,
                 cx,
@@ -154,18 +148,26 @@ impl PickerModalState {
 
         let sub_res = cx.subscribe(
             &resolution_select,
-            |this, _, ev: &SelectEvent<Vec<String>>, _| {
-                if let SelectEvent::Confirm(Some(label)) = ev {
-                    this.preferred_resolution = label_to_resolution(label);
+            |this, state, ev: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(_)) = ev {
+                    if let Some(ix) = state.read(cx).selected_index(cx) {
+                        if let Some(&res) = this.allowed_resolutions.get(ix.row) {
+                            this.preferred_resolution = res;
+                        }
+                    }
                 }
             },
         );
         let sub_audio = cx.subscribe(
             &audio_select,
-            |this, _, ev: &SelectEvent<Vec<String>>, cx| {
-                if let SelectEvent::Confirm(Some(label)) = ev {
-                    this.audio_manual_override = Some(label_to_audio_choice(label));
-                    cx.notify();
+            |this, state, ev: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(_)) = ev {
+                    if let Some(ix) = state.read(cx).selected_index(cx) {
+                        if let Some(&choice) = this.allowed_audio.get(ix.row) {
+                            this.audio_manual_override = Some(choice);
+                            cx.notify();
+                        }
+                    }
                 }
             },
         );
@@ -187,6 +189,8 @@ impl PickerModalState {
             active_tab: initial_tab,
             selected_target: None,
             preferred_resolution: config.resolution,
+            allowed_resolutions: initial_resolutions,
+            allowed_audio: initial_audio,
             audio_manual_override: None,
             preview_image: None,
             stale_images: Vec::new(),
@@ -238,8 +242,8 @@ impl PickerModalState {
         match &self.selected_target {
             Some(CaptureTarget::Monitor { name, .. }) if !name.trim().is_empty() => name.clone(),
             Some(CaptureTarget::Window { title, .. }) if !title.trim().is_empty() => title.clone(),
-            Some(CaptureTarget::PortalWayland) => "Tela do Sistema".to_string(),
-            _ => "Transmissão de Tela".to_string(),
+            Some(CaptureTarget::PortalWayland) => t!("picker.tab_system").into_owned(),
+            _ => t!("picker.default_target_label").into_owned(),
         }
     }
 
@@ -255,12 +259,13 @@ impl PickerModalState {
         };
         let items: Vec<String> = allowed
             .iter()
-            .map(|res| resolution_to_label(*res).to_string())
+            .map(|res| resolution_to_label(*res))
             .collect();
         let idx = allowed
             .iter()
             .position(|res| *res == target_res)
             .unwrap_or(items.len().saturating_sub(1));
+        self.allowed_resolutions = allowed;
 
         self.resolution_select.update(cx, |sel, cx| {
             sel.set_items(items, window, cx);
@@ -278,15 +283,16 @@ impl PickerModalState {
             self.audio_manual_override = None;
         }
         let allow_app_audio = self.active_tab == 1;
-        let items = if allow_app_audio {
+        let choices = if allow_app_audio {
             vec![
-                AUDIO_NONE.to_string(),
-                AUDIO_SYSTEM.to_string(),
-                AUDIO_APP.to_string(),
+                AudioChoice::None,
+                AudioChoice::SystemGlobal,
+                AudioChoice::ApplicationOnly,
             ]
         } else {
-            vec![AUDIO_NONE.to_string(), AUDIO_SYSTEM.to_string()]
+            vec![AudioChoice::None, AudioChoice::SystemGlobal]
         };
+        let items: Vec<String> = choices.iter().map(|c| audio_choice_to_label(*c)).collect();
 
         let default_choice = if allow_app_audio {
             AudioChoice::ApplicationOnly
@@ -297,11 +303,11 @@ impl PickerModalState {
             Some(choice) if allow_app_audio || choice != AudioChoice::ApplicationOnly => choice,
             _ => default_choice,
         };
-        let idx = match desired {
-            AudioChoice::None => 0,
-            AudioChoice::SystemGlobal => 1,
-            AudioChoice::ApplicationOnly => 2,
-        };
+        let idx = choices
+            .iter()
+            .position(|&c| c == desired)
+            .unwrap_or(1.min(choices.len().saturating_sub(1)));
+        self.allowed_audio = choices;
 
         self.audio_select.update(cx, |sel, cx| {
             sel.set_items(items, window, cx);
@@ -362,7 +368,7 @@ impl PickerModalState {
             }
             self.preview_source_dims = None;
             self.preview_loading = false;
-            self.preview_note = Some("Selecione uma tela ou janela na lista à esquerda.".to_string());
+            self.preview_note = Some(t!("picker.preview_select_left").into_owned());
             cx.notify();
             return;
         };
@@ -400,11 +406,11 @@ impl PickerModalState {
                     }
                     Err(err) => {
                         let raw = err.to_string();
-                        tracing::debug!("Prévia da fonte indisponível: {raw}");
+                        tracing::debug!("Source preview unavailable: {raw}");
                         if let Some(prev) = modal.preview_image.take() {
                             modal.stale_images.push(prev);
                         }
-                        modal.preview_note = Some(format_preview_error(&raw).to_string());
+                        modal.preview_note = Some(format_preview_error(&raw));
                     }
                 }
                 cx.notify();
@@ -433,40 +439,30 @@ impl PickerModalState {
 
     pub fn build_stream_config(&self, cx: &gpui_kit::App) -> Option<StreamConfig> {
         let target = self.selected_target.clone()?;
-        let res_str = self
+        let mut resolution = self
             .resolution_select
             .read(cx)
-            .selected_value()
-            .map(String::as_str)
-            .unwrap_or("1080p");
-        let mut resolution = label_to_resolution(res_str);
+            .selected_index(cx)
+            .and_then(|ix| self.allowed_resolutions.get(ix.row).copied())
+            .unwrap_or(self.preferred_resolution);
         if let Some((w, h)) = self.selected_source_dims() {
             resolution = resolution.clamp_to_source(w, h);
         }
 
-        let fps_str = self
+        let fps = self
             .fps_select
             .read(cx)
-            .selected_value()
-            .map(String::as_str)
-            .unwrap_or("60 FPS");
-        let fps = if fps_str == TEXT_MODE_LABEL || fps_str.starts_with("Texto") {
-            TEXT_FOCUS_FPS
-        } else if fps_str.starts_with("15") {
-            15
-        } else if fps_str.starts_with("30") {
-            30
-        } else {
-            60
-        };
+            .selected_index(cx)
+            .and_then(|ix| FPS_PRESETS.get(ix.row).copied())
+            .unwrap_or(60);
 
-        let audio_str = self
+        let selected_audio = self
             .audio_select
             .read(cx)
-            .selected_value()
-            .map(String::as_str)
-            .unwrap_or(AUDIO_SYSTEM);
-        let audio_mode = match label_to_audio_choice(audio_str) {
+            .selected_index(cx)
+            .and_then(|ix| self.allowed_audio.get(ix.row).copied())
+            .unwrap_or(AudioChoice::SystemGlobal);
+        let audio_mode = match selected_audio {
             AudioChoice::None => AudioCaptureMode::None,
             AudioChoice::ApplicationOnly => match &target {
                 CaptureTarget::Window { pid, .. } if *pid > 0 => {
@@ -509,8 +505,9 @@ impl Render for PickerModalState {
         let audio_is_app = self
             .audio_select
             .read(cx)
-            .selected_value()
-            .is_some_and(|v| label_to_audio_choice(v) == AudioChoice::ApplicationOnly);
+            .selected_index(cx)
+            .and_then(|ix| self.allowed_audio.get(ix.row).copied())
+            == Some(AudioChoice::ApplicationOnly);
         let missing_pid_warning = matches!(
             &selected,
             Some(CaptureTarget::Window { pid, .. }) if *pid == 0
@@ -518,21 +515,18 @@ impl Render for PickerModalState {
 
         let hint_content = if missing_pid_warning {
             (
-                "Para esta janela, será compartilhado o áudio do computador.".to_string(),
+                t!("picker.hint_system_audio_fallback").into_owned(),
                 warning,
             )
         } else if let Some((w, h)) = source_dims {
-            (format!("Tamanho original: {w}×{h}"), muted)
+            (
+                t!("picker.hint_original_size", width = w, height = h).into_owned(),
+                muted,
+            )
         } else if matches!(selected, Some(CaptureTarget::PortalWayland)) {
-            (
-                "A tela será escolhida ao iniciar o compartilhamento.".to_string(),
-                muted,
-            )
+            (t!("picker.hint_system_picker").into_owned(), muted)
         } else {
-            (
-                "A qualidade se ajusta automaticamente ao tamanho da tela.".to_string(),
-                muted,
-            )
+            (t!("picker.hint_auto_quality").into_owned(), muted)
         };
 
         let mut tabs = TabBar::new("picker-source-tabs")
@@ -541,10 +535,10 @@ impl Render for PickerModalState {
             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                 this.select_tab(*ix, window, cx);
             }))
-            .child(Tab::new().label("Monitores"))
-            .child(Tab::new().label("Janelas"));
+            .child(Tab::new().label(t!("picker.tab_monitors").into_owned()))
+            .child(Tab::new().label(t!("picker.tab_windows").into_owned()));
         if has_wayland {
-            tabs = tabs.child(Tab::new().label("Tela do Sistema"));
+            tabs = tabs.child(Tab::new().label(t!("picker.tab_system").into_owned()));
         }
 
         let list_items: Vec<_> = filtered
@@ -554,9 +548,9 @@ impl Render for PickerModalState {
                 let is_sel = selected.as_ref() == Some(&info.target);
                 let title = info.display_label.clone();
                 let badge = match &info.target {
-                    CaptureTarget::Monitor { .. } => "Monitor",
-                    CaptureTarget::Window { .. } => "Janela",
-                    CaptureTarget::PortalWayland => "Sistema",
+                    CaptureTarget::Monitor { .. } => t!("picker.badge_monitor").into_owned(),
+                    CaptureTarget::Window { .. } => t!("picker.badge_window").into_owned(),
+                    CaptureTarget::PortalWayland => t!("picker.badge_system").into_owned(),
                 };
                 let target_clone = info.target.clone();
 
@@ -617,11 +611,11 @@ impl Render for PickerModalState {
                     .into_any_element()
             } else {
                 let note = if self.preview_loading {
-                    "Carregando prévia..."
+                    t!("picker.preview_loading").into_owned()
                 } else {
                     self.preview_note
-                        .as_deref()
-                        .unwrap_or("Prévia indisponível para este item")
+                        .clone()
+                        .unwrap_or_else(|| t!("picker.preview_unavailable_item").into_owned())
                 };
                 div()
                     .w_full()
@@ -629,11 +623,11 @@ impl Render for PickerModalState {
                     .text_center()
                     .text_xs()
                     .text_color(muted)
-                    .child(SharedString::from(note.to_string()))
+                    .child(SharedString::from(note))
                     .into_any_element()
             });
 
-        let preview_header_label = "Prévia";
+        let preview_header_label = t!("picker.preview_header").into_owned();
 
         v_flex()
             .w_full()
@@ -651,7 +645,7 @@ impl Render for PickerModalState {
                         Button::new("picker-refresh-list")
                             .compact()
                             .outline()
-                            .label("Atualizar Lista")
+                            .label(t!("picker.refresh_list").into_owned())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.reload_targets(window, cx);
                             })),
@@ -690,7 +684,7 @@ impl Render for PickerModalState {
                                                 .p_3()
                                                 .text_xs()
                                                 .text_color(muted)
-                                                .child("Nenhuma tela ou janela encontrada nesta aba."),
+                                                .child(t!("picker.empty_list").into_owned()),
                                         )
                                     })
                                     .children(list_items),
@@ -729,7 +723,10 @@ impl Render for PickerModalState {
                                                     Button::new("picker-refresh-preview")
                                                         .compact()
                                                         .ghost()
-                                                        .label("Atualizar")
+                                                        .label(
+                                                            t!("picker.refresh_preview")
+                                                                .into_owned(),
+                                                        )
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.refresh_preview(cx);
                                                         })),
@@ -770,7 +767,12 @@ impl Render for PickerModalState {
                                                     .min_w_0()
                                                     .overflow_hidden()
                                                     .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Resolução"))
+                                                    .child(
+                                                        div().text_xs().text_color(muted).child(
+                                                            t!("picker.resolution_label")
+                                                                .into_owned(),
+                                                        ),
+                                                    )
                                                     .child(Select::new(&self.resolution_select)),
                                             )
                                             .child(
@@ -779,7 +781,11 @@ impl Render for PickerModalState {
                                                     .min_w_0()
                                                     .overflow_hidden()
                                                     .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Modo"))
+                                                    .child(
+                                                        div().text_xs().text_color(muted).child(
+                                                            t!("picker.mode_label").into_owned(),
+                                                        ),
+                                                    )
                                                     .child(Select::new(&self.fps_select)),
                                             ),
                                     )
@@ -789,7 +795,11 @@ impl Render for PickerModalState {
                                             .min_w_0()
                                             .overflow_hidden()
                                             .gap_1()
-                                            .child(div().text_xs().text_color(muted).child("Áudio"))
+                                            .child(
+                                                div().text_xs().text_color(muted).child(
+                                                    t!("picker.audio_label").into_owned(),
+                                                ),
+                                            )
                                             .child(Select::new(&self.audio_select)),
                                     ),
                             ),
@@ -816,7 +826,7 @@ pub fn open_picker_dialog(
         let m_close = modal_close.clone();
 
         dialog
-            .title("Compartilhar Tela e Áudio")
+            .title(t!("picker.dialog_title").into_owned())
             .width(px(760.))
             .centered()
             .overlay_closable(false)
@@ -832,7 +842,7 @@ pub fn open_picker_dialog(
                     .child(
                         Button::new("picker-btn-cancel")
                             .ghost()
-                            .label("Cancelar")
+                            .label(t!("picker.cancel").into_owned())
                             .on_click(move |_, window, cx| {
                                 m_cancel.update(cx, |m, cx| {
                                     m.drop_all_images(window);
@@ -844,7 +854,7 @@ pub fn open_picker_dialog(
                     .child(
                         Button::new("picker-btn-start")
                             .primary()
-                            .label("Iniciar Transmissão")
+                            .label(t!("picker.start_sharing").into_owned())
                             .on_click(move |_, window, cx| {
                                 let (cfg_opt, label) = {
                                     let st = m_start.read(cx);
@@ -861,10 +871,8 @@ pub fn open_picker_dialog(
                                     window.close_dialog(cx);
                                 } else {
                                     m_start.update(cx, |m, cx| {
-                                        m.preview_note = Some(
-                                            "Selecione uma tela ou janela antes de iniciar."
-                                                .to_string(),
-                                        );
+                                        m.preview_note =
+                                            Some(t!("picker.select_before_start").into_owned());
                                         cx.notify();
                                     });
                                 }
@@ -881,49 +889,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_picker_label_roundtrip() {
+    fn test_picker_labels_and_presets() {
+        rust_i18n::set_locale("en");
         assert_eq!(resolution_to_label(TargetResolution::R720p), "720p");
         assert_eq!(resolution_to_label(TargetResolution::R1080p), "1080p");
         assert_eq!(resolution_to_label(TargetResolution::R1440p), "1440p");
         assert_eq!(resolution_to_label(TargetResolution::Native), "Original");
 
-        assert_eq!(label_to_resolution("720p"), TargetResolution::R720p);
-        assert_eq!(label_to_resolution("1080p"), TargetResolution::R1080p);
-        assert_eq!(label_to_resolution("1440p"), TargetResolution::R1440p);
-        assert_eq!(label_to_resolution("Original"), TargetResolution::Native);
-        assert_eq!(label_to_resolution("Nativa"), TargetResolution::Native);
-
-        assert_eq!(label_to_audio_choice(AUDIO_NONE), AudioChoice::None);
+        assert_eq!(audio_choice_to_label(AudioChoice::None), "No audio");
         assert_eq!(
-            label_to_audio_choice(AUDIO_SYSTEM),
-            AudioChoice::SystemGlobal
+            audio_choice_to_label(AudioChoice::SystemGlobal),
+            "Computer audio"
         );
         assert_eq!(
-            label_to_audio_choice(AUDIO_APP),
-            AudioChoice::ApplicationOnly
+            audio_choice_to_label(AudioChoice::ApplicationOnly),
+            "This app only"
         );
+        assert_eq!(FPS_PRESETS, [5, 15, 30, 60]);
     }
 
     #[test]
     fn test_format_preview_error_hides_technical_internals() {
+        rust_i18n::set_locale("en");
         let wayland = format_preview_error(
-            "Video capture error: A seleção de tela abrirá ao iniciar o compartilhamento.",
+            "Video capture error: Wayland screen picker opens when starting broadcast",
         );
         assert_eq!(
             wayland,
-            "A seleção de tela abrirá ao iniciar o compartilhamento."
+            "The screen picker will open when you start sharing."
         );
 
         let minimized = format_preview_error(
-            "Video capture error: Janela minimizada — restaure-a para ver a prévia.",
+            "Video capture error: Window is minimized or no frame available for preview",
         );
         assert_eq!(
             minimized,
-            "Janela minimizada — restaure-a para ver a prévia."
+            "Window is minimized — restore it to see the preview."
         );
 
         let raw_xcap = format_preview_error("Video capture error: xcap Monitor::all panicked");
-        assert_eq!(raw_xcap, "Prévia indisponível no momento.");
+        assert_eq!(raw_xcap, "Preview unavailable right now.");
         assert!(!raw_xcap.contains("xcap"));
     }
 }

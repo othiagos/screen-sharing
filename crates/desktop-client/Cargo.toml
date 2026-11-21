@@ -26,6 +26,8 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 
 gpui-kit = { workspace = true }
+rust-i18n = { workspace = true }
+sys-locale = { workspace = true }
 image = { workspace = true }
 smallvec = { workspace = true }
 directories = { workspace = true }

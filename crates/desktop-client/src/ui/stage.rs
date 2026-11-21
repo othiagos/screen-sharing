@@ -1,3 +1,4 @@
+use crate::i18n::video_mode_label;
 use crate::ui::app_view::{AppView, StageLayout};
 use crate::ui::video_surface::{
     VideoTileKey, VideoTileOptions, VideoTileStats, format_friendly_resolution,
@@ -12,7 +13,8 @@ use gpui_kit::{
     Context, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
     StatefulInteractiveElement as _, Styled, Window, black, div, hsla, px,
 };
-use shared_protocol::{video_mode_display_label, PeerId, ThrottleReason};
+use rust_i18n::t;
+use shared_protocol::{PeerId, ThrottleReason};
 use std::sync::Arc;
 
 fn sync_video_slots(app: &mut AppView, window: &mut Window) {
@@ -57,8 +59,10 @@ fn tile_info(
     match key {
         VideoTileKey::LocalPreview => {
             let label = match &app.local_broadcast_label {
-                Some(src) => SharedString::from(format!("Sua Transmissão — {src}")),
-                None => SharedString::from("Sua Transmissão (Prévia)"),
+                Some(src) => SharedString::from(
+                    t!("stage.your_stream_named", source = src.as_str()).into_owned(),
+                ),
+                None => SharedString::from(t!("stage.your_stream_preview").into_owned()),
             };
             let img_arc = app.local_preview_slot.image();
             let stats = app.broadcast_stats.as_ref().map(|bs| VideoTileStats {
@@ -86,7 +90,13 @@ fn tile_info(
                 .iter()
                 .find(|p| p.peer_id == peer_id)
                 .map(|p| p.nickname.clone())
-                .unwrap_or_else(|| format!("Participante {}", &peer_id.to_string()[..6]));
+                .unwrap_or_else(|| {
+                    t!(
+                        "stage.participant_fallback",
+                        id = &peer_id.to_string()[..6]
+                    )
+                    .into_owned()
+                });
             let img_arc = app.video_slots.get(&peer_id).and_then(|s| s.image());
             let frame_opt = app.video_store.latest_peer_frame(peer_id);
             let meta_opt = app
@@ -227,7 +237,7 @@ pub fn render_stage(
                             .bg(hsla(0., 0., 0., 0.72))
                             .text_xs()
                             .text_color(gpui_kit::white())
-                            .child("ESC, F11 ou duplo clique para sair da tela cheia"),
+                            .child(t!("stage.fullscreen_hint").into_owned()),
                     )
                 })
                 .into_any_element();
@@ -278,13 +288,15 @@ pub fn render_stage(
                                 .text_xs()
                                 .font_weight(gpui_kit::FontWeight::BOLD)
                                 .text_color(fg)
-                                .child(format!("Sala: {}", app.room_id)),
+                                .child(
+                                    t!("stage.room_prefix", id = app.room_id.as_str()).into_owned(),
+                                ),
                         )
                         .child(
                             Clipboard::new("btn-copy-room")
                                 .value(app.room_id.clone())
-                                .tooltip("Copiar código da sala")
-                                .accessibility_label("Copiar código da sala"),
+                                .tooltip(t!("stage.copy_room_tooltip").into_owned())
+                                .accessibility_label(t!("stage.copy_room_tooltip").into_owned()),
                         ),
                 )
                 .child(
@@ -309,7 +321,11 @@ pub fn render_stage(
                     Button::new("btn-toggle-layout")
                         .compact()
                         .outline()
-                        .label(if is_focus_layout { "Grade" } else { "Foco" })
+                        .label(if is_focus_layout {
+                            t!("stage.layout_grid").into_owned()
+                        } else {
+                            t!("stage.layout_focus").into_owned()
+                        })
                         .disabled(first_available_key.is_none())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.stage_layout = match this.stage_layout {
@@ -329,7 +345,7 @@ pub fn render_stage(
                     Button::new("btn-fullscreen")
                         .compact()
                         .outline()
-                        .label("Tela Cheia")
+                        .label(t!("stage.fullscreen").into_owned())
                         .disabled(first_available_key.is_none())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.set_fullscreen(true, window, cx);
@@ -340,9 +356,9 @@ pub fn render_stage(
                         .compact()
                         .outline()
                         .label(if app.show_stats {
-                            "Ocultar Detalhes"
+                            t!("stage.hide_details").into_owned()
                         } else {
-                            "Detalhes"
+                            t!("stage.details").into_owned()
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_stats = !this.show_stats;
@@ -355,9 +371,9 @@ pub fn render_stage(
                             .compact()
                             .outline()
                             .label(if app.show_local_preview {
-                                "Ocultar Prévia"
+                                t!("stage.hide_preview").into_owned()
                             } else {
-                                "Ver Prévia"
+                                t!("stage.show_preview").into_owned()
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_local_preview(window, cx);
@@ -367,7 +383,7 @@ pub fn render_stage(
                 .child(if has_local_broadcast {
                     Button::new("btn-stop-share")
                         .danger()
-                        .label("Parar Transmissão")
+                        .label(t!("stage.stop_sharing").into_owned())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.stop_local_broadcast(window, cx);
                         }))
@@ -375,7 +391,7 @@ pub fn render_stage(
                 } else {
                     Button::new("btn-open-share")
                         .primary()
-                        .label("Compartilhar Tela")
+                        .label(t!("stage.share_screen").into_owned())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_capture_picker(window, cx);
                         }))
@@ -384,7 +400,7 @@ pub fn render_stage(
                 .child(
                     Button::new("btn-leave-room")
                         .ghost()
-                        .label("Sair")
+                        .label(t!("stage.leave").into_owned())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.leave_room(window, cx);
                         })),
@@ -406,7 +422,7 @@ pub fn render_stage(
                 format!(
                     "{} • {}",
                     format_friendly_resolution(m.width, m.height),
-                    video_mode_display_label(m.fps),
+                    video_mode_label(m.fps),
                 )
             });
             let audio_state = app.peer_sliders.get(&peer_id).cloned();
@@ -432,7 +448,8 @@ pub fn render_stage(
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .child(if is_local {
-                                    format!("{} (Você)", peer.nickname)
+                                    t!("stage.you_suffix", name = peer.nickname.as_str())
+                                        .into_owned()
                                 } else {
                                     peer.nickname.clone()
                                 }),
@@ -447,7 +464,7 @@ pub fn render_stage(
                                     .text_xs()
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_color(gpui_kit::white())
-                                    .child("AO VIVO"),
+                                    .child(t!("stage.live_badge").into_owned()),
                             )
                         }),
                 )
@@ -460,7 +477,7 @@ pub fn render_stage(
                             Button::new(("watch-btn", ix))
                                 .compact()
                                 .outline()
-                                .label("Parar de Assistir")
+                                .label(t!("stage.stop_watching").into_owned())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.toggle_peer_subscription(peer_id, false, window, cx);
                                 }))
@@ -469,7 +486,7 @@ pub fn render_stage(
                             Button::new(("watch-btn", ix))
                                 .compact()
                                 .primary()
-                                .label("Assistir")
+                                .label(t!("stage.watch").into_owned())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.toggle_peer_subscription(peer_id, true, window, cx);
                                 }))
@@ -487,7 +504,11 @@ pub fn render_stage(
                                     Button::new(("mute-btn", ix))
                                         .compact()
                                         .outline()
-                                        .label(if audio.muted { "Mudo" } else { "Som" })
+                                        .label(if audio.muted {
+                                            t!("stage.muted").into_owned()
+                                        } else {
+                                            t!("stage.sound").into_owned()
+                                        })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.toggle_peer_mute(peer_id, cx);
                                         })),
@@ -519,7 +540,7 @@ pub fn render_stage(
                 .text_xs()
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .text_color(muted)
-                .child(format!("PARTICIPANTES ({})", app.peers.len())),
+                .child(t!("stage.participants_header", count = app.peers.len()).into_owned()),
         )
         .child(
             div()
@@ -530,10 +551,11 @@ pub fn render_stage(
         );
 
     let main_video_area = if stage_keys.is_empty() && has_local_broadcast {
+        let fallback_source = t!("stage.active_capture_fallback").into_owned();
         let source_desc = app
             .local_broadcast_label
             .as_deref()
-            .unwrap_or("Captura de tela ativa");
+            .unwrap_or(&fallback_source);
         let (stats_desc, adapt_badge) = match &app.broadcast_stats {
             Some(bs) if bs.width > 0 && bs.height > 0 => {
                 let mode_fps = if bs.configured_fps > 0 {
@@ -541,7 +563,7 @@ pub fn render_stage(
                 } else {
                     bs.effective_fps.min(u32::from(u8::MAX)) as u8
                 };
-                let mode_txt = video_mode_display_label(mode_fps);
+                let mode_txt = video_mode_label(mode_fps);
                 let desc = format!(
                     "{source_desc} • {} • {mode_txt}",
                     format_friendly_resolution(bs.width, bs.height),
@@ -555,8 +577,7 @@ pub fn render_stage(
                 );
                 let badge = show_badge
                     .then(|| friendly_throttle_message(bs.throttle_reason))
-                    .flatten()
-                    .map(str::to_string);
+                    .flatten();
                 (desc, badge)
             }
             _ => (source_desc.to_string(), None),
@@ -586,7 +607,7 @@ pub fn render_stage(
                                     .text_base()
                                     .font_weight(gpui_kit::FontWeight::BOLD)
                                     .text_color(fg)
-                                    .child("Você está transmitindo"),
+                                    .child(t!("stage.broadcasting_title").into_owned()),
                             ),
                     )
                     .child(
@@ -617,13 +638,13 @@ pub fn render_stage(
                             .text_center()
                             .text_xs()
                             .text_color(muted)
-                            .child("Sua pré-visualização fica oculta por padrão para evitar distração e economizar recursos."),
+                            .child(t!("stage.preview_hidden_hint").into_owned()),
                     )
                     .child(
                         div().pt_1().child(
                             Button::new("btn-empty-show-preview")
                                 .outline()
-                                .label("Ver minha transmissão")
+                                .label(t!("stage.view_my_stream").into_owned())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_local_preview(window, cx);
                                 })),
@@ -652,13 +673,13 @@ pub fn render_stage(
                             .text_base()
                             .font_weight(gpui_kit::FontWeight::BOLD)
                             .text_color(fg)
-                            .child("Nenhuma transmissão selecionada"),
+                            .child(t!("stage.empty_title").into_owned()),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Clique em \"Compartilhar Tela\" na barra superior ou em \"Assistir\" ao lado de um participante AO VIVO."),
+                            .child(t!("stage.empty_hint").into_owned()),
                     ),
             )
             .into_any_element()
@@ -790,7 +811,7 @@ pub fn render_stage(
                         Button::new("btn-dismiss-warn")
                             .compact()
                             .ghost()
-                            .label("OK")
+                            .label(t!("stage.dismiss_ok").into_owned())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.dismiss_warning(warn_msg.clone(), cx);
                             })),

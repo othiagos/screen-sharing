@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::i18n::AppLocale;
 use crate::media::{
     BroadcastStats, LocalBroadcastSession, PeerAudioMixer, PeerMediaReceiver, PeerVideoStore,
 };
@@ -14,6 +15,7 @@ use gpui_kit::{
     KeyDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RenderImage, Styled,
     Subscription, Window, div,
 };
+use rust_i18n::t;
 use shared_protocol::{ControlErrorCode, PeerId, PeerInfo, StreamConfig};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -25,25 +27,15 @@ use tokio_util::sync::CancellationToken;
 
 const FULLSCREEN_OVERLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn format_server_error(code: ControlErrorCode) -> &'static str {
+pub(crate) fn format_server_error(code: ControlErrorCode) -> String {
     match code {
-        ControlErrorCode::InvalidPassword => "Senha da sala incorreta.",
-        ControlErrorCode::RoomNotFound => {
-            "Sala não encontrada. Verifique o código e tente novamente."
-        }
-        ControlErrorCode::Unauthorized => {
-            "Acesso negado pelo servidor. Verifique a chave de acesso em Opções avançadas."
-        }
-        ControlErrorCode::ProtocolMismatch => {
-            "Versão incompatível com o servidor. Atualize o aplicativo."
-        }
-        ControlErrorCode::NotInRoom => "Você não está em uma sala no momento.",
-        ControlErrorCode::BadRequest => {
-            "Não foi possível completar o pedido. Verifique os dados informados."
-        }
-        ControlErrorCode::Internal => {
-            "O servidor encontrou um problema temporário. Tente novamente."
-        }
+        ControlErrorCode::InvalidPassword => t!("errors.invalid_password").into_owned(),
+        ControlErrorCode::RoomNotFound => t!("errors.room_not_found").into_owned(),
+        ControlErrorCode::Unauthorized => t!("errors.unauthorized").into_owned(),
+        ControlErrorCode::ProtocolMismatch => t!("errors.protocol_mismatch").into_owned(),
+        ControlErrorCode::NotInRoom => t!("errors.not_in_room").into_owned(),
+        ControlErrorCode::BadRequest => t!("errors.bad_request").into_owned(),
+        ControlErrorCode::Internal => t!("errors.server_internal").into_owned(),
     }
 }
 
@@ -51,7 +43,7 @@ pub(crate) fn is_unauthorized_error(raw: &str) -> bool {
     raw.to_ascii_lowercase().contains("unauthorized")
 }
 
-pub(crate) fn format_connection_error(raw: &str) -> &'static str {
+pub(crate) fn format_connection_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("protocolmismatch") {
         format_server_error(ControlErrorCode::ProtocolMismatch)
@@ -62,47 +54,47 @@ pub(crate) fn format_connection_error(raw: &str) -> &'static str {
     } else if lower.contains("roomnotfound") {
         format_server_error(ControlErrorCode::RoomNotFound)
     } else if lower.contains("host:port") || lower.contains("invalid socket address") {
-        "Endereço do servidor inválido. Use o formato exemplo.com:4433."
+        t!("errors.invalid_server_address").into_owned()
     } else if lower.contains("failed resolving")
         || lower.contains("no ip address resolved")
         || lower.contains("name or service not known")
         || lower.contains("nodename nor servname")
         || lower.contains("dns")
     {
-        "Servidor não encontrado. Verifique o endereço digitado."
+        t!("errors.server_not_found").into_owned()
     } else if lower.contains("timed out") || lower.contains("timeout") {
-        "O servidor não respondeu a tempo. Verifique sua conexão e tente novamente."
+        t!("errors.connection_timeout").into_owned()
     } else if lower.contains("connection refused")
         || lower.contains("unreachable")
         || lower.contains("reset")
     {
-        "Não foi possível alcançar o servidor. Verifique se ele está ligado."
+        t!("errors.server_unreachable").into_owned()
     } else {
-        "Não foi possível conectar ao servidor. Verifique o endereço e sua internet."
+        t!("errors.connection_failed").into_owned()
     }
 }
 
-pub(crate) fn format_disconnect_reason(raw: &str) -> &'static str {
+pub(crate) fn format_disconnect_reason(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
-        "Conexão perdida: o servidor parou de responder."
+        t!("errors.disconnect_timeout").into_owned()
     } else if lower.contains("application closed") || lower.contains("locally closed") {
-        "Conexão encerrada pelo servidor."
+        t!("errors.disconnect_closed").into_owned()
     } else if lower.contains("reset") {
-        "Conexão interrompida inesperadamente."
+        t!("errors.disconnect_reset").into_owned()
     } else {
-        "Você foi desconectado do servidor."
+        t!("errors.disconnect_generic").into_owned()
     }
 }
 
-pub(crate) fn format_capture_start_error(raw: &str) -> &'static str {
+pub(crate) fn format_capture_start_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("not found") || lower.contains("source not found") {
-        "Não foi possível encontrar a tela ou janela selecionada."
+        t!("errors.capture_not_found").into_owned()
     } else if lower.contains("cancel") || lower.contains("no pipewire streams") {
-        "Compartilhamento cancelado."
+        t!("errors.capture_cancelled").into_owned()
     } else {
-        "Não foi possível iniciar o compartilhamento de tela."
+        t!("errors.capture_start_failed").into_owned()
     }
 }
 
@@ -269,6 +261,17 @@ impl AppView {
         cx.notify();
     }
 
+    pub fn set_locale(&mut self, locale: AppLocale, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.locale = Some(locale.code().to_string());
+        let _ = self.config.save();
+        crate::i18n::apply_locale(locale);
+        self.lobby_entities.refresh_placeholders(window, cx);
+        if !self.is_connecting {
+            self.status_message = None;
+        }
+        cx.notify();
+    }
+
     pub fn begin_connect(&mut self, create_room: bool, cx: &mut Context<Self>) {
         if self.is_connecting {
             return;
@@ -304,17 +307,17 @@ impl AppView {
         let pass_raw = self.lobby_entities.room_password.read(cx).value().to_string();
 
         if server_addr.is_empty() {
-            self.status_message = Some(("Informe o endereço do servidor.".into(), true));
+            self.status_message = Some((t!("errors.enter_server").into_owned(), true));
             cx.notify();
             return;
         }
         if nickname.is_empty() {
-            self.status_message = Some(("Informe seu nome.".into(), true));
+            self.status_message = Some((t!("errors.enter_name").into_owned(), true));
             cx.notify();
             return;
         }
         if !create_room && room_id.is_empty() {
-            self.status_message = Some(("Informe o código da sala para entrar.".into(), true));
+            self.status_message = Some((t!("errors.enter_room_code").into_owned(), true));
             cx.notify();
             return;
         }
@@ -332,7 +335,7 @@ impl AppView {
         self.pending_room_password = password;
         self.tofu_prompt = None;
         self.is_connecting = true;
-        self.status_message = Some(("Conectando ao servidor...".into(), false));
+        self.status_message = Some((t!("lobby.status_connecting").into_owned(), false));
         self.connect_generation = self.connect_generation.wrapping_add(1);
         let gen = self.connect_generation;
 
@@ -372,7 +375,7 @@ impl AppView {
                             );
                         }
                         app.sfu_client = Some(sfu);
-                        app.status_message = Some(("Entrando na sala...".into(), false));
+                        app.status_message = Some((t!("lobby.status_joining").into_owned(), false));
                     }
                     Ok(Ok(ConnectOutcome::TrustRequired {
                         server_addr,
@@ -391,20 +394,17 @@ impl AppView {
                     Ok(Err(err)) => {
                         app.is_connecting = false;
                         let raw = format!("{err:#}");
-                        tracing::warn!("Falha na conexão com o servidor: {raw}");
+                        tracing::warn!("Failed connecting to server: {raw}");
                         if is_unauthorized_error(&raw) {
                             app.show_advanced_lobby = true;
                         }
-                        app.status_message =
-                            Some((format_connection_error(&raw).to_string(), true));
+                        app.status_message = Some((format_connection_error(&raw), true));
                     }
                     Err(join_err) => {
                         app.is_connecting = false;
-                        tracing::warn!("Erro interno ao conectar ao servidor: {join_err}");
-                        app.status_message = Some((
-                            "Não foi possível conectar ao servidor. Tente novamente.".into(),
-                            true,
-                        ));
+                        tracing::warn!("Internal connection task join error: {join_err}");
+                        app.status_message =
+                            Some((t!("errors.connection_retry").into_owned(), true));
                     }
                 }
                 cx.notify();
@@ -416,7 +416,7 @@ impl AppView {
 
     pub fn cancel_tofu(&mut self, cx: &mut Context<Self>) {
         self.tofu_prompt = None;
-        self.status_message = Some(("Conexão cancelada.".into(), false));
+        self.status_message = Some((t!("lobby.status_cancelled").into_owned(), false));
         cx.notify();
     }
 
@@ -484,9 +484,9 @@ impl AppView {
             }
             Err(err) => {
                 let raw = err.to_string();
-                tracing::warn!("Erro ao iniciar captura local: {raw}");
+                tracing::warn!("Failed starting local capture: {raw}");
                 self.local_broadcast_label = None;
-                self.warning_banner = Some(format_capture_start_error(&raw).to_string());
+                self.warning_banner = Some(format_capture_start_error(&raw));
             }
         }
         cx.notify();
@@ -957,9 +957,9 @@ impl AppView {
                     self.rtt_ms = Some(rtt_ms);
                 }
                 SfuEvent::ServerError { code, message } => {
-                    tracing::warn!(?code, %message, "Erro retornado pelo servidor");
+                    tracing::warn!(?code, %message, "Server returned control error");
                     self.is_connecting = false;
-                    let friendly = format_server_error(code).to_string();
+                    let friendly = format_server_error(code);
                     if self.screen == AppScreen::Lobby {
                         if matches!(code, ControlErrorCode::Unauthorized) {
                             self.show_advanced_lobby = true;
@@ -973,7 +973,7 @@ impl AppView {
                     }
                 }
                 SfuEvent::Disconnected { reason } => {
-                    tracing::warn!(%reason, "Desconectado do servidor");
+                    tracing::warn!(%reason, "Disconnected from server");
                     self.is_connecting = false;
                     if let Some(bc) = self.local_broadcast.take() {
                         if let Some(sfu) = &self.sfu_client {
@@ -985,8 +985,7 @@ impl AppView {
                     let was_stage = self.screen == AppScreen::Stage;
                     self.reset_stage_state(None, cx);
                     if was_stage || self.tofu_prompt.is_none() {
-                        self.status_message =
-                            Some((format_disconnect_reason(&reason).to_string(), true));
+                        self.status_message = Some((format_disconnect_reason(&reason), true));
                     }
                 }
             }
@@ -1100,6 +1099,7 @@ mod tests {
 
     #[test]
     fn test_humanized_server_connection_and_disconnect_errors() {
+        rust_i18n::set_locale("en");
         let server_codes = [
             ControlErrorCode::ProtocolMismatch,
             ControlErrorCode::Unauthorized,
@@ -1129,45 +1129,45 @@ mod tests {
         );
         assert_eq!(
             format_connection_error("Server address must be in host:port format"),
-            "Endereço do servidor inválido. Use o formato exemplo.com:4433."
+            "Invalid server address. Use the format example.com:4433."
         );
         assert_eq!(
             format_connection_error("Failed resolving SFU host 'bad.local:4433'"),
-            "Servidor não encontrado. Verifique o endereço digitado."
+            "Server not found. Check the address you entered."
         );
         assert_eq!(
             format_connection_error("QUIC TLS handshake failed: timed out"),
-            "O servidor não respondeu a tempo. Verifique sua conexão e tente novamente."
+            "The server did not respond in time. Check your connection and try again."
         );
         assert_eq!(
             format_connection_error("unexpected low-level quinn error"),
-            "Não foi possível conectar ao servidor. Verifique o endereço e sua internet."
+            "Could not connect to the server. Check the address and your internet connection."
         );
 
         assert_eq!(
             format_disconnect_reason("timed out"),
-            "Conexão perdida: o servidor parou de responder."
+            "Connection lost: the server stopped responding."
         );
         assert_eq!(
             format_disconnect_reason("application closed: 0"),
-            "Conexão encerrada pelo servidor."
+            "Connection closed by the server."
         );
         assert_eq!(
             format_disconnect_reason("connection reset by peer"),
-            "Conexão interrompida inesperadamente."
+            "Connection interrupted unexpectedly."
         );
 
         assert_eq!(
             format_capture_start_error("Source not found: Monitor id=1"),
-            "Não foi possível encontrar a tela ou janela selecionada."
+            "Could not find the selected screen or window."
         );
         assert_eq!(
             format_capture_start_error("Portal returned no PipeWire streams"),
-            "Compartilhamento cancelado."
+            "Screen sharing cancelled."
         );
         assert_eq!(
             format_capture_start_error("xcap error"),
-            "Não foi possível iniciar o compartilhamento de tela."
+            "Could not start screen sharing."
         );
     }
 }

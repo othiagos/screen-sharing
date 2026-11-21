@@ -37,6 +37,8 @@ fn main() {
     );
 
     let initial_config = AppConfig::load();
+    let initial_locale =
+        desktop_client::i18n::AppLocale::from_saved_or_system(initial_config.locale.as_deref());
     let initial_mode = if initial_config.dark_mode {
         ThemeMode::Dark
     } else {
@@ -47,6 +49,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
         gpui_kit::init(cx);
+        desktop_client::i18n::apply_locale(initial_locale);
         Theme::change(initial_mode, None, cx);
 
         let bounds = Bounds::centered(None, size(px(1240.), px(800.)), cx);

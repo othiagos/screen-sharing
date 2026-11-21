@@ -1172,7 +1172,7 @@ pub fn list_capture_sources() -> Result<Vec<CaptureSourceInfo>, MediaError> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         sources.push(CaptureSourceInfo {
             target: CaptureTarget::PortalWayland,
-            display_label: "Escolher tela ou janela pelo sistema".to_string(),
+            display_label: rust_i18n::t!("picker.system_source_item").into_owned(),
             source_dims: None,
         });
     }
@@ -1602,7 +1602,7 @@ impl ResolvedCaptureTarget {
 pub fn capture_preview_with_source(target: &CaptureTarget) -> Result<PreviewCapture, MediaError> {
     if matches!(target, CaptureTarget::PortalWayland) {
         return Err(MediaError::VideoCapture(
-            "A seleção de tela abrirá ao iniciar o compartilhamento.".to_string(),
+            "Wayland screen picker opens when starting broadcast".to_string(),
         ));
     }
     let mut resolved = ResolvedCaptureTarget::resolve(target)?;
@@ -1629,7 +1629,7 @@ pub fn capture_preview_with_source(target: &CaptureTarget) -> Result<PreviewCapt
             })
         }
         FrameSample::Unchanged => Err(MediaError::VideoCapture(
-            "Janela minimizada — restaure-a para ver a prévia.".to_string(),
+            "Window is minimized or no frame available for preview".to_string(),
         )),
     }
 }

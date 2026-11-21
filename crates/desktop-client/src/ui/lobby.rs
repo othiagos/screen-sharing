@@ -1,17 +1,23 @@
+use crate::i18n::AppLocale;
 use crate::ui::app_view::AppView;
 use gpui_kit::component::accordion::Accordion;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Disableable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable as _, IconName, IndexPath, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, SharedString, Styled,
     Window, div, hsla, px,
 };
+use rust_i18n::t;
 
-/// Input entities preserved across renders on the Lobby screen.
+/// Input and selector entities preserved across renders on the Lobby screen.
 pub struct LobbyEntities {
+    pub locale_select: Entity<SelectState<Vec<String>>>,
     pub server_addr: Entity<InputState>,
     pub nickname: Entity<InputState>,
     pub auth_token: Entity<InputState>,
@@ -29,31 +35,56 @@ impl LobbyEntities {
         let nick_default = config.nickname.clone();
         let token_default = config.auth_token.clone().unwrap_or_default();
 
+        let locale_items: Vec<String> = AppLocale::ALL
+            .iter()
+            .map(|l| l.native_name().to_string())
+            .collect();
+        let initial_locale_idx = crate::i18n::current_locale().index();
+        let locale_select = cx.new(|cx| {
+            SelectState::new(
+                locale_items,
+                Some(IndexPath::default().row(initial_locale_idx)),
+                window,
+                cx,
+            )
+        });
+
         let server_addr = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("exemplo.com:4433")
+                .placeholder(t!("lobby.server_placeholder").into_owned())
                 .default_value(addr_default)
         });
         let nickname = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Como você quer aparecer")
+                .placeholder(t!("lobby.name_placeholder").into_owned())
                 .default_value(nick_default)
         });
         let auth_token = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Deixe em branco se não for necessária")
+                .placeholder(t!("lobby.server_key_placeholder").into_owned())
                 .default_value(token_default)
                 .masked(true)
         });
         let room_id = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Ex: sala-principal")
+            InputState::new(window, cx).placeholder(t!("lobby.room_code_placeholder").into_owned())
         });
         let room_password = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Opcional")
+                .placeholder(t!("lobby.optional_placeholder").into_owned())
                 .masked(true)
         });
 
+        let sub_locale = cx.subscribe_in(
+            &locale_select,
+            window,
+            |this: &mut AppView, state, ev: &SelectEvent<Vec<String>>, window, cx| {
+                if let SelectEvent::Confirm(Some(_)) = ev {
+                    if let Some(ix) = state.read(cx).selected_index(cx) {
+                        this.set_locale(AppLocale::from_index(ix.row), window, cx);
+                    }
+                }
+            },
+        );
         let sub_room = cx.subscribe(&room_id, |this: &mut AppView, _, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::PressEnter { .. }) {
                 this.begin_connect(false, cx);
@@ -70,14 +101,34 @@ impl LobbyEntities {
 
         (
             Self {
+                locale_select,
                 server_addr,
                 nickname,
                 auth_token,
                 room_id,
                 room_password,
             },
-            vec![sub_room, sub_pass],
+            vec![sub_locale, sub_room, sub_pass],
         )
+    }
+
+    /// Updates all input placeholders immediately after a live locale switch.
+    pub fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<AppView>) {
+        self.server_addr.update(cx, |input, cx| {
+            input.set_placeholder(t!("lobby.server_placeholder").into_owned(), window, cx);
+        });
+        self.nickname.update(cx, |input, cx| {
+            input.set_placeholder(t!("lobby.name_placeholder").into_owned(), window, cx);
+        });
+        self.auth_token.update(cx, |input, cx| {
+            input.set_placeholder(t!("lobby.server_key_placeholder").into_owned(), window, cx);
+        });
+        self.room_id.update(cx, |input, cx| {
+            input.set_placeholder(t!("lobby.room_code_placeholder").into_owned(), window, cx);
+        });
+        self.room_password.update(cx, |input, cx| {
+            input.set_placeholder(t!("lobby.optional_placeholder").into_owned(), window, cx);
+        });
     }
 }
 
@@ -90,14 +141,18 @@ pub struct TofuPromptState {
     pub create_room: bool,
 }
 
-fn labeled_field(label: &'static str, input: &Entity<InputState>, cx: &App) -> impl IntoElement {
+fn labeled_field(
+    label: impl Into<SharedString>,
+    input: &Entity<InputState>,
+    cx: &App,
+) -> impl IntoElement {
     v_flex()
         .gap_1()
         .child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(label),
+                .child(label.into()),
         )
         .child(Input::new(input))
 }
@@ -136,9 +191,9 @@ pub fn render_lobby(
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .text_color(if changed { danger } else { fg })
                     .child(if changed {
-                        "Atenção: a identidade deste servidor mudou"
+                        t!("tofu.changed_title").into_owned()
                     } else {
-                        "Primeira conexão com este servidor"
+                        t!("tofu.first_title").into_owned()
                     }),
             )
             .child(
@@ -146,15 +201,9 @@ pub fn render_lobby(
                     .text_sm()
                     .text_color(muted)
                     .child(if changed {
-                        format!(
-                            "O servidor {} apresentou uma identificação diferente da última vez. Só continue se souber que ele foi atualizado ou reinstalado.",
-                            tofu.server_addr
-                        )
+                        t!("tofu.changed_body", server = tofu.server_addr.as_str()).into_owned()
                     } else {
-                        format!(
-                            "Antes de conectar a {}, confirme que você confia neste endereço.",
-                            tofu.server_addr
-                        )
+                        t!("tofu.first_body", server = tofu.server_addr.as_str()).into_owned()
                     }),
             )
             .when_some(tofu.changed_from.clone(), |el, old_fp| {
@@ -170,7 +219,7 @@ pub fn render_lobby(
                             div()
                                 .text_xs()
                                 .text_color(danger)
-                                .child("Código anterior"),
+                                .child(t!("tofu.previous_code").into_owned()),
                         )
                         .child(div().text_xs().text_color(fg).child(old_fp)),
                 )
@@ -188,9 +237,9 @@ pub fn render_lobby(
                             .text_xs()
                             .text_color(muted)
                             .child(if changed {
-                                "Código atual"
+                                t!("tofu.current_code").into_owned()
                             } else {
-                                "Código de verificação"
+                                t!("tofu.verification_code").into_owned()
                             }),
                     )
                     .child(div().text_xs().text_color(fg).child(tofu.fingerprint.clone())),
@@ -202,13 +251,13 @@ pub fn render_lobby(
                     .child(
                         Button::new("tofu-cancel")
                             .outline()
-                            .label("Cancelar")
+                            .label(t!("tofu.cancel").into_owned())
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_tofu(cx))),
                     )
                     .child(
                         Button::new("tofu-trust")
                             .primary()
-                            .label("Confiar e Conectar")
+                            .label(t!("tofu.trust_connect").into_owned())
                             .on_click(cx.listener(|this, _, _, cx| this.confirm_tofu_and_connect(cx))),
                     ),
             )
@@ -216,7 +265,7 @@ pub fn render_lobby(
         let app_handle = cx.entity().downgrade();
 
         v_flex()
-            .w(px(500.))
+            .w(px(540.))
             .p_6()
             .gap_4()
             .rounded(cx.theme().radius_lg)
@@ -224,12 +273,13 @@ pub fn render_lobby(
             .border_1()
             .border_color(border)
             .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
+                v_flex()
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .gap_0p5()
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .gap_3()
                             .child(
                                 div()
                                     .text_xl()
@@ -238,28 +288,45 @@ pub fn render_lobby(
                                     .child("Screen Share"),
                             )
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child("Compartilhe sua tela e áudio com a sala"),
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_2p5()
+                                    .items_center()
+                                    .child(
+                                        div().w(px(140.)).child(
+                                            Select::new(&app.lobby_entities.locale_select)
+                                                .xsmall()
+                                                .icon(IconName::Globe)
+                                                .menu_width(px(150.))
+                                                .accessibility_label(
+                                                    t!("lobby.language_accessibility").into_owned(),
+                                                ),
+                                        ),
+                                    )
+                                    .child(
+                                        Switch::new("theme-toggle")
+                                            .checked(is_dark)
+                                            .label(t!("lobby.theme_dark").into_owned())
+                                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                                this.toggle_theme(*checked, cx);
+                                            })),
+                                    ),
                             ),
                     )
                     .child(
-                        Switch::new("theme-toggle")
-                            .checked(is_dark)
-                            .label("Escuro")
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.toggle_theme(*checked, cx);
-                            })),
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(t!("lobby.subtitle").into_owned()),
                     ),
             )
             .child(labeled_field(
-                "Servidor",
+                t!("lobby.server_label").into_owned(),
                 &app.lobby_entities.server_addr,
                 cx,
             ))
             .child(labeled_field(
-                "Seu nome",
+                t!("lobby.name_label").into_owned(),
                 &app.lobby_entities.nickname,
                 cx,
             ))
@@ -267,12 +334,12 @@ pub fn render_lobby(
                 h_flex()
                     .gap_3()
                     .child(div().flex_1().child(labeled_field(
-                        "Código da sala",
+                        t!("lobby.room_code_label").into_owned(),
                         &app.lobby_entities.room_id,
                         cx,
                     )))
                     .child(div().flex_1().child(labeled_field(
-                        "Senha da sala (opcional)",
+                        t!("lobby.room_password_label").into_owned(),
                         &app.lobby_entities.room_password,
                         cx,
                     ))),
@@ -282,6 +349,8 @@ pub fn render_lobby(
                     .w_full()
                     .h_auto()
                     .small()
+                    .rounded(cx.theme().radius)
+                    .border_color(cx.theme().input)
                     .on_toggle_click(move |open_indices, _, cx| {
                         let is_open = open_indices.contains(&0);
                         let _ = app_handle.update(cx, |this, cx| {
@@ -292,15 +361,16 @@ pub fn render_lobby(
                         });
                     })
                     .item(|item| {
-                        item.open(app.show_advanced_lobby)
+                        item.bg(cx.theme().input_background())
+                            .open(app.show_advanced_lobby)
                             .title(
                                 div()
                                     .text_xs()
                                     .text_color(if app.show_advanced_lobby { fg } else { muted })
-                                    .child("Opções avançadas"),
+                                    .child(t!("lobby.advanced_options").into_owned()),
                             )
                             .child(div().pt_1().child(labeled_field(
-                                "Chave de acesso do servidor (opcional)",
+                                t!("lobby.server_key_label").into_owned(),
                                 &app.lobby_entities.auth_token,
                                 cx,
                             )))
@@ -334,9 +404,9 @@ pub fn render_lobby(
                             Button::new("btn-join-room")
                                 .primary()
                                 .label(if is_connecting {
-                                    "Conectando..."
+                                    t!("lobby.connecting").into_owned()
                                 } else {
-                                    "Entrar na Sala"
+                                    t!("lobby.join_room").into_owned()
                                 })
                                 .disabled(is_connecting)
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -348,7 +418,7 @@ pub fn render_lobby(
                         div().flex_1().child(
                             Button::new("btn-create-room")
                                 .outline()
-                                .label("Criar Nova Sala")
+                                .label(t!("lobby.create_room").into_owned())
                                 .disabled(is_connecting)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.begin_connect(true, cx);

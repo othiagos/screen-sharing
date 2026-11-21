@@ -38,6 +38,8 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 bytes = "1.7"
 
 gpui-kit = "0.9"
+rust-i18n = "4"
+sys-locale = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 smallvec = "1.13"
 directories = "5.0"

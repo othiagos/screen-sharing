@@ -25,10 +25,10 @@ pub fn sanitize_video_fps(fps: u8) -> u8 {
     }
 }
 
-/// Human-friendly mode label hiding raw `5 FPS` behind `"Texto Nítido"`.
+/// Human-friendly mode label hiding raw `5 FPS` behind `"Sharp Text"`.
 pub fn video_mode_display_label(fps: u8) -> String {
     if fps <= TEXT_FOCUS_FPS {
-        "Texto Nítido".to_string()
+        "Sharp Text".to_string()
     } else {
         format!("{fps} FPS")
     }
@@ -211,8 +211,8 @@ impl ThrottleReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::None => "Normal",
-            Self::Network => "Rede",
-            Self::Viewer => "Espectador",
+            Self::Network => "Network",
+            Self::Viewer => "Viewer",
             Self::Cpu => "CPU",
         }
     }
@@ -713,8 +713,12 @@ mod tests {
         assert_eq!(sanitize_video_fps(15), 15);
         assert_eq!(sanitize_video_fps(30), 30);
         assert_eq!(sanitize_video_fps(60), 60);
-        assert_eq!(video_mode_display_label(5), "Texto Nítido");
+        assert_eq!(video_mode_display_label(5), "Sharp Text");
         assert_eq!(video_mode_display_label(60), "60 FPS");
+        assert_eq!(ThrottleReason::None.label(), "Normal");
+        assert_eq!(ThrottleReason::Network.label(), "Network");
+        assert_eq!(ThrottleReason::Viewer.label(), "Viewer");
+        assert_eq!(ThrottleReason::Cpu.label(), "CPU");
     }
 
     #[test]

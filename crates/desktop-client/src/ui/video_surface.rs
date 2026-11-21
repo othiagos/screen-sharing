@@ -1,3 +1,4 @@
+use crate::i18n::throttle_reason_label;
 use crate::media::DecodedVideoFrame;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -5,6 +6,7 @@ use gpui_kit::{
     Div, ElementId, InteractiveElement, ObjectFit, ParentElement, RenderImage, SharedString,
     Stateful, Styled, StyledImage as _, Window, black, div, hsla, img, px,
 };
+use rust_i18n::t;
 use shared_protocol::{PeerId, ThrottleReason, TEXT_FOCUS_FPS};
 use std::sync::Arc;
 
@@ -47,12 +49,12 @@ pub fn format_friendly_resolution(width: u32, height: u32) -> String {
     }
 }
 
-pub fn friendly_throttle_message(reason: ThrottleReason) -> Option<&'static str> {
+pub fn friendly_throttle_message(reason: ThrottleReason) -> Option<String> {
     match reason {
         ThrottleReason::None => None,
-        ThrottleReason::Network => Some("Qualidade ajustada temporariamente pela conexão"),
-        ThrottleReason::Viewer => Some("Qualidade ajustada para a conexão de quem assiste"),
-        ThrottleReason::Cpu => Some("Qualidade ajustada para manter o desempenho do computador"),
+        ThrottleReason::Network => Some(t!("warnings.throttle_network").into_owned()),
+        ThrottleReason::Viewer => Some(t!("warnings.throttle_viewer").into_owned()),
+        ThrottleReason::Cpu => Some(t!("warnings.throttle_cpu").into_owned()),
     }
 }
 
@@ -159,7 +161,7 @@ pub fn render_video_tile(
                 .justify_center()
                 .text_sm()
                 .text_color(muted_fg)
-                .child("Carregando transmissão..."),
+                .child(t!("stage.loading_stream").into_owned()),
         );
     }
 
@@ -194,7 +196,7 @@ pub fn render_video_tile(
                 .target_fps
                 .is_some_and(|target| target <= u32::from(TEXT_FOCUS_FPS))
             {
-                "Texto Nítido".to_string()
+                t!("modes.sharp_text").into_owned()
             } else {
                 match st.target_fps {
                     Some(target)
@@ -227,7 +229,13 @@ pub fn render_video_tile(
                 lines.push(br_str);
             }
             if show_throttle {
-                lines.push(format!("Adaptado: {}", st.throttle_reason.label()));
+                lines.push(
+                    t!(
+                        "details.adapted",
+                        reason = throttle_reason_label(st.throttle_reason).as_str()
+                    )
+                    .into_owned(),
+                );
             }
             if let Some(rtt) = st.rtt_ms {
                 lines.push(format!("RTT {rtt} ms"));

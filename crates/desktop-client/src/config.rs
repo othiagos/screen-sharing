@@ -40,6 +40,8 @@ pub struct AppConfig {
     pub fps: u8,
     #[serde(default = "default_true")]
     pub dark_mode: bool,
+    #[serde(default)]
+    pub locale: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -52,6 +54,7 @@ impl Default for AppConfig {
             resolution: TargetResolution::R1080p,
             fps: default_fps(),
             dark_mode: true,
+            locale: None,
         }
     }
 }
@@ -157,6 +160,7 @@ mod tests {
             nickname: "Tester".to_string(),
             resolution: TargetResolution::R1440p,
             fps: 5,
+            locale: Some("es".to_string()),
             ..Default::default()
         };
         cfg.trust_fingerprint("PLAY.Example.com:4433", "aa:bb:cc:dd");
@@ -164,17 +168,19 @@ mod tests {
 
         let loaded = AppConfig::load_from(&path).expect("load config");
         assert_eq!(loaded, cfg);
+        assert_eq!(loaded.locale.as_deref(), Some("es"));
         assert_eq!(
             loaded.pinned_fingerprint("play.example.com:4433"),
             Some("AABBCCDD")
         );
 
-        // Legacy JSON containing obsolete `bitrate` key loads cleanly and preserves `fps: 5`
+        // Legacy JSON containing obsolete `bitrate` key and no `locale` loads cleanly
         let legacy_json = r#"{"server_addr":"play.example.com:4433","nickname":"Tester","resolution":"R1080p","fps":5,"bitrate":"Mbps20","dark_mode":true}"#;
         fs::write(&path, legacy_json).expect("write legacy json");
         let legacy_loaded = AppConfig::load_from(&path).expect("load legacy json");
         assert_eq!(legacy_loaded.fps, 5);
         assert_eq!(legacy_loaded.resolution, TargetResolution::R1080p);
+        assert_eq!(legacy_loaded.locale, None);
 
         let _ = fs::remove_dir_all(&dir);
     }

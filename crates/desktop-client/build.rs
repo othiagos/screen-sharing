@@ -1,4 +1,10 @@
 fn main() {
+    println!("cargo:rerun-if-changed=locales");
+    if let Ok(entries) = std::fs::read_dir("locales") {
+        for entry in entries.flatten() {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
     println!("cargo:rerun-if-changed=icons/app.rc");
     println!("cargo:rerun-if-changed=icons/icon.ico");
     println!("cargo:rerun-if-env-changed=PATH");

@@ -228,8 +228,7 @@ fn run_wasapi_capture_loop(
                         );
                         if let Some(wtx) = &warning_tx {
                             let _ = wtx.send(
-                                "Não foi possível isolar o áudio deste aplicativo; compartilhando o áudio do computador."
-                                    .to_string(),
+                                rust_i18n::t!("warnings.audio_fallback_system").into_owned(),
                             );
                         }
                         activate_system_loopback_client()?
