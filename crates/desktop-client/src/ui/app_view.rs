@@ -14,7 +14,7 @@ use gpui_kit::{
     KeyDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RenderImage, Styled,
     Subscription, Window, div,
 };
-use shared_protocol::{PeerId, PeerInfo, StreamConfig};
+use shared_protocol::{ControlErrorCode, PeerId, PeerInfo, StreamConfig};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,6 +24,87 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const FULLSCREEN_OVERLAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn format_server_error(code: ControlErrorCode) -> &'static str {
+    match code {
+        ControlErrorCode::InvalidPassword => "Senha da sala incorreta.",
+        ControlErrorCode::RoomNotFound => {
+            "Sala não encontrada. Verifique o código e tente novamente."
+        }
+        ControlErrorCode::Unauthorized => {
+            "Acesso negado pelo servidor. Verifique a chave de acesso em Opções avançadas."
+        }
+        ControlErrorCode::ProtocolMismatch => {
+            "Versão incompatível com o servidor. Atualize o aplicativo."
+        }
+        ControlErrorCode::NotInRoom => "Você não está em uma sala no momento.",
+        ControlErrorCode::BadRequest => {
+            "Não foi possível completar o pedido. Verifique os dados informados."
+        }
+        ControlErrorCode::Internal => {
+            "O servidor encontrou um problema temporário. Tente novamente."
+        }
+    }
+}
+
+pub(crate) fn is_unauthorized_error(raw: &str) -> bool {
+    raw.to_ascii_lowercase().contains("unauthorized")
+}
+
+pub(crate) fn format_connection_error(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("protocolmismatch") {
+        format_server_error(ControlErrorCode::ProtocolMismatch)
+    } else if lower.contains("unauthorized") {
+        format_server_error(ControlErrorCode::Unauthorized)
+    } else if lower.contains("invalidpassword") {
+        format_server_error(ControlErrorCode::InvalidPassword)
+    } else if lower.contains("roomnotfound") {
+        format_server_error(ControlErrorCode::RoomNotFound)
+    } else if lower.contains("host:port") || lower.contains("invalid socket address") {
+        "Endereço do servidor inválido. Use o formato exemplo.com:4433."
+    } else if lower.contains("failed resolving")
+        || lower.contains("no ip address resolved")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+        || lower.contains("dns")
+    {
+        "Servidor não encontrado. Verifique o endereço digitado."
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "O servidor não respondeu a tempo. Verifique sua conexão e tente novamente."
+    } else if lower.contains("connection refused")
+        || lower.contains("unreachable")
+        || lower.contains("reset")
+    {
+        "Não foi possível alcançar o servidor. Verifique se ele está ligado."
+    } else {
+        "Não foi possível conectar ao servidor. Verifique o endereço e sua internet."
+    }
+}
+
+pub(crate) fn format_disconnect_reason(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "Conexão perdida: o servidor parou de responder."
+    } else if lower.contains("application closed") || lower.contains("locally closed") {
+        "Conexão encerrada pelo servidor."
+    } else if lower.contains("reset") {
+        "Conexão interrompida inesperadamente."
+    } else {
+        "Você foi desconectado do servidor."
+    }
+}
+
+pub(crate) fn format_capture_start_error(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("source not found") {
+        "Não foi possível encontrar a tela ou janela selecionada."
+    } else if lower.contains("cancel") || lower.contains("no pipewire streams") {
+        "Compartilhamento cancelado."
+    } else {
+        "Não foi possível iniciar o compartilhamento de tela."
+    }
+}
 
 pub(crate) fn should_show_fullscreen_overlays(
     is_fullscreen: bool,
@@ -60,6 +141,7 @@ pub struct AppView {
     pub config: AppConfig,
     pub screen: AppScreen,
     pub lobby_entities: LobbyEntities,
+    pub show_advanced_lobby: bool,
     _lobby_subs: Vec<Subscription>,
     pub tofu_prompt: Option<TofuPromptState>,
     pub is_connecting: bool,
@@ -100,7 +182,6 @@ pub struct AppView {
     pub show_stats: bool,
     pub rtt_ms: Option<u32>,
     pub broadcast_stats: Option<BroadcastStats>,
-    pub last_clipboard_feedback: Option<Instant>,
     picker_state: Option<(Entity<PickerModalState>, Subscription)>,
     connect_generation: u64,
     pump_active: bool,
@@ -131,6 +212,7 @@ impl AppView {
             config,
             screen: AppScreen::Lobby,
             lobby_entities,
+            show_advanced_lobby: false,
             _lobby_subs: lobby_subs,
             tofu_prompt: None,
             is_connecting: false,
@@ -168,7 +250,6 @@ impl AppView {
             show_stats: false,
             rtt_ms: None,
             broadcast_stats: None,
-            last_clipboard_feedback: None,
             picker_state: None,
             connect_generation: 0,
             pump_active: false,
@@ -223,17 +304,17 @@ impl AppView {
         let pass_raw = self.lobby_entities.room_password.read(cx).value().to_string();
 
         if server_addr.is_empty() {
-            self.status_message = Some(("Informe o endereço do servidor (host:porta).".into(), true));
+            self.status_message = Some(("Informe o endereço do servidor.".into(), true));
             cx.notify();
             return;
         }
         if nickname.is_empty() {
-            self.status_message = Some(("Informe seu apelido.".into(), true));
+            self.status_message = Some(("Informe seu nome.".into(), true));
             cx.notify();
             return;
         }
         if !create_room && room_id.is_empty() {
-            self.status_message = Some(("Informe o ID da sala para entrar.".into(), true));
+            self.status_message = Some(("Informe o código da sala para entrar.".into(), true));
             cx.notify();
             return;
         }
@@ -309,12 +390,21 @@ impl AppView {
                     }
                     Ok(Err(err)) => {
                         app.is_connecting = false;
-                        app.status_message = Some((format!("Falha na conexão: {err}"), true));
+                        let raw = format!("{err:#}");
+                        tracing::warn!("Falha na conexão com o servidor: {raw}");
+                        if is_unauthorized_error(&raw) {
+                            app.show_advanced_lobby = true;
+                        }
+                        app.status_message =
+                            Some((format_connection_error(&raw).to_string(), true));
                     }
                     Err(join_err) => {
                         app.is_connecting = false;
-                        app.status_message =
-                            Some((format!("Erro interno de conexão: {join_err}"), true));
+                        tracing::warn!("Erro interno ao conectar ao servidor: {join_err}");
+                        app.status_message = Some((
+                            "Não foi possível conectar ao servidor. Tente novamente.".into(),
+                            true,
+                        ));
                     }
                 }
                 cx.notify();
@@ -326,7 +416,7 @@ impl AppView {
 
     pub fn cancel_tofu(&mut self, cx: &mut Context<Self>) {
         self.tofu_prompt = None;
-        self.status_message = Some(("Conexão cancelada pelo usuário.".into(), false));
+        self.status_message = Some(("Conexão cancelada.".into(), false));
         cx.notify();
     }
 
@@ -393,8 +483,10 @@ impl AppView {
                 self.ensure_pump_started(cx);
             }
             Err(err) => {
+                let raw = err.to_string();
+                tracing::warn!("Erro ao iniciar captura local: {raw}");
                 self.local_broadcast_label = None;
-                self.warning_banner = Some(format!("Erro ao iniciar captura: {err}"));
+                self.warning_banner = Some(format_capture_start_error(&raw).to_string());
             }
         }
         cx.notify();
@@ -865,17 +957,23 @@ impl AppView {
                     self.rtt_ms = Some(rtt_ms);
                 }
                 SfuEvent::ServerError { code, message } => {
+                    tracing::warn!(?code, %message, "Erro retornado pelo servidor");
                     self.is_connecting = false;
+                    let friendly = format_server_error(code).to_string();
                     if self.screen == AppScreen::Lobby {
-                        self.status_message = Some((format!("{code:?}: {message}"), true));
+                        if matches!(code, ControlErrorCode::Unauthorized) {
+                            self.show_advanced_lobby = true;
+                        }
+                        self.status_message = Some((friendly, true));
                         if let Some(sfu) = self.sfu_client.take() {
                             sfu.disconnect();
                         }
                     } else {
-                        self.warning_banner = Some(format!("Erro do servidor ({code:?}): {message}"));
+                        self.warning_banner = Some(friendly);
                     }
                 }
                 SfuEvent::Disconnected { reason } => {
+                    tracing::warn!(%reason, "Desconectado do servidor");
                     self.is_connecting = false;
                     if let Some(bc) = self.local_broadcast.take() {
                         if let Some(sfu) = &self.sfu_client {
@@ -888,7 +986,7 @@ impl AppView {
                     self.reset_stage_state(None, cx);
                     if was_stage || self.tofu_prompt.is_none() {
                         self.status_message =
-                            Some((format!("Desconectado do servidor: {reason}"), true));
+                            Some((format_disconnect_reason(&reason).to_string(), true));
                     }
                 }
             }
@@ -998,5 +1096,78 @@ mod tests {
             t_move,
             t_move + Duration::from_secs(5)
         ));
+    }
+
+    #[test]
+    fn test_humanized_server_connection_and_disconnect_errors() {
+        let server_codes = [
+            ControlErrorCode::ProtocolMismatch,
+            ControlErrorCode::Unauthorized,
+            ControlErrorCode::InvalidPassword,
+            ControlErrorCode::RoomNotFound,
+            ControlErrorCode::NotInRoom,
+            ControlErrorCode::BadRequest,
+            ControlErrorCode::Internal,
+        ];
+        for code in server_codes {
+            let msg = format_server_error(code);
+            assert!(!msg.is_empty());
+            assert!(!msg.contains("SFU"));
+            assert!(!msg.contains(&format!("{code:?}")));
+        }
+
+        assert_eq!(
+            format_connection_error("SFU rejected Hello (Unauthorized): invalid token"),
+            format_server_error(ControlErrorCode::Unauthorized)
+        );
+        assert!(is_unauthorized_error(
+            "SFU rejected Hello (Unauthorized): invalid token"
+        ));
+        assert_eq!(
+            format_connection_error("SFU rejected Hello (ProtocolMismatch): expected v4"),
+            format_server_error(ControlErrorCode::ProtocolMismatch)
+        );
+        assert_eq!(
+            format_connection_error("Server address must be in host:port format"),
+            "Endereço do servidor inválido. Use o formato exemplo.com:4433."
+        );
+        assert_eq!(
+            format_connection_error("Failed resolving SFU host 'bad.local:4433'"),
+            "Servidor não encontrado. Verifique o endereço digitado."
+        );
+        assert_eq!(
+            format_connection_error("QUIC TLS handshake failed: timed out"),
+            "O servidor não respondeu a tempo. Verifique sua conexão e tente novamente."
+        );
+        assert_eq!(
+            format_connection_error("unexpected low-level quinn error"),
+            "Não foi possível conectar ao servidor. Verifique o endereço e sua internet."
+        );
+
+        assert_eq!(
+            format_disconnect_reason("timed out"),
+            "Conexão perdida: o servidor parou de responder."
+        );
+        assert_eq!(
+            format_disconnect_reason("application closed: 0"),
+            "Conexão encerrada pelo servidor."
+        );
+        assert_eq!(
+            format_disconnect_reason("connection reset by peer"),
+            "Conexão interrompida inesperadamente."
+        );
+
+        assert_eq!(
+            format_capture_start_error("Source not found: Monitor id=1"),
+            "Não foi possível encontrar a tela ou janela selecionada."
+        );
+        assert_eq!(
+            format_capture_start_error("Portal returned no PipeWire streams"),
+            "Compartilhamento cancelado."
+        );
+        assert_eq!(
+            format_capture_start_error("xcap error"),
+            "Não foi possível iniciar o compartilhamento de tela."
+        );
     }
 }

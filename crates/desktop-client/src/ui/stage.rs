@@ -1,19 +1,19 @@
 use crate::ui::app_view::{AppView, StageLayout};
 use crate::ui::video_surface::{
-    VideoTileKey, VideoTileOptions, VideoTileStats, format_bitrate_compact, is_significant_throttle,
-    render_video_tile,
+    VideoTileKey, VideoTileOptions, VideoTileStats, format_friendly_resolution,
+    friendly_throttle_message, is_significant_throttle, render_video_tile,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{ActiveTheme, Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, RenderImage,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, black, div, hsla, px,
+    Context, InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, black, div, hsla, px,
 };
-use shared_protocol::{video_mode_display_label, PeerId, ThrottleReason, TEXT_FOCUS_FPS};
+use shared_protocol::{video_mode_display_label, PeerId, ThrottleReason};
 use std::sync::Arc;
-use std::time::Duration;
 
 fn sync_video_slots(app: &mut AppView, window: &mut Window) {
     let stale_keys: Vec<PeerId> = app
@@ -58,7 +58,7 @@ fn tile_info(
         VideoTileKey::LocalPreview => {
             let label = match &app.local_broadcast_label {
                 Some(src) => SharedString::from(format!("Sua Transmissão — {src}")),
-                None => SharedString::from("Sua Transmissão (Preview Local)"),
+                None => SharedString::from("Sua Transmissão (Prévia)"),
             };
             let img_arc = app.local_preview_slot.image();
             let stats = app.broadcast_stats.as_ref().map(|bs| VideoTileStats {
@@ -86,7 +86,7 @@ fn tile_info(
                 .iter()
                 .find(|p| p.peer_id == peer_id)
                 .map(|p| p.nickname.clone())
-                .unwrap_or_else(|| format!("Peer {}", &peer_id.to_string()[..6]));
+                .unwrap_or_else(|| format!("Participante {}", &peer_id.to_string()[..6]));
             let img_arc = app.video_slots.get(&peer_id).and_then(|s| s.image());
             let frame_opt = app.video_store.latest_peer_frame(peer_id);
             let meta_opt = app
@@ -237,15 +237,6 @@ pub fn render_stage(
         }
     }
 
-    let copied_recently = app
-        .last_clipboard_feedback
-        .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-    let copy_label = if copied_recently {
-        "Copiado!"
-    } else {
-        "Copiar ID"
-    };
-
     let (rtt_text, rtt_color) = match app.rtt_ms {
         Some(ms) if ms <= 45 => (format!("{ms} ms"), hsla(0.38, 0.7, 0.45, 1.0)),
         Some(ms) if ms <= 120 => (format!("{ms} ms"), hsla(0.12, 0.85, 0.55, 1.0)),
@@ -269,25 +260,32 @@ pub fn render_stage(
         .border_color(border)
         .child(
             h_flex()
-                .gap_3()
+                .gap_2p5()
                 .items_center()
                 .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui_kit::FontWeight::BOLD)
-                        .text_color(fg)
-                        .child(format!("Sala: {}", app.room_id)),
-                )
-                .child(
-                    Button::new("btn-copy-room")
-                        .compact()
-                        .outline()
-                        .label(copy_label)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(this.room_id.clone()));
-                            this.last_clipboard_feedback = Some(std::time::Instant::now());
-                            cx.notify();
-                        })),
+                    h_flex()
+                        .pl_2p5()
+                        .pr_1()
+                        .py_0p5()
+                        .gap_1p5()
+                        .items_center()
+                        .rounded(cx.theme().radius)
+                        .bg(bg)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_color(fg)
+                                .child(format!("Sala: {}", app.room_id)),
+                        )
+                        .child(
+                            Clipboard::new("btn-copy-room")
+                                .value(app.room_id.clone())
+                                .tooltip("Copiar código da sala")
+                                .accessibility_label("Copiar código da sala"),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -311,11 +309,7 @@ pub fn render_stage(
                     Button::new("btn-toggle-layout")
                         .compact()
                         .outline()
-                        .label(if is_focus_layout {
-                            "Modo Grid"
-                        } else {
-                            "Modo Foco"
-                        })
+                        .label(if is_focus_layout { "Grade" } else { "Foco" })
                         .disabled(first_available_key.is_none())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.stage_layout = match this.stage_layout {
@@ -346,9 +340,9 @@ pub fn render_stage(
                         .compact()
                         .outline()
                         .label(if app.show_stats {
-                            "Ocultar Stats"
+                            "Ocultar Detalhes"
                         } else {
-                            "Stats (Ctrl+Shift+S)"
+                            "Detalhes"
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_stats = !this.show_stats;
@@ -390,7 +384,7 @@ pub fn render_stage(
                 .child(
                     Button::new("btn-leave-room")
                         .ghost()
-                        .label("Sair da Sala")
+                        .label("Sair")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.leave_room(window, cx);
                         })),
@@ -410,11 +404,9 @@ pub fn render_stage(
             let is_sub = app.subscribed_peers.contains(&peer_id);
             let stream_desc = peer.active_stream.as_ref().map(|m| {
                 format!(
-                    "{}x{} • {} • {}",
-                    m.width,
-                    m.height,
+                    "{} • {}",
+                    format_friendly_resolution(m.width, m.height),
                     video_mode_display_label(m.fps),
-                    m.codec_name
                 )
             });
             let audio_state = app.peer_sliders.get(&peer_id).cloned();
@@ -544,36 +536,15 @@ pub fn render_stage(
             .unwrap_or("Captura de tela ativa");
         let (stats_desc, adapt_badge) = match &app.broadcast_stats {
             Some(bs) if bs.width > 0 && bs.height > 0 => {
-                let shown_fps = if bs.encoded_fps > 0 {
-                    bs.encoded_fps
+                let mode_fps = if bs.configured_fps > 0 {
+                    bs.configured_fps.min(u32::from(u8::MAX)) as u8
                 } else {
-                    bs.effective_fps
+                    bs.effective_fps.min(u32::from(u8::MAX)) as u8
                 };
-                let fps_txt = if bs.configured_fps <= u32::from(TEXT_FOCUS_FPS) {
-                    "Texto Nítido".to_string()
-                } else if bs.effective_fps > 0
-                    && bs.effective_fps < bs.configured_fps
-                    && bs.throttle_reason != ThrottleReason::None
-                {
-                    format!("{shown_fps}/{} FPS", bs.configured_fps)
-                } else {
-                    format!("{shown_fps} FPS")
-                };
-                let br_txt = if bs.max_bitrate_kbps > 0
-                    && (bs.throttle_reason != ThrottleReason::None
-                        || bs.target_bitrate_kbps < (bs.max_bitrate_kbps * 95) / 100)
-                {
-                    format!(
-                        "{} / {}",
-                        format_bitrate_compact(bs.target_bitrate_kbps),
-                        format_bitrate_compact(bs.max_bitrate_kbps)
-                    )
-                } else {
-                    format_bitrate_compact(bs.target_bitrate_kbps)
-                };
+                let mode_txt = video_mode_display_label(mode_fps);
                 let desc = format!(
-                    "{source_desc} • {}×{} • {fps_txt} • {br_txt} • {}",
-                    bs.width, bs.height, bs.backend
+                    "{source_desc} • {} • {mode_txt}",
+                    format_friendly_resolution(bs.width, bs.height),
                 );
                 let show_badge = is_significant_throttle(
                     bs.throttle_reason,
@@ -582,12 +553,10 @@ pub fn render_stage(
                     bs.effective_fps,
                     bs.configured_fps,
                 );
-                let badge = show_badge.then(|| {
-                    format!(
-                        "Bitrate/FPS reduzido automaticamente ({})",
-                        bs.throttle_reason.label()
-                    )
-                });
+                let badge = show_badge
+                    .then(|| friendly_throttle_message(bs.throttle_reason))
+                    .flatten()
+                    .map(str::to_string);
                 (desc, badge)
             }
             _ => (source_desc.to_string(), None),

@@ -43,7 +43,9 @@ fn main() {
         ThemeMode::Light
     };
 
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(initial_mode, None, cx);
 

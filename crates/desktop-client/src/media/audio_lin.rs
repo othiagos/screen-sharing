@@ -189,12 +189,15 @@ fn run_pipewire_capture_loop(
             }
         }
         (AudioCaptureMode::ApplicationOnly { pid }, None) => {
-            let msg = format!(
-                "PipeWire: nó de áudio para PID {pid} não encontrado; usando áudio global do sistema"
+            warn!(
+                pid,
+                "PipeWire audio node not found for PID; falling back to system global audio"
             );
-            warn!("{msg}");
             if let Some(wtx) = &warning_tx {
-                let _ = wtx.send(msg);
+                let _ = wtx.send(
+                    "Não foi possível isolar o áudio deste aplicativo; compartilhando o áudio do computador."
+                        .to_string(),
+                );
             }
             properties! {
                 *pw::keys::MEDIA_TYPE => "Audio",

@@ -1,8 +1,9 @@
 use crate::ui::app_view::AppView;
+use gpui_kit::component::accordion::Accordion;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Disableable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, SharedString, Styled,
@@ -30,28 +31,26 @@ impl LobbyEntities {
 
         let server_addr = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("127.0.0.1:4433 ou sfu.exemplo.com:4433")
+                .placeholder("exemplo.com:4433")
                 .default_value(addr_default)
         });
         let nickname = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Seu apelido")
+                .placeholder("Como você quer aparecer")
                 .default_value(nick_default)
         });
         let auth_token = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Opcional (SFU_AUTH_TOKEN)")
+                .placeholder("Deixe em branco se não for necessária")
                 .default_value(token_default)
                 .masked(true)
         });
         let room_id = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Ex: sala-principal")
-                .default_value("sala-principal")
+            InputState::new(window, cx).placeholder("Ex: sala-principal")
         });
         let room_password = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Senha da sala (opcional)")
+                .placeholder("Opcional")
                 .masked(true)
         });
 
@@ -137,19 +136,26 @@ pub fn render_lobby(
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .text_color(if changed { danger } else { fg })
                     .child(if changed {
-                        "ALERTA: Certificado TLS do servidor alterado!"
+                        "Atenção: a identidade deste servidor mudou"
                     } else {
-                        "Confirmar certificado do servidor (TOFU)"
+                        "Primeira conexão com este servidor"
                     }),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(muted)
-                    .child(format!(
-                        "Servidor: {}. Verifique a impressão digital SHA-256 antes de enviar credenciais:",
-                        tofu.server_addr
-                    )),
+                    .child(if changed {
+                        format!(
+                            "O servidor {} apresentou uma identificação diferente da última vez. Só continue se souber que ele foi atualizado ou reinstalado.",
+                            tofu.server_addr
+                        )
+                    } else {
+                        format!(
+                            "Antes de conectar a {}, confirme que você confia neste endereço.",
+                            tofu.server_addr
+                        )
+                    }),
             )
             .when_some(tofu.changed_from.clone(), |el, old_fp| {
                 el.child(
@@ -164,7 +170,7 @@ pub fn render_lobby(
                             div()
                                 .text_xs()
                                 .text_color(danger)
-                                .child("Impressão digital anterior salva (possível interceptação ou reinstalação):"),
+                                .child("Código anterior"),
                         )
                         .child(div().text_xs().text_color(fg).child(old_fp)),
                 )
@@ -181,7 +187,11 @@ pub fn render_lobby(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("Impressão digital SHA-256 recebida:"),
+                            .child(if changed {
+                                "Código atual"
+                            } else {
+                                "Código de verificação"
+                            }),
                     )
                     .child(div().text_xs().text_color(fg).child(tofu.fingerprint.clone())),
             )
@@ -203,6 +213,8 @@ pub fn render_lobby(
                     ),
             )
     } else {
+        let app_handle = cx.entity().downgrade();
+
         v_flex()
             .w(px(500.))
             .p_6()
@@ -229,7 +241,7 @@ pub fn render_lobby(
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("Compartilhamento de tela em baixa latência • Vídeo H.264 • Áudio Opus"),
+                                    .child("Compartilhe sua tela e áudio com a sala"),
                             ),
                     )
                     .child(
@@ -242,33 +254,57 @@ pub fn render_lobby(
                     ),
             )
             .child(labeled_field(
-                "Endereço do Servidor SFU (host:porta)",
+                "Servidor",
                 &app.lobby_entities.server_addr,
                 cx,
             ))
             .child(labeled_field(
-                "Seu Apelido",
+                "Seu nome",
                 &app.lobby_entities.nickname,
-                cx,
-            ))
-            .child(labeled_field(
-                "Token de Acesso do Servidor (opcional)",
-                &app.lobby_entities.auth_token,
                 cx,
             ))
             .child(
                 h_flex()
                     .gap_3()
                     .child(div().flex_1().child(labeled_field(
-                        "ID da Sala (para entrar)",
+                        "Código da sala",
                         &app.lobby_entities.room_id,
                         cx,
                     )))
                     .child(div().flex_1().child(labeled_field(
-                        "Senha da Sala (opcional)",
+                        "Senha da sala (opcional)",
                         &app.lobby_entities.room_password,
                         cx,
                     ))),
+            )
+            .child(
+                Accordion::new("lobby-advanced-accordion")
+                    .w_full()
+                    .h_auto()
+                    .small()
+                    .on_toggle_click(move |open_indices, _, cx| {
+                        let is_open = open_indices.contains(&0);
+                        let _ = app_handle.update(cx, |this, cx| {
+                            if this.show_advanced_lobby != is_open {
+                                this.show_advanced_lobby = is_open;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .item(|item| {
+                        item.open(app.show_advanced_lobby)
+                            .title(
+                                div()
+                                    .text_xs()
+                                    .text_color(if app.show_advanced_lobby { fg } else { muted })
+                                    .child("Opções avançadas"),
+                            )
+                            .child(div().pt_1().child(labeled_field(
+                                "Chave de acesso do servidor (opcional)",
+                                &app.lobby_entities.auth_token,
+                                cx,
+                            )))
+                    }),
             )
             .when_some(status_banner, |el, (msg, is_err)| {
                 let banner_color = if is_err { danger } else { accent };

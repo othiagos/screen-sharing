@@ -20,9 +20,9 @@ use shared_protocol::{
 use std::sync::Arc;
 
 const TEXT_MODE_LABEL: &str = "Texto Nítido";
-const AUDIO_NONE: &str = "Sem Áudio";
-const AUDIO_SYSTEM: &str = "Áudio Global do Sistema";
-const AUDIO_APP: &str = "Somente Áudio do Aplicativo";
+const AUDIO_NONE: &str = "Sem áudio";
+const AUDIO_SYSTEM: &str = "Áudio do computador";
+const AUDIO_APP: &str = "Somente este aplicativo";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioChoice {
@@ -36,7 +36,7 @@ fn resolution_to_label(res: TargetResolution) -> &'static str {
         TargetResolution::R720p => "720p",
         TargetResolution::R1080p => "1080p",
         TargetResolution::R1440p => "1440p",
-        TargetResolution::Native => "Nativa",
+        TargetResolution::Native => "Original",
     }
 }
 
@@ -44,7 +44,7 @@ fn label_to_resolution(label: &str) -> TargetResolution {
     match label {
         "720p" => TargetResolution::R720p,
         "1440p" => TargetResolution::R1440p,
-        "Nativa" => TargetResolution::Native,
+        "Original" | "Nativa" => TargetResolution::Native,
         _ => TargetResolution::R1080p,
     }
 }
@@ -56,6 +56,17 @@ fn label_to_audio_choice(label: &str) -> AudioChoice {
         AudioChoice::ApplicationOnly
     } else {
         AudioChoice::SystemGlobal
+    }
+}
+
+fn format_preview_error(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("seleção de tela abrirá") || lower.contains("wayland") {
+        "A seleção de tela abrirá ao iniciar o compartilhamento."
+    } else if lower.contains("minimizada") {
+        "Janela minimizada — restaure-a para ver a prévia."
+    } else {
+        "Prévia indisponível no momento."
     }
 }
 
@@ -80,7 +91,6 @@ pub struct PickerModalState {
     audio_manual_override: Option<AudioChoice>,
     preview_image: Option<Arc<RenderImage>>,
     stale_images: Vec<Arc<RenderImage>>,
-    preview_dims: Option<(u32, u32)>,
     preview_source_dims: Option<(u32, u32)>,
     preview_loading: bool,
     preview_note: Option<String>,
@@ -104,7 +114,7 @@ impl PickerModalState {
                     "720p".to_string(),
                     "1080p".to_string(),
                     "1440p".to_string(),
-                    "Nativa".to_string(),
+                    "Original".to_string(),
                 ],
                 Some(IndexPath::default().row(1)),
                 window,
@@ -180,7 +190,6 @@ impl PickerModalState {
             audio_manual_override: None,
             preview_image: None,
             stale_images: Vec::new(),
-            preview_dims: None,
             preview_source_dims: None,
             preview_loading: false,
             preview_note: None,
@@ -229,7 +238,7 @@ impl PickerModalState {
         match &self.selected_target {
             Some(CaptureTarget::Monitor { name, .. }) if !name.trim().is_empty() => name.clone(),
             Some(CaptureTarget::Window { title, .. }) if !title.trim().is_empty() => title.clone(),
-            Some(CaptureTarget::PortalWayland) => "Portal Wayland".to_string(),
+            Some(CaptureTarget::PortalWayland) => "Tela do Sistema".to_string(),
             _ => "Transmissão de Tela".to_string(),
         }
     }
@@ -351,10 +360,9 @@ impl PickerModalState {
             if let Some(prev) = self.preview_image.take() {
                 self.stale_images.push(prev);
             }
-            self.preview_dims = None;
             self.preview_source_dims = None;
             self.preview_loading = false;
-            self.preview_note = Some("Selecione uma origem na lista à esquerda.".to_string());
+            self.preview_note = Some("Selecione uma tela ou janela na lista à esquerda.".to_string());
             cx.notify();
             return;
         };
@@ -387,16 +395,16 @@ impl PickerModalState {
                             if let Some(prev) = modal.preview_image.replace(img_arc) {
                                 modal.stale_images.push(prev);
                             }
-                            modal.preview_dims = Some((cap.preview_width, cap.preview_height));
                             modal.preview_source_dims = Some(cap.source_dims);
                         }
                     }
                     Err(err) => {
+                        let raw = err.to_string();
+                        tracing::debug!("Prévia da fonte indisponível: {raw}");
                         if let Some(prev) = modal.preview_image.take() {
                             modal.stale_images.push(prev);
                         }
-                        modal.preview_dims = None;
-                        modal.preview_note = Some(err.to_string());
+                        modal.preview_note = Some(format_preview_error(&raw).to_string());
                     }
                 }
                 cx.notify();
@@ -510,22 +518,19 @@ impl Render for PickerModalState {
 
         let hint_content = if missing_pid_warning {
             (
-                "Janela sem PID detectável: será capturado o áudio global do sistema.".to_string(),
+                "Para esta janela, será compartilhado o áudio do computador.".to_string(),
                 warning,
             )
         } else if let Some((w, h)) = source_dims {
-            (
-                format!("Resolução real da fonte: {w}×{h} (sem upscale)"),
-                muted,
-            )
+            (format!("Tamanho original: {w}×{h}"), muted)
         } else if matches!(selected, Some(CaptureTarget::PortalWayland)) {
             (
-                "Resolução real detectada ao confirmar no seletor do sistema.".to_string(),
+                "A tela será escolhida ao iniciar o compartilhamento.".to_string(),
                 muted,
             )
         } else {
             (
-                "Resolução limitada automaticamente ao tamanho máximo da origem.".to_string(),
+                "A qualidade se ajusta automaticamente ao tamanho da tela.".to_string(),
                 muted,
             )
         };
@@ -539,7 +544,7 @@ impl Render for PickerModalState {
             .child(Tab::new().label("Monitores"))
             .child(Tab::new().label("Janelas"));
         if has_wayland {
-            tabs = tabs.child(Tab::new().label("Portal Wayland"));
+            tabs = tabs.child(Tab::new().label("Tela do Sistema"));
         }
 
         let list_items: Vec<_> = filtered
@@ -551,7 +556,7 @@ impl Render for PickerModalState {
                 let badge = match &info.target {
                     CaptureTarget::Monitor { .. } => "Monitor",
                     CaptureTarget::Window { .. } => "Janela",
-                    CaptureTarget::PortalWayland => "PipeWire",
+                    CaptureTarget::PortalWayland => "Sistema",
                 };
                 let target_clone = info.target.clone();
 
@@ -612,11 +617,11 @@ impl Render for PickerModalState {
                     .into_any_element()
             } else {
                 let note = if self.preview_loading {
-                    "Capturando miniatura..."
+                    "Carregando prévia..."
                 } else {
                     self.preview_note
                         .as_deref()
-                        .unwrap_or("Preview indisponível para este item")
+                        .unwrap_or("Prévia indisponível para este item")
                 };
                 div()
                     .w_full()
@@ -628,11 +633,7 @@ impl Render for PickerModalState {
                     .into_any_element()
             });
 
-        let preview_header_label = match (source_dims, self.preview_dims) {
-            (Some((sw, sh)), _) => format!("Preview ({sw}×{sh})"),
-            (None, Some((pw, ph))) => format!("Preview ({pw}×{ph})"),
-            (None, None) => "Preview ao vivo".to_string(),
-        };
+        let preview_header_label = "Prévia";
 
         v_flex()
             .w_full()
@@ -689,7 +690,7 @@ impl Render for PickerModalState {
                                                 .p_3()
                                                 .text_xs()
                                                 .text_color(muted)
-                                                .child("Nenhuma janela/monitor encontrado nesta aba."),
+                                                .child("Nenhuma tela ou janela encontrada nesta aba."),
                                         )
                                     })
                                     .children(list_items),
@@ -728,7 +729,7 @@ impl Render for PickerModalState {
                                                     Button::new("picker-refresh-preview")
                                                         .compact()
                                                         .ghost()
-                                                        .label("Capturar Miniatura")
+                                                        .label("Atualizar")
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             this.refresh_preview(cx);
                                                         })),
@@ -778,7 +779,7 @@ impl Render for PickerModalState {
                                                     .min_w_0()
                                                     .overflow_hidden()
                                                     .gap_1()
-                                                    .child(div().text_xs().text_color(muted).child("Modo / FPS"))
+                                                    .child(div().text_xs().text_color(muted).child("Modo"))
                                                     .child(Select::new(&self.fps_select)),
                                             ),
                                     )
@@ -788,7 +789,7 @@ impl Render for PickerModalState {
                                             .min_w_0()
                                             .overflow_hidden()
                                             .gap_1()
-                                            .child(div().text_xs().text_color(muted).child("Captura de Áudio"))
+                                            .child(div().text_xs().text_color(muted).child("Áudio"))
                                             .child(Select::new(&self.audio_select)),
                                     ),
                             ),
@@ -861,7 +862,7 @@ pub fn open_picker_dialog(
                                 } else {
                                     m_start.update(cx, |m, cx| {
                                         m.preview_note = Some(
-                                            "Selecione um monitor, janela ou portal antes de iniciar."
+                                            "Selecione uma tela ou janela antes de iniciar."
                                                 .to_string(),
                                         );
                                         cx.notify();
@@ -873,4 +874,56 @@ pub fn open_picker_dialog(
     });
 
     modal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_picker_label_roundtrip() {
+        assert_eq!(resolution_to_label(TargetResolution::R720p), "720p");
+        assert_eq!(resolution_to_label(TargetResolution::R1080p), "1080p");
+        assert_eq!(resolution_to_label(TargetResolution::R1440p), "1440p");
+        assert_eq!(resolution_to_label(TargetResolution::Native), "Original");
+
+        assert_eq!(label_to_resolution("720p"), TargetResolution::R720p);
+        assert_eq!(label_to_resolution("1080p"), TargetResolution::R1080p);
+        assert_eq!(label_to_resolution("1440p"), TargetResolution::R1440p);
+        assert_eq!(label_to_resolution("Original"), TargetResolution::Native);
+        assert_eq!(label_to_resolution("Nativa"), TargetResolution::Native);
+
+        assert_eq!(label_to_audio_choice(AUDIO_NONE), AudioChoice::None);
+        assert_eq!(
+            label_to_audio_choice(AUDIO_SYSTEM),
+            AudioChoice::SystemGlobal
+        );
+        assert_eq!(
+            label_to_audio_choice(AUDIO_APP),
+            AudioChoice::ApplicationOnly
+        );
+    }
+
+    #[test]
+    fn test_format_preview_error_hides_technical_internals() {
+        let wayland = format_preview_error(
+            "Video capture error: A seleção de tela abrirá ao iniciar o compartilhamento.",
+        );
+        assert_eq!(
+            wayland,
+            "A seleção de tela abrirá ao iniciar o compartilhamento."
+        );
+
+        let minimized = format_preview_error(
+            "Video capture error: Janela minimizada — restaure-a para ver a prévia.",
+        );
+        assert_eq!(
+            minimized,
+            "Janela minimizada — restaure-a para ver a prévia."
+        );
+
+        let raw_xcap = format_preview_error("Video capture error: xcap Monitor::all panicked");
+        assert_eq!(raw_xcap, "Prévia indisponível no momento.");
+        assert!(!raw_xcap.contains("xcap"));
+    }
 }

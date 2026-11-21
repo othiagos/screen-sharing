@@ -221,12 +221,16 @@ fn run_wasapi_capture_loop(
                 match activate_process_loopback_client(pid) {
                     Ok(client) => client,
                     Err(err) => {
-                        let msg = format!(
-                            "WASAPI: loopback isolado para PID {pid} indisponível ({err}); usando áudio global do sistema"
+                        warn!(
+                            pid,
+                            %err,
+                            "WASAPI process loopback unavailable; falling back to system global audio"
                         );
-                        warn!("{msg}");
                         if let Some(wtx) = &warning_tx {
-                            let _ = wtx.send(msg);
+                            let _ = wtx.send(
+                                "Não foi possível isolar o áudio deste aplicativo; compartilhando o áudio do computador."
+                                    .to_string(),
+                            );
                         }
                         activate_system_loopback_client()?
                     }

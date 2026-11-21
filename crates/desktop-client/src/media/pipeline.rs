@@ -535,10 +535,10 @@ impl LocalBroadcastSession {
             let unexpected_stop_v = Arc::clone(&unexpected_stop_reason);
             let stop_notice = match config.target {
                 CaptureTarget::Window { .. } => {
-                    "Transmissão encerrada: a janela ou processo capturado foi fechado."
+                    "Transmissão encerrada porque a janela compartilhada foi fechada."
                 }
                 CaptureTarget::Monitor { .. } | CaptureTarget::PortalWayland => {
-                    "Transmissão encerrada: a captura de tela foi finalizada."
+                    "A captura de tela foi encerrada."
                 }
             };
             let config_resolution = config.resolution;

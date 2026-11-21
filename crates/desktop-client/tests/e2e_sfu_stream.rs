@@ -445,7 +445,7 @@ async fn test_unexpected_capture_end_stops_broadcast_and_notifies_peers() -> any
     let reason = broadcast
         .unexpected_stop_reason()
         .expect("unexpected stop reason should be populated");
-    assert!(reason.contains("fechado"));
+    assert!(reason.contains("fechada"));
 
     let audio_cancel = observed_audio_cancel
         .lock()

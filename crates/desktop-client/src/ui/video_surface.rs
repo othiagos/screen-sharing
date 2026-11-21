@@ -37,6 +37,25 @@ pub fn format_bitrate_compact(kbps: u32) -> String {
     }
 }
 
+pub fn format_friendly_resolution(width: u32, height: u32) -> String {
+    match (width, height) {
+        (1280, 720) => "720p".to_string(),
+        (1920, 1080) => "1080p".to_string(),
+        (2560, 1440) => "1440p".to_string(),
+        (3840, 2160) => "4K".to_string(),
+        _ => format!("{width}×{height}"),
+    }
+}
+
+pub fn friendly_throttle_message(reason: ThrottleReason) -> Option<&'static str> {
+    match reason {
+        ThrottleReason::None => None,
+        ThrottleReason::Network => Some("Qualidade ajustada temporariamente pela conexão"),
+        ThrottleReason::Viewer => Some("Qualidade ajustada para a conexão de quem assiste"),
+        ThrottleReason::Cpu => Some("Qualidade ajustada para manter o desempenho do computador"),
+    }
+}
+
 pub fn is_significant_throttle(
     reason: ThrottleReason,
     bitrate_kbps: u32,
@@ -140,7 +159,7 @@ pub fn render_video_tile(
                 .justify_center()
                 .text_sm()
                 .text_color(muted_fg)
-                .child("Aguardando quadro H.264..."),
+                .child("Carregando transmissão..."),
         );
     }
 
@@ -286,5 +305,29 @@ mod tests {
             30,
             60,
         ));
+    }
+
+    #[test]
+    fn test_format_friendly_resolution() {
+        assert_eq!(format_friendly_resolution(1280, 720), "720p");
+        assert_eq!(format_friendly_resolution(1920, 1080), "1080p");
+        assert_eq!(format_friendly_resolution(2560, 1440), "1440p");
+        assert_eq!(format_friendly_resolution(3840, 2160), "4K");
+        assert_eq!(format_friendly_resolution(1366, 768), "1366×768");
+        assert_eq!(format_friendly_resolution(1920, 1040), "1920×1040");
+    }
+
+    #[test]
+    fn test_friendly_throttle_message() {
+        assert_eq!(friendly_throttle_message(ThrottleReason::None), None);
+        for reason in [
+            ThrottleReason::Network,
+            ThrottleReason::Viewer,
+            ThrottleReason::Cpu,
+        ] {
+            let msg = friendly_throttle_message(reason).expect("throttled reason has message");
+            assert!(!msg.contains("Bitrate"));
+            assert!(!msg.contains("FPS"));
+        }
     }
 }
