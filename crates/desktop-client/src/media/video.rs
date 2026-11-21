@@ -607,7 +607,7 @@ impl RawOpenH264Encoder {
     }
 
     unsafe fn set_option(&mut self, opt: ENCODER_OPTION, val: *mut c_void) -> c_int {
-        (self.set_option)(self.encoder_ptr, opt, val)
+        unsafe { (self.set_option)(self.encoder_ptr, opt, val) }
     }
 
     #[cfg(test)]
@@ -1346,8 +1346,8 @@ fn extract_window_pid_linux(window: &xcap::Window) -> u32 {
     }
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            if let Ok(file_name) = entry.file_name().into_string() {
-                if let Ok(pid) = file_name.parse::<u32>() {
+            if let Ok(file_name) = entry.file_name().into_string()
+                && let Ok(pid) = file_name.parse::<u32>() {
                     let comm_path = entry.path().join("comm");
                     if let Ok(comm) = std::fs::read_to_string(comm_path) {
                         let comm_clean = comm.trim().to_lowercase();
@@ -1356,7 +1356,6 @@ fn extract_window_pid_linux(window: &xcap::Window) -> u32 {
                         }
                     }
                 }
-            }
         }
     }
     0
@@ -1707,8 +1706,8 @@ impl VideoCapturer for NativeVideoCapturer {
                         next_tick = now_after + frame_interval;
                     }
 
-                    if let CaptureTarget::Window { pid, id, title } = &target {
-                        if *pid > 0 && !is_captured_process_alive(*pid) {
+                    if let CaptureTarget::Window { pid, id, title } = &target
+                        && *pid > 0 && !is_captured_process_alive(*pid) {
                             warn!(
                                 pid,
                                 id,
@@ -1717,7 +1716,6 @@ impl VideoCapturer for NativeVideoCapturer {
                             );
                             break;
                         }
-                    }
 
                     if tx.capacity() == 0 {
                         continue;
@@ -1763,8 +1761,8 @@ impl VideoCapturer for NativeVideoCapturer {
                             consecutive_window_errors = 0;
                             first_window_error_at = None;
                             // Avoid cloning/re-encoding identical frames 60x/s; emit 2Hz keepalive max.
-                            if last_sent_at.elapsed() >= Duration::from_millis(500) {
-                                if let Some((w, h, ref bytes, is_bgra)) = last_frame {
+                            if last_sent_at.elapsed() >= Duration::from_millis(500)
+                                && let Some((w, h, ref bytes, is_bgra)) = last_frame {
                                     last_sent_at = Instant::now();
                                     let frame = RawVideoFrame {
                                         width: w,
@@ -1780,7 +1778,6 @@ impl VideoCapturer for NativeVideoCapturer {
                                         break;
                                     }
                                 }
-                            }
                         }
                         Err(MediaError::SourceNotFound(msg)) => {
                             warn!("Capture target disappeared, stopping video capture: {msg}");

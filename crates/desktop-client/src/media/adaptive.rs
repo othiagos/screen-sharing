@@ -312,8 +312,8 @@ impl AdaptiveBitrateController {
         }
 
         // 3. Network/SFU FPS fallback ONLY for 60 -> 30 FPS (30/15/5 remain fixed)
-        if let Some(sfu_fps) = inputs.sfu_min_fps_cap {
-            if sfu_fps < self.effective_fps {
+        if let Some(sfu_fps) = inputs.sfu_min_fps_cap
+            && sfu_fps < self.effective_fps {
                 let target_tier = self.highest_fps_not_exceeding(sfu_fps);
                 if target_tier < self.effective_fps {
                     self.effective_fps = target_tier;
@@ -325,7 +325,6 @@ impl AdaptiveBitrateController {
                     self.current_bps = self.current_bps.min(effective_cap);
                 }
             }
-        }
 
         let floor_network_sustained =
             if self.effective_fps > 30 && network_mild && self.current_bps < range.min_bps {
@@ -340,8 +339,7 @@ impl AdaptiveBitrateController {
             && self
                 .last_fps_change_at
                 .is_none_or(|t| now.duration_since(t) >= FPS_CHANGE_COOLDOWN)
-        {
-            if let Some(lower_fps) = self.next_lower_fps() {
+            && let Some(lower_fps) = self.next_lower_fps() {
                 self.effective_fps = lower_fps;
                 self.last_fps_change_at = Some(now);
                 self.congested_at_floor_since = None;
@@ -351,7 +349,6 @@ impl AdaptiveBitrateController {
                 effective_cap = sfu_cap.map_or(range.max_bps, |cap| range.max_bps.min(cap));
                 self.current_bps = self.current_bps.min(effective_cap);
             }
-        }
 
         // 4. Probe-up recovery when path is stable (FPS recovery -> probe inside VBR table)
         let stable_enough = now.duration_since(self.healthy_since) >= STABLE_WINDOW_BEFORE_PROBE
@@ -364,8 +361,8 @@ impl AdaptiveBitrateController {
                 let fps_cooldown_ok = self
                     .last_fps_change_at
                     .is_none_or(|t| now.duration_since(t) >= FPS_RECOVERY_COOLDOWN);
-                if fps_cooldown_ok {
-                    if let Some(higher_fps) = self.next_higher_fps() {
+                if fps_cooldown_ok
+                    && let Some(higher_fps) = self.next_higher_fps() {
                         let higher_range = vbr_bitrate_range(self.resolution_tier, higher_fps);
                         let allowed_by_sfu_fps =
                             inputs.sfu_min_fps_cap.is_none_or(|c| higher_fps <= c);
@@ -387,7 +384,6 @@ impl AdaptiveBitrateController {
                                 .min(effective_cap);
                         }
                     }
-                }
             }
 
             if self.current_bps < effective_cap

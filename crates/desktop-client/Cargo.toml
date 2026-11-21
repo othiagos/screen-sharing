@@ -1,7 +1,9 @@
 [package]
 name = "desktop-client"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 build = "build.rs"
 description = "Native GPUI Kit desktop client for Screen Share with GPU-accelerated game capture"
 
@@ -15,7 +17,6 @@ tokio-util = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }
-ringbuf = { workspace = true }
 
 quinn = { workspace = true }
 rustls = { workspace = true }

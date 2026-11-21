@@ -231,24 +231,22 @@ pub async fn handle_quic_connection(conn: Connection, state: Arc<SfuState>) {
                         }
                         match raw[0] {
                             MEDIA_KIND_VIDEO => {
-                                if let Ok((hdr, _)) = VideoFrameHeader::decode(&raw) {
-                                    if hdr.sender_id == peer_id {
+                                if let Ok((hdr, _)) = VideoFrameHeader::decode(&raw)
+                                    && hdr.sender_id == peer_id {
                                         state_inner.forward_video(
                                             peer_id,
                                             hdr.is_keyframe(),
                                             Bytes::from(raw),
                                         );
                                     }
-                                }
                             }
                             MEDIA_KIND_AUDIO
                                 if raw.len() <= MAX_AUDIO_PACKET_BYTES + AUDIO_HEADER_LEN =>
                             {
-                                if let Ok((hdr, _)) = AudioPacketHeader::decode(&raw) {
-                                    if hdr.sender_id == peer_id {
+                                if let Ok((hdr, _)) = AudioPacketHeader::decode(&raw)
+                                    && hdr.sender_id == peer_id {
                                         state_inner.forward_audio(peer_id, Bytes::from(raw));
                                     }
-                                }
                             }
                             _ => {}
                         }
@@ -268,11 +266,10 @@ pub async fn handle_quic_connection(conn: Connection, state: Arc<SfuState>) {
                 _ = cancel_dg_r.cancelled() => break,
                 dg_res = conn_dg_r.read_datagram() => {
                     let Ok(bytes) = dg_res else { break };
-                    if let Ok((hdr, _)) = AudioPacketHeader::decode(&bytes) {
-                        if hdr.sender_id == peer_id {
+                    if let Ok((hdr, _)) = AudioPacketHeader::decode(&bytes)
+                        && hdr.sender_id == peer_id {
                             state_dg_r.forward_audio(peer_id, bytes);
                         }
-                    }
                 }
             }
         }

@@ -113,11 +113,10 @@ impl Clone for SharedFrameBuffer {
 
 impl Drop for SharedFrameBuffer {
     fn drop(&mut self) {
-        if let (Some(arc), Some(pool)) = (self.data.take(), self.pool.take()) {
-            if let Ok(vec) = Arc::try_unwrap(arc) {
+        if let (Some(arc), Some(pool)) = (self.data.take(), self.pool.take())
+            && let Ok(vec) = Arc::try_unwrap(arc) {
                 pool.recycle(vec);
             }
-        }
     }
 }
 

@@ -337,7 +337,7 @@ impl AppView {
         self.is_connecting = true;
         self.status_message = Some((t!("lobby.status_connecting").into_owned(), false));
         self.connect_generation = self.connect_generation.wrapping_add(1);
-        let gen = self.connect_generation;
+        let connect_gen = self.connect_generation;
 
         let pinned = self.config.pinned_fingerprint(&server_addr).map(str::to_string);
         let req = ConnectRequest {
@@ -358,7 +358,7 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let outcome = conn_task.await;
             let _ = this.update(cx, |app, cx| {
-                if app.connect_generation != gen {
+                if app.connect_generation != connect_gen {
                     return;
                 }
                 match outcome {
@@ -606,11 +606,10 @@ impl AppView {
     }
 
     fn handle_unexpected_broadcast_stop(&mut self, reason: String, cx: &mut Context<Self>) {
-        if let Some(session) = self.local_broadcast.take() {
-            if let Some(sfu) = self.sfu_client.as_ref() {
+        if let Some(session) = self.local_broadcast.take()
+            && let Some(sfu) = self.sfu_client.as_ref() {
                 session.stop(sfu);
             }
-        }
         self.clear_local_broadcast_state(None);
         if self.is_fullscreen && self.subscribed_peers.is_empty() {
             self.is_fullscreen = false;
@@ -727,13 +726,11 @@ impl AppView {
         if let Some(w) = &self.warning_banner {
             return Some(w.clone());
         }
-        if let Some(bs) = &self.broadcast_stats {
-            if let Some(w) = &bs.warning {
-                if self.dismissed_warning.as_ref() != Some(w) {
+        if let Some(bs) = &self.broadcast_stats
+            && let Some(w) = &bs.warning
+                && self.dismissed_warning.as_ref() != Some(w) {
                     return Some(w.clone());
                 }
-            }
-        }
         None
     }
 
@@ -975,11 +972,10 @@ impl AppView {
                 SfuEvent::Disconnected { reason } => {
                     tracing::warn!(%reason, "Disconnected from server");
                     self.is_connecting = false;
-                    if let Some(bc) = self.local_broadcast.take() {
-                        if let Some(sfu) = &self.sfu_client {
+                    if let Some(bc) = self.local_broadcast.take()
+                        && let Some(sfu) = &self.sfu_client {
                             bc.stop(sfu);
                         }
-                    }
                     self.sfu_client = None;
                     self.event_rx = None;
                     let was_stage = self.screen == AppScreen::Stage;

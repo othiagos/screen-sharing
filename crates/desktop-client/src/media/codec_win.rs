@@ -78,15 +78,17 @@ struct ComMfGuard {
 
 impl ComMfGuard {
     unsafe fn enter() -> Result<Self, MediaError> {
-        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let mut guard = Self {
-            com_initialized: hr.is_ok(),
-            mf_started: false,
-        };
-        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
-            .map_err(|e| MediaError::Codec(format!("MFStartup failed: {e}")))?;
-        guard.mf_started = true;
-        Ok(guard)
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let mut guard = Self {
+                com_initialized: hr.is_ok(),
+                mf_started: false,
+            };
+            MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
+                .map_err(|e| MediaError::Codec(format!("MFStartup failed: {e}")))?;
+            guard.mf_started = true;
+            Ok(guard)
+        }
     }
 }
 
@@ -302,15 +304,15 @@ impl MfWorkerInner {
 
             // Unlock Async MFT if required (NVENC / AMF / QSV drivers are commonly async MFTs).
             let mut is_async = false;
-            if let Ok(attrs) = transform.GetAttributes() {
-                if attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0 {
-                    attrs
-                        .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
-                        .map_err(|e| {
-                            MediaError::Codec(format!("MF_TRANSFORM_ASYNC_UNLOCK failed: {e}"))
-                        })?;
-                    is_async = true;
-                }
+            if let Ok(attrs) = transform.GetAttributes()
+                && attrs.GetUINT32(&MF_TRANSFORM_ASYNC).unwrap_or(0) != 0
+            {
+                attrs
+                    .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+                    .map_err(|e| {
+                        MediaError::Codec(format!("MF_TRANSFORM_ASYNC_UNLOCK failed: {e}"))
+                    })?;
+                is_async = true;
             }
 
             // Set DirectX device manager for hardware-accelerated MFT
@@ -348,81 +350,83 @@ impl MfWorkerInner {
     }
 
     unsafe fn configure_streams(&mut self, width: u32, height: u32) -> Result<(), MediaError> {
-        let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        unsafe {
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
 
-        if let Some(api) = &self.codec_api {
-            let _ = api.SetValue(
-                &CODECAPI_AVEncCommonRateControlMode,
-                &VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
-            );
-            let _ = api.SetValue(
-                &CODECAPI_AVEncCommonMeanBitRate,
-                &VARIANT::from(self.bitrate_bps),
-            );
-            let _ = api.SetValue(
-                &CODECAPI_AVEncCommonMaxBitRate,
-                &VARIANT::from(self.max_bitrate_bps.max(self.bitrate_bps)),
-            );
-            if self.fps <= 5 {
-                let _ = api.SetValue(&CODECAPI_AVEncCommonQuality, &VARIANT::from(85u32));
-                let _ = api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(80u32));
+            if let Some(api) = &self.codec_api {
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncCommonRateControlMode,
+                    &VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32),
+                );
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncCommonMeanBitRate,
+                    &VARIANT::from(self.bitrate_bps),
+                );
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncCommonMaxBitRate,
+                    &VARIANT::from(self.max_bitrate_bps.max(self.bitrate_bps)),
+                );
+                if self.fps <= 5 {
+                    let _ = api.SetValue(&CODECAPI_AVEncCommonQuality, &VARIANT::from(85u32));
+                    let _ = api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(80u32));
+                }
+                let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &VARIANT::from(true));
+                let _ = api.SetValue(&CODECAPI_AVEncCommonRealTime, &VARIANT::from(true));
+                let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
+                let gop = if self.fps <= 5 {
+                    12u32
+                } else {
+                    u32::from(self.fps) * 3
+                };
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop));
             }
-            let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &VARIANT::from(true));
-            let _ = api.SetValue(&CODECAPI_AVEncCommonRealTime, &VARIANT::from(true));
-            let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
-            let gop = if self.fps <= 5 {
-                12u32
-            } else {
-                u32::from(self.fps) * 3
-            };
-            let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop));
+
+            let packed_size = (u64::from(width) << 32) | u64::from(height);
+            let packed_fps = (u64::from(self.fps) << 32) | 1u64;
+            let packed_par = (1u64 << 32) | 1u64;
+
+            let out_type: IMFMediaType = MFCreateMediaType()
+                .map_err(|e| MediaError::Codec(format!("MFCreateMediaType output: {e}")))?;
+            out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
+            out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).ok();
+            out_type.SetUINT32(&MF_MT_AVG_BITRATE, self.bitrate_bps).ok();
+            out_type.SetUINT64(&MF_MT_FRAME_SIZE, packed_size).ok();
+            out_type.SetUINT64(&MF_MT_FRAME_RATE, packed_fps).ok();
+            out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_par).ok();
+            out_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2).ok(); // Progressive
+            out_type
+                .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
+                .ok();
+
+            self.transform
+                .SetOutputType(0, &out_type, 0)
+                .map_err(|e| MediaError::Codec(format!("MFT SetOutputType(H264) failed: {e}")))?;
+
+            let in_type: IMFMediaType = MFCreateMediaType()
+                .map_err(|e| MediaError::Codec(format!("MFCreateMediaType input: {e}")))?;
+            in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
+            in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok();
+            in_type.SetUINT64(&MF_MT_FRAME_SIZE, packed_size).ok();
+            in_type.SetUINT64(&MF_MT_FRAME_RATE, packed_fps).ok();
+            in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_par).ok();
+            in_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2).ok();
+
+            self.transform
+                .SetInputType(0, &in_type, 0)
+                .map_err(|e| MediaError::Codec(format!("MFT SetInputType(NV12) failed: {e}")))?;
+
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+            self.configured_dims = Some((width, height));
+            self.force_next_idr = true;
+            debug!(width, height, fps = self.fps, bitrate = self.bitrate_bps, "Configured MF H.264 streams");
+            Ok(())
         }
-
-        let packed_size = (u64::from(width) << 32) | u64::from(height);
-        let packed_fps = (u64::from(self.fps) << 32) | 1u64;
-        let packed_par = (1u64 << 32) | 1u64;
-
-        let out_type: IMFMediaType = MFCreateMediaType()
-            .map_err(|e| MediaError::Codec(format!("MFCreateMediaType output: {e}")))?;
-        out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
-        out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).ok();
-        out_type.SetUINT32(&MF_MT_AVG_BITRATE, self.bitrate_bps).ok();
-        out_type.SetUINT64(&MF_MT_FRAME_SIZE, packed_size).ok();
-        out_type.SetUINT64(&MF_MT_FRAME_RATE, packed_fps).ok();
-        out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_par).ok();
-        out_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2).ok(); // Progressive
-        out_type
-            .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
-            .ok();
-
-        self.transform
-            .SetOutputType(0, &out_type, 0)
-            .map_err(|e| MediaError::Codec(format!("MFT SetOutputType(H264) failed: {e}")))?;
-
-        let in_type: IMFMediaType = MFCreateMediaType()
-            .map_err(|e| MediaError::Codec(format!("MFCreateMediaType input: {e}")))?;
-        in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
-        in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok();
-        in_type.SetUINT64(&MF_MT_FRAME_SIZE, packed_size).ok();
-        in_type.SetUINT64(&MF_MT_FRAME_RATE, packed_fps).ok();
-        in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_par).ok();
-        in_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2).ok();
-
-        self.transform
-            .SetInputType(0, &in_type, 0)
-            .map_err(|e| MediaError::Codec(format!("MFT SetInputType(NV12) failed: {e}")))?;
-
-        let _ = self
-            .transform
-            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-        let _ = self
-            .transform
-            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-
-        self.configured_dims = Some((width, height));
-        self.force_next_idr = true;
-        debug!(width, height, fps = self.fps, bitrate = self.bitrate_bps, "Configured MF H.264 streams");
-        Ok(())
     }
 
     fn encode_nv12(
@@ -468,12 +472,12 @@ impl MfWorkerInner {
             let _ = sample.SetSampleDuration(dur_100ns);
             self.frame_index = self.frame_index.wrapping_add(1);
 
-            if let Some(gen) = &self.event_gen {
+            if let Some(event_gen) = &self.event_gen {
                 // Async MFT loop: deliver input once METransformNeedInput arrives, then read output.
                 let mut sent_input = false;
                 let mut is_clean = false;
                 for _ in 0..16 {
-                    let ev = gen.GetEvent(MF_EVENT_FLAG_NONE).map_err(|e| {
+                    let ev = event_gen.GetEvent(MF_EVENT_FLAG_NONE).map_err(|e| {
                         MediaError::Codec(format!("MFT GetEvent failed: {e}"))
                     })?;
                     let ev_type = MF_EVENT_TYPE(ev.GetType().unwrap_or(0) as i32);
@@ -622,47 +626,49 @@ unsafe fn extract_mft_output(
     transform: &IMFTransform,
     out_bytes: &mut Vec<u8>,
 ) -> Result<bool, MediaError> {
-    let stream_info = transform
-        .GetOutputStreamInfo(0)
-        .map_err(|e| MediaError::Codec(format!("GetOutputStreamInfo: {e}")))?;
-    let provides_samples = (stream_info.dwFlags & 0x0000_0100) != 0; // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
+    unsafe {
+        let stream_info = transform
+            .GetOutputStreamInfo(0)
+            .map_err(|e| MediaError::Codec(format!("GetOutputStreamInfo: {e}")))?;
+        let provides_samples = (stream_info.dwFlags & 0x0000_0100) != 0; // MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
 
-    let mut out_sample: Option<IMFSample> = None;
-    if !provides_samples {
-        let s = MFCreateSample()
-            .map_err(|e| MediaError::Codec(format!("MFCreateSample out: {e}")))?;
-        let b = MFCreateMemoryBuffer(stream_info.cbSize.max(512 * 1024))
-            .map_err(|e| MediaError::Codec(format!("MFCreateMemoryBuffer out: {e}")))?;
-        let _ = s.AddBuffer(&b);
-        out_sample = Some(s);
-    }
+        let mut out_sample: Option<IMFSample> = None;
+        if !provides_samples {
+            let s = MFCreateSample()
+                .map_err(|e| MediaError::Codec(format!("MFCreateSample out: {e}")))?;
+            let b = MFCreateMemoryBuffer(stream_info.cbSize.max(512 * 1024))
+                .map_err(|e| MediaError::Codec(format!("MFCreateMemoryBuffer out: {e}")))?;
+            let _ = s.AddBuffer(&b);
+            out_sample = Some(s);
+        }
 
-    let mut out_buf = [MFT_OUTPUT_DATA_BUFFER {
-        dwStreamID: 0,
-        pSample: std::mem::ManuallyDrop::new(out_sample),
-        dwStatus: 0,
-        pEvents: std::mem::ManuallyDrop::new(None),
-    }];
-    let mut status = 0u32;
-    let res = transform.ProcessOutput(0, &mut out_buf, &mut status);
-    let sample_opt = std::mem::ManuallyDrop::take(&mut out_buf[0].pSample);
-    let _ = std::mem::ManuallyDrop::take(&mut out_buf[0].pEvents);
-    res.map_err(|e| MediaError::Codec(format!("MFT ProcessOutput: {e}")))?;
+        let mut out_buf = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(out_sample),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        let res = transform.ProcessOutput(0, &mut out_buf, &mut status);
+        let sample_opt = std::mem::ManuallyDrop::take(&mut out_buf[0].pSample);
+        let _ = std::mem::ManuallyDrop::take(&mut out_buf[0].pEvents);
+        res.map_err(|e| MediaError::Codec(format!("MFT ProcessOutput: {e}")))?;
 
-    let mut is_clean = false;
-    if let Some(sample) = sample_opt {
-        is_clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
-        if let Ok(contiguous) = sample.ConvertToContiguousBuffer() {
-            let mut ptr: *mut u8 = null_mut();
-            let mut cur_len = 0u32;
-            if contiguous.Lock(&mut ptr, None, Some(&mut cur_len)).is_ok() && !ptr.is_null() {
-                let slice = std::slice::from_raw_parts(ptr, cur_len as usize);
-                out_bytes.extend_from_slice(slice);
-                let _ = contiguous.Unlock();
+        let mut is_clean = false;
+        if let Some(sample) = sample_opt {
+            is_clean = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+            if let Ok(contiguous) = sample.ConvertToContiguousBuffer() {
+                let mut ptr: *mut u8 = null_mut();
+                let mut cur_len = 0u32;
+                if contiguous.Lock(&mut ptr, None, Some(&mut cur_len)).is_ok() && !ptr.is_null() {
+                    let slice = std::slice::from_raw_parts(ptr, cur_len as usize);
+                    out_bytes.extend_from_slice(slice);
+                    let _ = contiguous.Unlock();
+                }
             }
         }
+        Ok(is_clean)
     }
-    Ok(is_clean)
 }
 
 impl Drop for MfH264Encoder {

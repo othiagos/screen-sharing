@@ -34,11 +34,10 @@ pub fn collect_process_tree_pids(root_pid: u32) -> HashSet<u32> {
                 let children_path = task.path().join("children");
                 if let Ok(content) = std::fs::read_to_string(children_path) {
                     for token in content.split_whitespace() {
-                        if let Ok(child_pid) = token.parse::<u32>() {
-                            if !pids.contains(&child_pid) {
+                        if let Ok(child_pid) = token.parse::<u32>()
+                            && !pids.contains(&child_pid) {
                                 stack.push(child_pid);
                             }
-                        }
                     }
                 }
             }
@@ -134,10 +133,10 @@ fn run_pipewire_capture_loop(
             if global.type_ != pw::types::ObjectType::Node || target_pids.is_empty() {
                 return;
             }
-            if let Some(props) = global.props {
-                if let Some(pid_str) = props.get(*pw::keys::APP_PROCESS_ID) {
-                    if let Ok(node_pid) = pid_str.trim().parse::<u32>() {
-                        if target_pids.contains(&node_pid) {
+            if let Some(props) = global.props
+                && let Some(pid_str) = props.get(*pw::keys::APP_PROCESS_ID)
+                    && let Ok(node_pid) = pid_str.trim().parse::<u32>()
+                        && target_pids.contains(&node_pid) {
                             let target_obj = props
                                 .get("object.serial")
                                 .map(str::to_string)
@@ -150,9 +149,6 @@ fn run_pipewire_capture_loop(
                             );
                             *matched_clone.borrow_mut() = Some((global.id, target_obj));
                         }
-                    }
-                }
-            }
         })
         .register();
 

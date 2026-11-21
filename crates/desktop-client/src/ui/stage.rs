@@ -689,7 +689,7 @@ pub fn render_stage(
             all_focusable.push(VideoTileKey::LocalPreview);
         }
 
-        let content = match app.stage_layout {
+        match app.stage_layout {
             StageLayout::Focus(focused_key) if all_focusable.contains(&focused_key) => {
                 let others: Vec<VideoTileKey> = all_focusable
                     .iter()
@@ -787,9 +787,7 @@ pub fn render_stage(
                     grid
                 }
             }
-        };
-
-        content
+        }
     };
 
     v_flex()

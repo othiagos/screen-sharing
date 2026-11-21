@@ -181,8 +181,8 @@ pub fn render_video_tile(
         );
     }
 
-    if options.show_stats {
-        if let Some(st) = stats {
+    if options.show_stats
+        && let Some(st) = stats {
             let mut lines: Vec<String> = Vec::new();
             let eff_fps = st.effective_fps.unwrap_or(st.fps);
             let show_throttle = is_significant_throttle(
@@ -270,7 +270,6 @@ pub fn render_video_tile(
 
             tile = tile.child(div().absolute().right(px(10.)).top(px(10.)).child(overlay));
         }
-    }
 
     tile
 }

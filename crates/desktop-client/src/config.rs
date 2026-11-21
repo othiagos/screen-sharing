@@ -78,17 +78,15 @@ impl AppConfig {
 
     /// Loads config from `primary`, migrating from `legacy` if `primary` does not yet exist.
     pub fn load_with_migration(primary: &Path, legacy: &Path) -> Self {
-        if primary.exists() {
-            if let Ok(cfg) = Self::load_from(primary) {
+        if primary.exists()
+            && let Ok(cfg) = Self::load_from(primary) {
                 return cfg;
             }
-        }
-        if legacy.exists() {
-            if let Ok(cfg) = Self::load_from(legacy) {
+        if legacy.exists()
+            && let Ok(cfg) = Self::load_from(legacy) {
                 let _ = cfg.save_to(primary);
                 return cfg;
             }
-        }
         Self::default()
     }
 
@@ -116,12 +114,11 @@ impl AppConfig {
 
     /// Atomically persists config JSON to an explicit file path.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("Failed creating config dir {}", parent.display()))?;
             }
-        }
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)
             .with_context(|| format!("Failed writing config {}", path.display()))?;

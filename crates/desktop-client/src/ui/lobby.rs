@@ -78,11 +78,10 @@ impl LobbyEntities {
             &locale_select,
             window,
             |this: &mut AppView, state, ev: &SelectEvent<Vec<String>>, window, cx| {
-                if let SelectEvent::Confirm(Some(_)) = ev {
-                    if let Some(ix) = state.read(cx).selected_index(cx) {
+                if let SelectEvent::Confirm(Some(_)) = ev
+                    && let Some(ix) = state.read(cx).selected_index(cx) {
                         this.set_locale(AppLocale::from_index(ix.row), window, cx);
                     }
-                }
             },
         );
         let sub_room = cx.subscribe(&room_id, |this: &mut AppView, _, ev: &InputEvent, cx| {

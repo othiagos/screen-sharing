@@ -2,15 +2,21 @@
 
 ## Highlights
 
-- **Centralized Low-Latency SFU (`sfu-server` via `quinn`):** Dedicated unidirectional streams per H.264 video frame eliminate TCP head-of-line blocking, while unreliable UDP datagrams (with automatic stream fallback) deliver low-latency 20ms Opus audio.
-- **Native Hardware UI (`gpui-kit`):** Zero WebView/WebAssembly overhead — dark Discord/Parsec-style native window with direct GPU `RenderImage` BGRA video presentation, per-peer 0–200% audio mixer sliders, Grid/Focus/Fullscreen views, live preview Capture Picker, and real-time latency/bitrate stats (`Ctrl+Shift+S`).
-- **Stutter-Free Game Capture:**
-  - **Windows 10/11:** `Windows.Graphics.Capture` (`CreateFreeThreaded` + HWND validation to eliminate Alt-Tab desktop leaks), DXGI Desktop Duplication with idle frame deduplication, **Media Foundation Hardware H.264 MFT** (NVENC/AMF/QuickSync when available, `OpenH264` tuned fallback), and WASAPI Process Loopback.
-  - **Linux (Wayland & X11):** XDG Desktop Portal ScreenCast (`ashpd`) + PipeWire video streaming on Wayland, `xcap` on X11, bilinear SIMD scaling (`fast_image_resize`), and PipeWire per-application audio capture via `target.object` (`object.serial`).
-- **TLS 1.3 + TOFU Security:** Self-signed servers automatically display a **Trust-On-First-Use (TOFU)** SHA-256 fingerprint prompt and warn immediately if the pin changes. Supports `SFU_TLS_CERT`/`SFU_TLS_KEY` PEM files, optional `SFU_AUTH_TOKEN`, and per-room passwords.
+- **Centralized Low-Latency SFU (`sfu-server` via `quinn`):** Dedicated unidirectional QUIC streams per video frame eliminate TCP head-of-line blocking, while unreliable UDP datagrams (with automatic stream fallback) deliver low-latency 20ms Opus audio.
+- **Native Hardware-Accelerated UI (`gpui-kit`):** Zero WebView/Electron overhead — light/dark native interface with direct GPU `RenderImage` BGRA presentation, per-peer 0–200% audio mixer sliders, Grid/Focus/Fullscreen views, live preview Capture Picker, and on-demand technical overlay (**Details** / `Ctrl+Shift+S`).
+- **Multilingual (`i18n`):** Built-in support for **English** (default), **Español**, and **Português (BR)** with automatic OS language detection on first launch and instant switching in the Lobby.
+- **Sharp Text 4:4:4 Mode & Automatic VBR:**
+  - **Sharp Text (`5 FPS`):** Dedicated 64×64 dirty-tile 4:4:4 codec (`SolidRgb` + lossless `QoiRgb` + YUV 4:4:4 JPEG fallback) for crystal-clear code, spreadsheets, and documents without 4:2:0 color bleed.
+  - **Smooth Motion (`15` / `30` / `60 FPS`):** Automatic VBR congestion control with SIMD YUV conversion, **Media Foundation Hardware H.264 MFT** (NVENC/AMF/QuickSync on Windows), and multi-slice **OpenH264** fallback.
+- **Stutter-Free Screen & Audio Capture:**
+  - **Windows 10/11:** `Windows.Graphics.Capture` (`CreateFreeThreaded` + HWND validation), DXGI Desktop Duplication with idle frame deduplication, and WASAPI per-application / system loopback audio.
+  - **Linux (Wayland & X11):** XDG Desktop Portal ScreenCast (`ashpd`) + PipeWire video on Wayland, `xcap` on X11, SIMD bilinear scaling (`fast_image_resize`), and PipeWire per-application / system audio capture.
+- **TLS 1.3 + TOFU Security:** Self-signed servers prompt for server identity confirmation (**Trust-On-First-Use** SHA-256 verification code) and warn immediately if the identity changes. Supports `SFU_TLS_CERT`/`SFU_TLS_KEY` PEM files, optional `SFU_AUTH_TOKEN`, and per-room passwords.
 - **Audio Resilience:** 40ms per-peer jitter buffer with Opus Packet Loss Concealment (PLC), automatic drift trimming, and soft-clipped mixing.
 
-## Prerequisites
+## Prerequisites (Building from Source)
+
+Requires **Rust 1.88+** (Rust Edition 2024).
 
 ### Linux (Ubuntu / Debian)
 
@@ -37,7 +43,7 @@ winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passi
 
 ## Building
 
-Always compile with `--release` so SIMD scaling and H.264/Opus encoding run at full speed:
+Always compile with `--release` so SIMD scaling and video/audio encoding run at full speed:
 
 ```bash
 cargo build --release -p sfu-server -p desktop-client
@@ -53,7 +59,7 @@ Binaries are written to `target/release/sfu-server` and `target/release/desktop-
    ```
    Optional environment variables:
    - `SFU_BIND_ADDR` / `SFU_BIND`: bind address (default `0.0.0.0:4433`)
-   - `SFU_AUTH_TOKEN`: optional shared access token required on `Hello`
+   - `SFU_AUTH_TOKEN`: optional shared access key required on `Hello`
    - `SFU_CERT_DIR`: persistent directory for auto-generated self-signed TLS certs (default `./.sfu-certs`)
    - `SFU_PUBLIC_HOST`: comma-separated SAN DNS/IP entries when auto-generating certs
    - `SFU_TLS_CERT` & `SFU_TLS_KEY`: explicit PEM cert/key paths (e.g., Let's Encrypt)
@@ -62,10 +68,10 @@ Binaries are written to `target/release/sfu-server` and `target/release/desktop-
    ```bash
    cargo run --release -p desktop-client
    ```
-   - Enter `server:4433`, your nickname, and optional `auth_token`.
-   - Accept the server's SHA-256 TOFU fingerprint prompt on first connection.
-   - Click **Criar Nova Sala** or enter an existing Room ID and click **Entrar na Sala**.
-   - Click **Compartilhar Tela** to pick a Monitor, Window, or Wayland Portal, preview it live, select `720p`/`1080p`/`1440p`/`Nativa`, `15`/`30`/`60 FPS`, adaptive bitrate (`Auto`, `Até 6 Mbps`, `Até 12 Mbps`, `Até 20 Mbps`), and audio mode.
+   - Enter the server address (`example.com:4433`), your name, and (if required by the server) the access key under **Advanced options**.
+   - Confirm the server identity prompt on first connection.
+   - Click **Create New Room** or enter an 8-character room code (e.g. `a1b2c3d4`) and click **Join Room**.
+   - Click **Share Screen** to pick a Monitor, Window, or System Screen, preview it live, choose resolution (`720p` / `1080p` / `1440p` / `Original`), mode (`Sharp Text` / `15` / `30` / `60 FPS`), and audio (`No audio` / `Computer audio` / `This app only`).
 
 ## Docker Deployment (`sfu-server`)
 

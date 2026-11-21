@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ashpd 0.14.0",
@@ -1418,7 +1418,6 @@ dependencies = [
  "qoi",
  "quinn",
  "rcgen",
- "ringbuf",
  "rust-i18n",
  "rustls",
  "serde",
@@ -5997,17 +5996,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ringbuf"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
-dependencies = [
- "crossbeam-utils",
- "portable-atomic",
- "portable-atomic-util",
-]
-
-[[package]]
 name = "ropey"
 version = "2.0.0-beta.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6542,7 +6530,7 @@ dependencies = [
 
 [[package]]
 name = "sfu-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6603,7 +6591,7 @@ dependencies = [
 
 [[package]]
 name = "shared-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "serde",

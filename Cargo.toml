@@ -12,8 +12,9 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
@@ -25,7 +26,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 dashmap = "6.1"
 futures-util = "0.3"
 parking_lot = "0.12"
-ringbuf = "0.4"
 
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

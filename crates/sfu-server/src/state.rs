@@ -101,11 +101,10 @@ impl ViewerCongestionState {
         if now.duration_since(clean_start) < VIEWER_STABLE_BEFORE_PROBE {
             return false;
         }
-        if let Some(prev) = self.last_increase_at {
-            if now.duration_since(prev) < VIEWER_INCREASE_INTERVAL {
+        if let Some(prev) = self.last_increase_at
+            && now.duration_since(prev) < VIEWER_INCREASE_INTERVAL {
                 return false;
             }
-        }
         let next = ((self.suggested_bps as f64) * 1.15).round() as u32 + 150_000;
         let release_threshold = stream_bps.max(8_000_000).saturating_mul(5) / 4;
         self.last_increase_at = Some(now);
@@ -237,11 +236,10 @@ impl ConnectedPeer {
     pub fn try_request_keyframe_with_cooldown(&self, cooldown: Duration) {
         let mut guard = self.last_keyframe_req.lock();
         let now = Instant::now();
-        if let Some(prev) = *guard {
-            if now.duration_since(prev) < cooldown {
+        if let Some(prev) = *guard
+            && now.duration_since(prev) < cooldown {
                 return;
             }
-        }
         *guard = Some(now);
         drop(guard);
         self.send_control(ServerControl::ForceKeyframe);
@@ -632,9 +630,9 @@ impl SfuState {
                 .map(|b| b.measured_video_bps.load(Ordering::Relaxed))
                 .unwrap_or(0);
             let mut changed = false;
-            if let Some(subs) = room.subscriptions.get(&broadcaster_id) {
-                if let Some(sub) = subs.get(&viewer_id) {
-                    if sub.video {
+            if let Some(subs) = room.subscriptions.get(&broadcaster_id)
+                && let Some(sub) = subs.get(&viewer_id)
+                    && sub.video {
                         let mut cg = sub.congestion.lock();
                         changed = if congested {
                             cg.note_congestion(stream_bps, severe, now)
@@ -642,8 +640,6 @@ impl SfuState {
                             cg.note_clean(stream_bps, now)
                         };
                     }
-                }
-            }
             if changed || Self::should_send_keepalive_hint(&room, broadcaster_id, now) {
                 Self::recompute_broadcaster_hint(&room, broadcaster_id, now);
             }
@@ -712,8 +708,8 @@ impl SfuState {
         }
         drop(subs);
 
-        if full_drops > 0 {
-            if let Some(broadcaster) = room.peers.get(&broadcaster_id) {
+        if full_drops > 0
+            && let Some(broadcaster) = room.peers.get(&broadcaster_id) {
                 let majority_dropping =
                     total_video_viewers <= 1 || (full_drops * 2) > total_video_viewers;
                 let cooldown = if majority_dropping {
@@ -723,7 +719,6 @@ impl SfuState {
                 };
                 broadcaster.try_request_keyframe_with_cooldown(cooldown);
             }
-        }
 
         if updated_congestion {
             Self::recompute_broadcaster_hint(&room, broadcaster_id, now);

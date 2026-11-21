@@ -101,7 +101,7 @@ impl PeerVideoStore {
         frame_id: u32,
         fps_estimate: u32,
     ) {
-        let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let bgra_len = bgra.len();
         let image = bgra_to_render_image(width, height, bgra);
         let slot = self
@@ -114,14 +114,14 @@ impl PeerVideoStore {
             height,
             bgra_len,
             image,
-            generation: gen,
+            generation,
             frame_id,
             fps_estimate,
         });
     }
 
     pub fn update_local_preview(&self, width: u32, height: u32, bgra: Vec<u8>, fps: u32) {
-        let gen = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let bgra_len = bgra.len();
         let image = bgra_to_render_image(width, height, bgra);
         *self.local_preview.lock() = Some(DecodedVideoFrame {
@@ -129,8 +129,8 @@ impl PeerVideoStore {
             height,
             bgra_len,
             image,
-            generation: gen,
-            frame_id: gen as u32,
+            generation,
+            frame_id: generation as u32,
             fps_estimate: fps,
         });
     }
@@ -387,11 +387,10 @@ impl PeerMediaReceiver {
                 entry.2 = now;
             }
         }
-        if let Some((q, d)) = to_send {
-            if let Some(sfu) = self.sfu_handle.lock().as_ref() {
+        if let Some((q, d)) = to_send
+            && let Some(sfu) = self.sfu_handle.lock().as_ref() {
                 sfu.send_viewer_feedback(broadcaster_id, q, d);
             }
-        }
     }
 }
 

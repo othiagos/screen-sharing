@@ -2,6 +2,7 @@
 name = "sfu-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]
@@ -20,7 +21,7 @@ parking_lot.workspace = true
 quinn = "0.11"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rustls-pemfile = "2.2"
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

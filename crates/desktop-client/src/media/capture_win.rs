@@ -99,27 +99,27 @@ impl DxgiMonitorDuplicator {
             while let Ok(adapter) = factory.EnumAdapters1(adapter_idx) {
                 let mut output_idx = 0u32;
                 while let Ok(output) = adapter.EnumOutputs(output_idx) {
-                    if let Ok(desc) = output.GetDesc() {
-                        if desc.AttachedToDesktop.as_bool() {
-                            let hmon_id = desc.Monitor.0 as usize as u32;
-                            let dev_name_len = desc
-                                .DeviceName
-                                .iter()
-                                .position(|&c| c == 0)
-                                .unwrap_or(desc.DeviceName.len());
-                            let dev_name =
-                                String::from_utf16_lossy(&desc.DeviceName[..dev_name_len]);
+                    if let Ok(desc) = output.GetDesc()
+                        && desc.AttachedToDesktop.as_bool()
+                    {
+                        let hmon_id = desc.Monitor.0 as usize as u32;
+                        let dev_name_len = desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.DeviceName.len());
+                        let dev_name =
+                            String::from_utf16_lossy(&desc.DeviceName[..dev_name_len]);
 
-                            if fallback_pair.is_none() {
-                                fallback_pair = Some((adapter.clone(), output.clone()));
-                            }
-                            if hmon_id == monitor_id_hint
-                                || (!monitor_name_hint.is_empty()
-                                    && dev_name.contains(monitor_name_hint))
-                            {
-                                matched_pair = Some((adapter.clone(), output));
-                                break;
-                            }
+                        if fallback_pair.is_none() {
+                            fallback_pair = Some((adapter.clone(), output.clone()));
+                        }
+                        if hmon_id == monitor_id_hint
+                            || (!monitor_name_hint.is_empty()
+                                && dev_name.contains(monitor_name_hint))
+                        {
+                            matched_pair = Some((adapter.clone(), output));
+                            break;
                         }
                     }
                     output_idx += 1;
@@ -633,71 +633,73 @@ unsafe fn copy_texture_to_bgra_vec(
     out_w: &mut u32,
     out_h: &mut u32,
 ) -> Result<(), MediaError> {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    src_tex.GetDesc(&mut desc);
-    let w = desc.Width;
-    let h = desc.Height;
-    if w == 0 || h == 0 {
-        return Err(MediaError::VideoCapture(
-            "Captured D3D11 texture has zero dimensions".to_string(),
-        ));
-    }
-
-    if staging_tex.is_none() || *staging_dims != (w, h) {
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: w,
-            Height: h,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut new_tex: Option<ID3D11Texture2D> = None;
-        device
-            .CreateTexture2D(&staging_desc, None, Some(&mut new_tex))
-            .map_err(|e| MediaError::VideoCapture(format!("CreateTexture2D staging: {e}")))?;
-        *staging_tex = new_tex;
-        *staging_dims = (w, h);
-    }
-
-    let staging = staging_tex.as_ref().unwrap();
-    context.CopyResource(staging, src_tex);
-
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    context
-        .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        .map_err(|e| MediaError::VideoCapture(format!("ID3D11DeviceContext::Map: {e}")))?;
-
-    let row_bytes = (w as usize) * 4;
-    let total_bytes = row_bytes * (h as usize);
-    if out_bgra.len() != total_bytes {
-        out_bgra.resize(total_bytes, 0);
-    }
-    let src_pitch = mapped.RowPitch as usize;
-    let src_ptr = mapped.pData.cast::<u8>();
-    if src_pitch == row_bytes {
-        std::ptr::copy_nonoverlapping(src_ptr, out_bgra.as_mut_ptr(), total_bytes);
-    } else {
-        for row in 0..(h as usize) {
-            std::ptr::copy_nonoverlapping(
-                src_ptr.add(row * src_pitch),
-                out_bgra.as_mut_ptr().add(row * row_bytes),
-                row_bytes,
-            );
+    unsafe {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        src_tex.GetDesc(&mut desc);
+        let w = desc.Width;
+        let h = desc.Height;
+        if w == 0 || h == 0 {
+            return Err(MediaError::VideoCapture(
+                "Captured D3D11 texture has zero dimensions".to_string(),
+            ));
         }
-    }
 
-    context.Unmap(staging, 0);
-    *out_w = w;
-    *out_h = h;
-    Ok(())
+        if staging_tex.is_none() || *staging_dims != (w, h) {
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut new_tex: Option<ID3D11Texture2D> = None;
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut new_tex))
+                .map_err(|e| MediaError::VideoCapture(format!("CreateTexture2D staging: {e}")))?;
+            *staging_tex = new_tex;
+            *staging_dims = (w, h);
+        }
+
+        let staging = staging_tex.as_ref().unwrap();
+        context.CopyResource(staging, src_tex);
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context
+            .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|e| MediaError::VideoCapture(format!("ID3D11DeviceContext::Map: {e}")))?;
+
+        let row_bytes = (w as usize) * 4;
+        let total_bytes = row_bytes * (h as usize);
+        if out_bgra.len() != total_bytes {
+            out_bgra.resize(total_bytes, 0);
+        }
+        let src_pitch = mapped.RowPitch as usize;
+        let src_ptr = mapped.pData.cast::<u8>();
+        if src_pitch == row_bytes {
+            std::ptr::copy_nonoverlapping(src_ptr, out_bgra.as_mut_ptr(), total_bytes);
+        } else {
+            for row in 0..(h as usize) {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(row * src_pitch),
+                    out_bgra.as_mut_ptr().add(row * row_bytes),
+                    row_bytes,
+                );
+            }
+        }
+
+        context.Unmap(staging, 0);
+        *out_w = w;
+        *out_h = h;
+        Ok(())
+    }
 }
 
 struct GdiDibSurface {
@@ -724,75 +726,79 @@ impl Default for GdiDibSurface {
 
 impl GdiDibSurface {
     unsafe fn cleanup(&mut self) {
-        if !self.hdc_mem.is_invalid() {
-            if !self.old_obj.is_invalid() {
-                let _ = SelectObject(self.hdc_mem, self.old_obj);
-                self.old_obj = HGDIOBJ::default();
+        unsafe {
+            if !self.hdc_mem.is_invalid() {
+                if !self.old_obj.is_invalid() {
+                    let _ = SelectObject(self.hdc_mem, self.old_obj);
+                    self.old_obj = HGDIOBJ::default();
+                }
+                if !self.hbitmap.is_invalid() {
+                    let _ = DeleteObject(self.hbitmap);
+                    self.hbitmap = HBITMAP::default();
+                }
+                let _ = DeleteDC(self.hdc_mem);
+                self.hdc_mem = HDC::default();
             }
-            if !self.hbitmap.is_invalid() {
-                let _ = DeleteObject(self.hbitmap);
-                self.hbitmap = HBITMAP::default();
-            }
-            let _ = DeleteDC(self.hdc_mem);
-            self.hdc_mem = HDC::default();
+            self.dib_ptr = null_mut();
+            self.width = 0;
+            self.height = 0;
         }
-        self.dib_ptr = null_mut();
-        self.width = 0;
-        self.height = 0;
     }
 
     unsafe fn ensure_size(&mut self, hdc_ref: HDC, width: u32, height: u32) -> bool {
-        if !self.hdc_mem.is_invalid()
-            && !self.dib_ptr.is_null()
-            && self.width == width
-            && self.height == height
-        {
-            return true;
-        }
-        self.cleanup();
+        unsafe {
+            if !self.hdc_mem.is_invalid()
+                && !self.dib_ptr.is_null()
+                && self.width == width
+                && self.height == height
+            {
+                return true;
+            }
+            self.cleanup();
 
-        let hdc_mem = CreateCompatibleDC(hdc_ref);
-        if hdc_mem.is_invalid() {
-            return false;
-        }
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut bits: *mut c_void = null_mut();
-        let hbitmap = match CreateDIBSection(
-            hdc_mem,
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            windows::Win32::Foundation::HANDLE::default(),
-            0,
-        ) {
-            Ok(hbmp) if !hbmp.is_invalid() && !bits.is_null() => hbmp,
-            _ => {
-                let _ = DeleteDC(hdc_mem);
+            let hdc_mem = CreateCompatibleDC(hdc_ref);
+            if hdc_mem.is_invalid() {
                 return false;
             }
-        };
 
-        let old_obj = SelectObject(hdc_mem, hbitmap);
-        self.hdc_mem = hdc_mem;
-        self.hbitmap = hbitmap;
-        self.old_obj = old_obj;
-        self.dib_ptr = bits.cast::<u8>();
-        self.width = width;
-        self.height = height;
-        true
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let mut bits: *mut c_void = null_mut();
+            let hbitmap = match CreateDIBSection(
+                hdc_mem,
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                windows::Win32::Foundation::HANDLE::default(),
+                0,
+            ) {
+                Ok(hbmp) if !hbmp.is_invalid() && !bits.is_null() => hbmp,
+                _ => {
+                    let _ = DeleteDC(hdc_mem);
+                    return false;
+                }
+            };
+
+            let old_obj = SelectObject(hdc_mem, hbitmap);
+            self.hdc_mem = hdc_mem;
+            self.hbitmap = hbitmap;
+            self.old_obj = old_obj;
+            self.dib_ptr = bits.cast::<u8>();
+            self.width = width;
+            self.height = height;
+            true
+        }
     }
 }
 
@@ -816,92 +822,95 @@ fn is_ignored_system_title(title: &str) -> bool {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let out = &mut *(lparam.0 as *mut Vec<(CaptureTarget, Option<(u32, u32)>)>);
+    unsafe {
+        let out = &mut *(lparam.0 as *mut Vec<(CaptureTarget, Option<(u32, u32)>)>);
 
-    if !IsWindowVisible(hwnd).as_bool() {
-        return BOOL(1);
-    }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
 
-    let shell_hwnd = GetShellWindow();
-    if !shell_hwnd.0.is_null() && hwnd == shell_hwnd {
-        return BOOL(1);
-    }
+        let shell_hwnd = GetShellWindow();
+        if !shell_hwnd.0.is_null() && hwnd == shell_hwnd {
+            return BOOL(1);
+        }
 
-    let is_minimized = IsIconic(hwnd).as_bool();
-    if !is_minimized {
-        let mut cloaked: u32 = 0;
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            (&mut cloaked as *mut u32).cast::<c_void>(),
-            size_of::<u32>() as u32,
-        )
-        .is_ok()
-            && cloaked != 0
+        let is_minimized = IsIconic(hwnd).as_bool();
+        if !is_minimized {
+            let mut cloaked: u32 = 0;
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast::<c_void>(),
+                size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+            {
+                return BOOL(1);
+            }
+        }
+
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
+        let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
+        let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
+
+        if (is_tool_window || is_no_activate) && !is_app_window {
+            return BOOL(1);
+        }
+
+        if let Ok(owner) = GetWindow(hwnd, GW_OWNER)
+            && !owner.0.is_null()
+            && !is_app_window
         {
             return BOOL(1);
         }
-    }
 
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    let is_app_window = (ex_style & WS_EX_APPWINDOW.0) != 0;
-    let is_tool_window = (ex_style & WS_EX_TOOLWINDOW.0) != 0;
-    let is_no_activate = (ex_style & WS_EX_NOACTIVATE.0) != 0;
-
-    if (is_tool_window || is_no_activate) && !is_app_window {
-        return BOOL(1);
-    }
-
-    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-        if !owner.0.is_null() && !is_app_window {
+        let text_len = GetWindowTextLengthW(hwnd);
+        if text_len <= 0 {
             return BOOL(1);
         }
-    }
 
-    let text_len = GetWindowTextLengthW(hwnd);
-    if text_len <= 0 {
-        return BOOL(1);
-    }
-
-    let mut buf = vec![0u16; (text_len as usize) + 1];
-    let copied = GetWindowTextW(hwnd, &mut buf);
-    if copied <= 0 {
-        return BOOL(1);
-    }
-
-    let title = String::from_utf16_lossy(&buf[..copied as usize])
-        .trim()
-        .to_string();
-    if title.is_empty() || is_ignored_system_title(&title) {
-        return BOOL(1);
-    }
-
-    let mut dims = None;
-    if !is_minimized {
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            let w = rect.right - rect.left;
-            let h = rect.bottom - rect.top;
-            if w <= 1 || h <= 1 {
-                return BOOL(1);
-            }
-            dims = Some((w as u32, h as u32));
+        let mut buf = vec![0u16; (text_len as usize) + 1];
+        let copied = GetWindowTextW(hwnd, &mut buf);
+        if copied <= 0 {
+            return BOOL(1);
         }
+
+        let title = String::from_utf16_lossy(&buf[..copied as usize])
+            .trim()
+            .to_string();
+        if title.is_empty() || is_ignored_system_title(&title) {
+            return BOOL(1);
+        }
+
+        let mut dims = None;
+        if !is_minimized {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_ok() {
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                if w <= 1 || h <= 1 {
+                    return BOOL(1);
+                }
+                dims = Some((w as u32, h as u32));
+            }
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+        out.push((
+            CaptureTarget::Window {
+                id: hwnd.0 as usize as u32,
+                title,
+                pid,
+            },
+            dims,
+        ));
+
+        BOOL(1)
     }
-
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-    out.push((
-        CaptureTarget::Window {
-            id: hwnd.0 as usize as u32,
-            title,
-            pid,
-        },
-        dims,
-    ));
-
-    BOOL(1)
 }
 
 pub fn list_windows_win32_with_dims() -> Vec<(CaptureTarget, Option<(u32, u32)>)> {
@@ -945,17 +954,16 @@ pub fn resolve_hwnd(id: u32, title_hint: &str, pid_hint: u32) -> Result<HWND, Me
             title,
             pid: win_pid,
         } = target
-        {
-            if crate::media::video::matches_window_candidate(
+            && crate::media::video::matches_window_candidate(
                 id,
                 title_hint,
                 pid_hint,
                 win_id,
                 &title,
                 win_pid,
-            ) {
-                return Ok(HWND(win_id as usize as *mut c_void));
-            }
+            )
+        {
+            return Ok(HWND(win_id as usize as *mut c_void));
         }
     }
 

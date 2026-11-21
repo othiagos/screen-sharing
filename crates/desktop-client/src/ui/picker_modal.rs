@@ -149,26 +149,22 @@ impl PickerModalState {
         let sub_res = cx.subscribe(
             &resolution_select,
             |this, state, ev: &SelectEvent<Vec<String>>, cx| {
-                if let SelectEvent::Confirm(Some(_)) = ev {
-                    if let Some(ix) = state.read(cx).selected_index(cx) {
-                        if let Some(&res) = this.allowed_resolutions.get(ix.row) {
+                if let SelectEvent::Confirm(Some(_)) = ev
+                    && let Some(ix) = state.read(cx).selected_index(cx)
+                        && let Some(&res) = this.allowed_resolutions.get(ix.row) {
                             this.preferred_resolution = res;
                         }
-                    }
-                }
             },
         );
         let sub_audio = cx.subscribe(
             &audio_select,
             |this, state, ev: &SelectEvent<Vec<String>>, cx| {
-                if let SelectEvent::Confirm(Some(_)) = ev {
-                    if let Some(ix) = state.read(cx).selected_index(cx) {
-                        if let Some(&choice) = this.allowed_audio.get(ix.row) {
+                if let SelectEvent::Confirm(Some(_)) = ev
+                    && let Some(ix) = state.read(cx).selected_index(cx)
+                        && let Some(&choice) = this.allowed_audio.get(ix.row) {
                             this.audio_manual_override = Some(choice);
                             cx.notify();
                         }
-                    }
-                }
             },
         );
 
